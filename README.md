@@ -161,7 +161,8 @@ instead of blocking the swarm. Set `SWARM_TRACE=1` to write per-worker milestone
 While the swarm runs, the widget above the editor and the `swarm` status line update live. The
 widget carries one row per worker — `state`, the task it holds, git branch, `ctx <n>%`, tokens
 in/out, `$cost`, turns and last activity — fitted to the terminal width by dropping whole fields
-from the right; `/swarm agents` prints the same facts for every agent in full.
+from the right. For the store's view of the same swarm, `/swarm agents` lists the roster (`role`,
+`state`, `task`, heartbeat age, capabilities, worktree) and `/swarm tasks` the task table.
 
 ### Multi-agent mode (`/swarm on`)
 
@@ -195,7 +196,7 @@ session does both by itself:
 The status line tracks the mode: `idle`, `planning`, `running` (`3a r0 c2 v0 d1` = online agents,
 ready/claimed/review/done), `done n/m`, `stalled`; the widget above the editor carries a
 `MULTI-AGENT MODE · <phase>` header over one rich row per worker (state, task, branch, ctx%,
-tokens, cost, turns, age — see above), and `/swarm agents` prints the full detail. `/swarm off`
+tokens, cost, turns, age — see above); `/swarm agents` lists the roster from the store. `/swarm off`
 stops running workers and persists
 `"auto": false`; a swarm blocked with nothing claimable is stopped after 90 s and reported as
 `stalled` instead of spinning. If the coordinator never publishes tasks for a request that is still
