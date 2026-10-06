@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { matchesKey, TERMINAL, type Component, type KeyId } from "@oh-my-pi/pi-tui";
+import type { Component, KeyId } from "@oh-my-pi/pi-tui";
 import { sortAgentInfo } from "./agentinfo";
 import { MAIN_ID, moveSelection, navEntries, renderNavLines, type NavEntry } from "./agentnav";
 import { AUTO_TICK_MS, AutoController } from "./auto";
@@ -53,9 +53,37 @@ const AGENT_NAV_KEYS: ReadonlyArray<readonly [KeyId, "up" | "down" | "enter" | "
 	["q", "close"],
 ];
 
-/** Terminal bytes -> the picker's action, or undefined for a key the picker does not own. */
-function agentNavKey(data: string): "up" | "down" | "enter" | "close" | undefined {
-	for (const [keyId, action] of AGENT_NAV_KEYS) if (matchesKey(data, keyId)) return action;
+/** The host's `matchesKey`, or whatever a host-free caller supplies. */
+export type KeyMatcher = (data: string, keyId: KeyId) => boolean;
+
+/**
+ * Resolve the host's key matcher on demand.
+ *
+ * `@oh-my-pi/pi-tui` is NOT a declared dependency of this package: it resolves only because the
+ * `omp` binary embeds it (and because `pi-coding-agent` hoists it in this repo). A top-level
+ * `import { matchesKey }` therefore makes the WHOLE extension unloadable under any loader that
+ * lacks the package - `bun --no-install` on a node_modules-free tree dies with `Cannot find
+ * package '@oh-my-pi/pi-tui'` - which would cost the tools, `/swarm`, the widget and this picker,
+ * all for one key function. So the import is dynamic and its failure is a VALUE (`undefined`),
+ * never a throw.
+ */
+export async function loadKeyMatcher(
+	load: () => Promise<{ matchesKey: KeyMatcher }> = () => import("@oh-my-pi/pi-tui"),
+): Promise<KeyMatcher | undefined> {
+	try {
+		return (await load()).matchesKey;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Terminal bytes -> the picker's action, or undefined for a key the picker does not own. Exported
+ * because it IS the documented key table (README "Agent list navigation"); the matcher is a
+ * parameter so the mapping can be checked without the host module.
+ */
+export function agentNavKey(data: string, matcher: KeyMatcher): "up" | "down" | "enter" | "close" | undefined {
+	for (const [keyId, action] of AGENT_NAV_KEYS) if (matcher(data, keyId)) return action;
 	return undefined;
 }
 
@@ -80,6 +108,44 @@ interface DrainMarker {
 /** The status line's parts are optional by construction; drop the absent and the empty ones. */
 function isText(value: string | undefined): value is string {
 	return value !== undefined && value !== "";
+}
+
+/** The completion banner's payload - the host's own `TerminalNotification` shape, narrowed. */
+export interface HostNotification {
+	title: string;
+	body: string;
+	type: "completion";
+	urgency: "normal";
+}
+
+/** The host's terminal singleton, as much of it as this extension uses. */
+export interface HostNotifier {
+	sendNotification(notification: HostNotification): void;
+}
+
+/**
+ * The one-shot batch-completion alert, on the host's own "Complete" channel.
+ *
+ * Same optional-host-module reasoning as {@link loadKeyMatcher}: the import is dynamic, so a loader
+ * without `@oh-my-pi/pi-tui` costs the loud banner and nothing else. `fallback` is called whatever
+ * happens - it is the channel that must still land - and the return value says which one fired.
+ */
+export async function announceCompletion(
+	notification: HostNotification,
+	fallback: () => void,
+	load: () => Promise<{ TERMINAL: HostNotifier }> = () => import("@oh-my-pi/pi-tui"),
+): Promise<boolean> {
+	let sent = false;
+	try {
+		const { TERMINAL } = await load();
+		TERMINAL.sendNotification(notification);
+		sent = true;
+	} catch {
+		// The module is absent (a loader that does not embed it) or the terminal cannot notify at
+		// all; both are non-fatal here because the in-TUI alert below still goes out.
+	}
+	fallback();
+	return sent;
 }
 
 interface Runtime {
@@ -378,7 +444,7 @@ export default function swarm(pi: ExtensionAPI): void {
 	 * survives a repaint, and a non-TUI host - which can run no component at all - keeps the plain
 	 * roster text it has always printed.
 	 */
-	const openAgentNav = (ctx: ExtensionContext, runtime: Runtime): void => {
+	const openAgentNav = async (ctx: ExtensionContext, runtime: Runtime): Promise<void> => {
 		if (runtime.navDismiss !== undefined) return;
 		if (ctx.mode !== "tui" || !ctx.hasUI) {
 			ctx.ui.notify(`${renderAgents(runtime.store.listAgents(), Date.now())}\n/swarm nav needs the interactive TUI`, "info");
@@ -390,6 +456,26 @@ export default function swarm(pi: ExtensionAPI): void {
 			closedEarly = true;
 			dismiss?.(undefined);
 		};
+		const settle = (): void => {
+			dismiss = undefined;
+			navClosers.delete(closeNav);
+			if (runtime.navDismiss === closeNav) runtime.navDismiss = undefined;
+		};
+		// Take the single-mount slot BEFORE the await: a second `/swarm nav` while the host module is
+		// still resolving must not mount a second picker.
+		runtime.navDismiss = closeNav;
+		navClosers.add(closeNav);
+		const matcher = await loadKeyMatcher();
+		if (matcher === undefined) {
+			// No key matcher, no picker: the roster still prints, and every other `/swarm` surface is
+			// untouched - that is the whole point of loading the host module lazily.
+			settle();
+			ctx.ui.notify(
+				`${renderAgents(runtime.store.listAgents(), Date.now())}\n/swarm nav needs the host key matcher (@oh-my-pi/pi-tui); this loader does not provide it`,
+				"warning",
+			);
+			return;
+		}
 		const component: Component = {
 			render(inner: number): readonly string[] {
 				const now = Date.now();
@@ -406,7 +492,7 @@ export default function swarm(pi: ExtensionAPI): void {
 				];
 			},
 			handleInput(data: string): void {
-				const action = agentNavKey(data);
+				const action = agentNavKey(data, matcher);
 				if (action === undefined) return;
 				if (action === "close") {
 					// Escape commits nothing: the cursor and the target stay exactly as they were.
@@ -423,13 +509,6 @@ export default function swarm(pi: ExtensionAPI): void {
 				runtime.nav.index = moveSelection(runtime.nav.index, action === "up" ? -1 : 1, entries.length);
 				refreshPanel(ctx, runtime); // the widget paints the same selection: keep the two in step
 			},
-		};
-		runtime.navDismiss = closeNav;
-		navClosers.add(closeNav);
-		const settle = (): void => {
-			dismiss = undefined;
-			navClosers.delete(closeNav);
-			if (runtime.navDismiss === closeNav) runtime.navDismiss = undefined;
 		};
 		void ctx.ui
 			.custom<string | undefined>(
@@ -494,22 +573,22 @@ export default function swarm(pi: ExtensionAPI): void {
 	 *
 	 * Prominence (per the task-38 probe): `ui.notify` is a 2.4 s toast or a single replaced status
 	 * line, and its loudest legal level would be "error" for a success, so the alert goes out on the
-	 * host's own completion channel - `TERMINAL.sendNotification`, the exact one the host uses for
-	 * its "Complete" banner - with the headline, while the summary itself persists in the widget and
-	 * on the status line. Multi-agent mode off has no controller to announce anything, so the full
-	 * summary also lands in the transcript; with the mode on the auto controller posts its own
-	 * notice, and one alert in the chat is enough.
+	 * host's own completion channel (`TERMINAL.sendNotification`, the exact call the host makes for
+	 * its "Complete" banner) with the headline, while the summary itself persists in the widget and
+	 * on the status line. That channel is resolved lazily by {@link announceCompletion}, so a loader
+	 * without the host module still gets the in-TUI notice. Multi-agent mode off has no controller to
+	 * announce anything, so the full summary also lands in the transcript; with the mode on the auto
+	 * controller posts its own notice, and one alert in the chat is enough.
 	 */
 	const alertDrained = (ctx: ExtensionContext, runtime: Runtime, summary: DrainSummary): void => {
 		const width = Math.max(20, (process.stdout.columns || Number(Bun.env.COLUMNS) || 80) - 2);
 		const title = drainSummaryTitle(summary);
 		runtime.drainMarker = { lines: drainSummaryLines(summary, { width }), status: title };
-		try {
-			TERMINAL.sendNotification({ title: "SWARM DONE", body: title, type: "completion", urgency: "normal" });
-		} catch {
-			// A terminal without the capability: the widget and status markers still carry it.
-		}
-		if (ctx.hasUI) ctx.ui.notify(title, "info");
+		void announceCompletion({ title: "SWARM DONE", body: title, type: "completion", urgency: "normal" }, () => {
+			// The in-TUI channel, whatever the loud one did: a loader without the host module (or a
+			// terminal that cannot notify) must still leave the operator a notice.
+			if (ctx.hasUI) ctx.ui.notify(title, "info");
+		});
 		if (runtime.auto === undefined) {
 			pi.sendMessage({ customType: "swarm", content: runtime.drainMarker.lines.join("\n"), display: true }, { deliverAs: "followUp" });
 		}
@@ -614,7 +693,7 @@ export default function swarm(pi: ExtensionAPI): void {
 					return;
 				}
 				case "nav": {
-					openAgentNav(ctx, runtime);
+					await openAgentNav(ctx, runtime);
 					return;
 				}
 				case "tasks": {
