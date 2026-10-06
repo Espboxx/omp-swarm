@@ -80,6 +80,28 @@ tests/
 
 ## Install
 
+### From the marketplace (self-hosted)
+
+This repo is its own marketplace — `.omp-plugin/marketplace.json` (catalog `espboxx-plugins`)
+points back at the repo root, so one URL is enough:
+
+```
+/marketplace add Espboxx/omp-swarm
+/marketplace install omp-swarm@espboxx-plugins
+```
+
+The CLI pair is equivalent: `omp plugin marketplace add Espboxx/omp-swarm` then
+`omp plugin install omp-swarm@espboxx-plugins` (`--dry-run` previews without fetching or writing).
+
+Installs are **user-scoped by default** (every project); add `--scope project` to scope one to the
+current project, and `--force` to reinstall. `/reload-plugins` refreshes skills, slash commands,
+agents and MCP servers, but a **newly installed extension module needs a session restart** before
+`/swarm` and its tools exist. The package name `omp-swarm` is global per scope, so a marketplace
+install collides with an already-`omp plugin link`ed checkout (`Runtime package name "omp-swarm"
+conflicts with installed plugin "omp-swarm@espboxx-plugins"`) — uninstall the link first.
+
+### From a local checkout
+
 Development (any directory, no install needed):
 
 ```bash
