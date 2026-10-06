@@ -199,6 +199,12 @@ creation-to-completion (the working window is not recoverable), and the cost is 
 sessions folded together — there is no per-task price, so none is printed. A run that ends with
 nothing finished is the stall notice's case, not this one, and never claims "the swarm finished".
 
+One scope rule is worth stating, because both kinds of number share one line: the headline's counts
+are the store's totals for the **whole board** at drain time (that is what `DrainSummary.counts`
+is, and what `/swarm tasks` reports) — only the elapsed, the agents, the cost and the per-task lines
+belong to this batch. On a pool that already carries finished work the headline therefore reads
+larger than the batch did; the task lines are the batch's own record of what it did.
+
 ### Multi-agent mode (`/swarm on`)
 
 Manual swarms need two operator acts (create tasks, then `/swarm start N`). In multi-agent mode the
