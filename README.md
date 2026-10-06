@@ -61,11 +61,13 @@ extension/
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary and tool output
+  agentinfo.ts pure agent-list rows: AgentInfo facts -> one fitted ASCII line per worker
   types.ts     domain types
 tests/
   unit/store.test.ts           32 unit tests of the store (incl. cross-process claim races and task-graph refusals)
   unit/auto.test.ts            28 unit tests of the roster, its mid-run growth and the state machine
   unit/render.test.ts          15 unit tests of the panel, task table and summary rendering
+  unit/agentinfo.test.ts       15 unit tests of the agent-row format, compaction, degradation and truncation
   helpers/swarm-child.ts       child-process worker used by the race tests
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
@@ -156,7 +158,10 @@ expanded into callsigns (`SwiftTiger`, `CalmFalcon`, …); `capabilities` gate c
 instead of blocking the swarm. Set `SWARM_TRACE=1` to write per-worker milestones to
 `.swarm/driver.log`.
 
-While the swarm runs, the widget above the editor and the `swarm` status line update live.
+While the swarm runs, the widget above the editor and the `swarm` status line update live. The
+widget carries one row per worker — `state`, the task it holds, git branch, `ctx <n>%`, tokens
+in/out, `$cost`, turns and last activity — fitted to the terminal width by dropping whole fields
+from the right; `/swarm agents` prints the same facts for every agent in full.
 
 ### Multi-agent mode (`/swarm on`)
 
@@ -189,7 +194,9 @@ session does both by itself:
 
 The status line tracks the mode: `idle`, `planning`, `running` (`3a r0 c2 v0 d1` = online agents,
 ready/claimed/review/done), `done n/m`, `stalled`; the widget above the editor carries a
-`MULTI-AGENT MODE · <phase>` header. `/swarm off` stops running workers and persists
+`MULTI-AGENT MODE · <phase>` header over one rich row per worker (state, task, branch, ctx%,
+tokens, cost, turns, age — see above), and `/swarm agents` prints the full detail. `/swarm off`
+stops running workers and persists
 `"auto": false`; a swarm blocked with nothing claimable is stopped after 90 s and reported as
 `stalled` instead of spinning. If the coordinator never publishes tasks for a request that is still
 streaming, it is nudged once after 90 s and the mode returns to `idle`.

@@ -1,7 +1,8 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as zod from "@oh-my-pi/omptype/zod";
+import { renderAgentInfoRows, type AgentInfo } from "./agentinfo";
 import { expandWorkers, type WorkerSpec } from "./config";
 import { renderPanel } from "./render";
 import type { SwarmStore } from "./store";
@@ -44,6 +45,13 @@ export interface SwarmDriverDeps {
 	deliverToMain?(text: string, urgent: boolean): void;
 }
 
+/** Usage facts folded out of a worker's live session (task-32's obtainable route). */
+interface WorkerUsage {
+	ctx: { used: number; total: number };
+	tokens: { in: number; out: number; cacheRead: number };
+	costUsd: number;
+}
+
 interface WorkerRuntime {
 	spec: WorkerSpec;
 	session: AgentSession;
@@ -52,12 +60,25 @@ interface WorkerRuntime {
 	turns: number;
 	lastTickAt: number;
 	lastError?: string;
+	/** Last usage fold and its age; `#usage` refreshes it at most once per `USAGE_TTL_MS`. */
+	usage?: WorkerUsage;
+	usageAt?: number;
 }
 
 const TICK_INTERVAL_MS = 3000;
 const PANEL_INTERVAL_MS = 2000;
 const STOP_GRACE_MS = 90_000;
 const SPAWN_TIMEOUT_MS = 120_000;
+/** The session-stats fold walks the transcript, so refresh it at most this often per worker. */
+const USAGE_TTL_MS = 1000;
+/** A branch read spawns git; the answer only moves on checkout, so hold it this long. */
+const BRANCH_TTL_MS = 5000;
+/**
+ * The extension's own checkout. A worker's worktree is the swarm root, which need not be a git
+ * repository (it is not, in the deployment that runs this repo from a subdirectory), so the git
+ * facts of the code being worked on come from here when the worktree itself answers nothing.
+ */
+const EXTENSION_CHECKOUT = resolve(import.meta.dir, "..");
 
 /** One slot per spawned worker: a growth step extends the exact callsign sequence the pool started. */
 function roleSlots(specs: WorkerSpec[]): RoleConfig[] {
@@ -145,6 +166,8 @@ export class SwarmDriver {
 	#heartbeatHandle: Timer | undefined;
 	#panelHandle: Timer | undefined;
 	#drained = false;
+	/** Branch per git cwd, re-read at most every `BRANCH_TTL_MS`; the spawn is the expensive part. */
+	readonly #branches = new Map<string, { at: number; value: string | undefined }>();
 
 	constructor(deps: SwarmDriverDeps) {
 		this.#deps = deps;
@@ -412,9 +435,97 @@ export class SwarmDriver {
 		})();
 	}
 
-	panelLines(): string[] {
+	/**
+	 * One `AgentInfo` per live worker, joining the runtime facts with the store's task records and
+	 * the usage/branch caches. A worker whose row cannot be assembled still contributes a bare row,
+	 * so a single bad session can never blank the list.
+	 */
+	agentInfoRows(now: number): AgentInfo[] {
+		const rows: AgentInfo[] = [];
+		for (const worker of this.#workers.values()) {
+			const id = worker.spec.name;
+			try {
+				const agent = this.#deps.store.getAgent(id);
+				const task = agent?.currentTask === undefined ? undefined : this.#deps.store.getTask(agent.currentTask);
+				const usage = this.#usage(worker, now);
+				rows.push({
+					id,
+					name: id,
+					state: worker.session.isStreaming ? (agent?.status ?? "working") : "idle",
+					taskId: task?.id,
+					taskTitle: task?.title,
+					taskStatus: task?.status,
+					branch: this.#branch(worker.worktree),
+					turns: worker.turns,
+					lastActivityAt: worker.lastTickAt === 0 ? undefined : worker.lastTickAt,
+					worktree: worker.worktree,
+					ctx: usage?.ctx,
+					tokens: usage?.tokens,
+					costUsd: usage?.costUsd,
+				});
+			} catch (error) {
+				this.#trace(`agentinfo ${id}: ${error instanceof Error ? error.message : String(error)}`);
+				rows.push({ id, name: id, state: "idle" });
+			}
+		}
+		return rows;
+	}
+
+	/**
+	 * Fold a worker's session usage at most once per `USAGE_TTL_MS`. `getSessionStats()` is the host
+	 * accessor task-32 proved reachable (≈0.016 ms on a 131-message transcript) and needs no
+	 * transcript parsing at all; the TTL only bounds it for very long sessions and event-driven
+	 * repaints. A failure keeps the previous value rather than blanking the row.
+	 */
+	#usage(worker: WorkerRuntime, now: number): WorkerUsage | undefined {
+		if (worker.usage !== undefined && now - (worker.usageAt ?? 0) < USAGE_TTL_MS) return worker.usage;
+		try {
+			const stats = worker.session.getSessionStats();
+			worker.usage = {
+				ctx: { used: stats.contextUsage?.tokens ?? 0, total: stats.contextUsage?.contextWindow ?? 0 },
+				tokens: { in: stats.tokens.input, out: stats.tokens.output, cacheRead: stats.tokens.cacheRead },
+				costUsd: stats.cost,
+			};
+			worker.usageAt = now;
+		} catch (error) {
+			this.#trace(`usage ${worker.spec.name}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		return worker.usage;
+	}
+
+	/** The branch of `worktree`, or of the extension's own checkout when that is not a repository. */
+	#branch(worktree: string): string | undefined {
+		const cached = this.#branches.get(worktree);
+		if (cached !== undefined && Date.now() - cached.at < BRANCH_TTL_MS) return cached.value;
+		let value: string | undefined;
+		for (const cwd of [worktree, EXTENSION_CHECKOUT]) {
+			try {
+				const result = Bun.spawnSync(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd, stdout: "pipe", stderr: "pipe" });
+				if (result.success) {
+					value = result.stdout.toString().trim();
+					break;
+				}
+			} catch {
+				// no git on PATH, or an unusable cwd: try the next candidate
+			}
+		}
+		this.#branches.set(worktree, { at: Date.now(), value });
+		return value;
+	}
+
+	/**
+	 * The always-visible widget body: the run header, one rich row per worker, then the fleet
+	 * counters and the board tally. With no workers it stays the iteration-2 surface verbatim, so a
+	 * swarm that is simply off reads as stopped instead of as an empty list.
+	 */
+	panelLines(width = 0): string[] {
 		const snapshot = this.#deps.store.snapshot(this.#deps.config.offlineAfterSeconds, this.#running);
-		return renderPanel(snapshot, 10);
+		const lines = renderPanel(snapshot, 10);
+		if (this.#workers.size === 0) return lines;
+		const header = lines.at(0);
+		const tail = lines.slice(-2);
+		if (header === undefined || tail.length < 2) return lines;
+		return [header, ...renderAgentInfoRows(this.agentInfoRows(snapshot.now), { width, now: snapshot.now }), ...tail];
 	}
 
 	/**

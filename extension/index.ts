@@ -150,8 +150,20 @@ export default function swarm(pi: ExtensionAPI): void {
 		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(runtime), { placement: "aboveEditor" });
 	};
 
-	/** What the string-array widget carries: the mode header followed by the driver's summary. */
-	const panelWidgetLines = (runtime: Runtime): string[] => [...(runtime.auto?.header() ?? []), ...(runtime.driver?.panelLines() ?? [])];
+	/**
+	 * What the string-array widget carries: the mode header followed by the driver's summary -
+	 * the run line, one rich row per worker and the fleet counters.
+	 *
+	 * Width: the host paints each line as `new Text(line, 1, 0)`, which wraps at
+	 * `width - 2 * paddingX` (`pi-tui/src/components/text.ts`), so rows have to fit in the
+	 * terminal width minus two columns or a row's tail wraps under itself. The terminal width
+	 * follows the host's own rule (`pi-tui/src/terminal.ts`): the PTY reports nothing until its
+	 * first resize, so `COLUMNS` and then 80 stand in.
+	 */
+	const panelWidgetLines = (runtime: Runtime): string[] => {
+		const columns = process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
+		return [...(runtime.auto?.header() ?? []), ...(runtime.driver?.panelLines(Math.max(20, columns - 2)) ?? [])];
+	};
 
 	const autoFor = (runtime: Runtime, ctx: ExtensionContext): AutoController => {
 		if (runtime.auto) return runtime.auto;
