@@ -2,106 +2,18 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { matchesKey, type Component, type KeyId } from "@oh-my-pi/pi-tui";
 import { AUTO_TICK_MS, AutoController } from "./auto";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
 import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
 import { SwarmDriver, type SwarmDriverDeps, type TimerApi } from "./driver";
-import { applyPanelKey, renderPanelLines, statusLineText, type PanelModel, type PanelRow, type PanelStatus } from "./panel";
 import { renderAgents, renderBoard, renderSummary, renderTasks } from "./render";
 import { SwarmStore } from "./store";
 import { buildSwarmTools, isBoardType, isTaskStatus, type SwarmIdentity } from "./tools";
-import { DEFAULT_CONFIG, type AgentStatus, type SwarmConfig } from "./types";
+import { DEFAULT_CONFIG, type SwarmConfig } from "./types";
 
 const MAIN_AGENT_ID = "main";
 const PANEL_STATUS_KEY = "swarm";
 const PANEL_WIDGET_KEY = "swarm-panel";
-const PANEL_TITLE = "MULTI-AGENT MODE";
-/** Columns the left panel occupies; forwarded as `overlayOptions.width`. */
-const PANEL_WIDTH = 30;
-/** Floor on the rendered roster so a cursor can never sit beyond the last painted row. */
-const PANEL_MIN_ROWS = 8;
-
-/** The host keys the panel answers, mapped onto the frozen reducer's names in `panel.ts`. */
-const PANEL_KEYS: ReadonlyArray<readonly [KeyId, string]> = [
-	["up", "up"],
-	["down", "down"],
-	["enter", "enter"],
-	["k", "k"],
-	["j", "j"],
-	["r", "r"],
-	["s", "s"],
-	["q", "q"],
-];
-
-/** Terminal bytes -> reducer key name, or undefined when the panel does not own that key. */
-export function panelKey(data: string): string | undefined {
-	for (const [keyId, name] of PANEL_KEYS) if (matchesKey(data, keyId)) return name;
-	return undefined;
-}
-
-export interface AgentPanelHooks {
-	/** Live roster; re-read on every render so agents joining mid-mode show up. */
-	rows(): PanelRow[];
-	onSelect(row: PanelRow): void;
-	onReload(): void;
-	onStatus(): void;
-	onQuit(): void;
-}
-
-/**
- * The MULTI-AGENT MODE agent list as a host component. It owns only the cursor/selection state and
- * delegates every list decision to the pure `panel.ts` module, so the host wiring stays a thin
- * adapter (`ctx.ui.custom` -> this component -> `applyPanelKey`).
- */
-export function createAgentListPanel(hooks: AgentPanelHooks): Component {
-	let model: PanelModel = { title: PANEL_TITLE, rows: [], cursor: 0, now: Date.now() };
-	const sync = (): PanelRow[] => {
-		const rows = hooks.rows();
-		model = { ...model, rows, now: Date.now(), cursor: Math.max(0, Math.min(model.cursor, rows.length - 1)) };
-		return rows;
-	};
-	return {
-		render(width: number): readonly string[] {
-			sync();
-			return renderPanelLines(model, { width: Math.max(width, 16), maxRows: Math.max(PANEL_MIN_ROWS, model.rows.length) });
-		},
-		handleInput(data: string): void {
-			sync();
-			const key = panelKey(data);
-			if (key === undefined) return;
-			const { model: next, action } = applyPanelKey(model, key);
-			model = next;
-			switch (action.kind) {
-				case "select": {
-					const row = model.rows[model.cursor];
-					if (row !== undefined && row.id === action.id) {
-						model = { ...model, selected: row.id };
-						hooks.onSelect(row);
-					}
-					return;
-				}
-				case "reload":
-					hooks.onReload();
-					return;
-				case "status":
-					hooks.onStatus();
-					return;
-				case "quit":
-					hooks.onQuit();
-					return;
-				default:
-					return;
-			}
-		},
-	};
-}
-
-/** The live panel mounted in a TUI host; `selected` drives the status line. */
-interface AgentPanelSession {
-	selected?: { id: string; label: string };
-	close(): void;
-}
 
 interface Runtime {
 	root: string;
@@ -111,7 +23,6 @@ interface Runtime {
 	driver?: SwarmDriver;
 	auto?: AutoController;
 	autoTimer?: Timer;
-	panel?: AgentPanelSession;
 }
 
 /**
@@ -138,7 +49,7 @@ class SwarmRuntimes {
 		return runtime;
 	}
 
-	/** Peek without creating anything: used by the panel on session start. */
+	/** Peek without creating anything: `session_start` must not write `.swarm/` on its own. */
 	peek(root: string): Runtime | undefined {
 		return this.#runtimes.get(resolve(root));
 	}
@@ -235,22 +146,12 @@ export default function swarm(pi: ExtensionAPI): void {
 		const legacy = runtime.driver?.running
 			? `swarm ${snapshot.agents.length}a r${counts.ready} c${counts.claimed} v${counts.review} d${counts.done}`
 			: undefined;
-		// A selection owns the status line; otherwise the mode keeps painting its phase text.
-		const selected = runtime.panel?.selected;
-		ctx.ui.setStatus(PANEL_STATUS_KEY, selected ? statusLineText(selected.label) : (runtime.auto?.statusText() ?? legacy));
-		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(ctx, runtime), { placement: "aboveEditor" });
+		ctx.ui.setStatus(PANEL_STATUS_KEY, runtime.auto?.statusText() ?? legacy);
+		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(runtime), { placement: "aboveEditor" });
 	};
 
-	/**
-	 * What the string-array widget carries. In a TUI the overlay IS the panel, so the widget keeps
-	 * the mode's own summary; every host that cannot mount a component (rpc/print - `custom()`
-	 * returns undefined there) gets the panel itself as text, which is the contract's fallback.
-	 */
-	const panelWidgetLines = (ctx: ExtensionContext, runtime: Runtime): string[] => {
-		if (!runtime.config.auto) return [...(runtime.auto?.header() ?? []), ...(runtime.driver?.panelLines() ?? [])];
-		if (ctx.mode === "tui" && runtime.panel !== undefined) return [];
-		return renderPanelLines(panelModel(runtime), { width: PANEL_WIDTH });
-	};
+	/** What the string-array widget carries: the mode header followed by the driver's summary. */
+	const panelWidgetLines = (runtime: Runtime): string[] => [...(runtime.auto?.header() ?? []), ...(runtime.driver?.panelLines() ?? [])];
 
 	const autoFor = (runtime: Runtime, ctx: ExtensionContext): AutoController => {
 		if (runtime.auto) return runtime.auto;
@@ -295,144 +196,19 @@ export default function swarm(pi: ExtensionAPI): void {
 		runtime.autoTimer = undefined;
 	};
 
-	/** Newest context for a root, so the panel's own keys can repaint and notify. */
-	const panelCtx = (runtime: Runtime): ExtensionContext | undefined => contexts.get(runtime.root);
-
-	const panelStatus = (status: AgentStatus | undefined): PanelStatus => {
-		switch (status) {
-			case "working":
-				return "working";
-			case "reviewing":
-				return "reviewing";
-			case "offline":
-				return "offline";
-			// An agent with nothing in flight (`idle`, `waiting`, `blocked`) reads as idle here.
-			default:
-				return "idle";
-		}
-	};
-
-	/**
-	 * The mode's roster: the configured planner roster first (so the panel is meaningful before the
-	 * pool starts), with live agents merged in. The swarm tracks no per-agent model - `config.model`
-	 * is shared by every worker - so the row label is the callsign, matching the mock's
-	 * "numbered rows, name + status".
-	 */
-	const panelRows = (runtime: Runtime): PanelRow[] => {
-		const live = new Map(runtime.store.listAgents().map((agent) => [agent.id, agent]));
-		const planned = expandWorkers(runtime.config).map((spec) => spec.name);
-		const known = new Set(planned);
-		const ids = [...planned, ...[...live.keys()].filter((id) => !known.has(id))];
-		return ids.map((id, index) => ({ index: index + 1, id, label: id, status: panelStatus(live.get(id)?.status) }));
-	};
-
-	const panelModel = (runtime: Runtime): PanelModel => ({
-		title: PANEL_TITLE,
-		rows: panelRows(runtime),
-		cursor: 0,
-		selected: runtime.panel?.selected?.id,
-		now: Date.now(),
-	});
-
-	const closePanel = (runtime: Runtime): void => {
-		const session = runtime.panel;
-		runtime.panel = undefined;
-		session?.close();
-	};
-
-	/**
-	 * Enter = select the agent under the cursor. The status line shows it immediately; the model
-	 * side of the switch applies only when the row names a model the host can resolve, and says so
-	 * when it cannot - a selection never fails silently.
-	 */
-	const selectAgent = (ctx: ExtensionContext, runtime: Runtime, row: PanelRow): void => {
-		if (ctx.models.resolve(row.label) !== undefined) {
-			runtime.config.model = row.label;
-			ctx.ui.notify(`selected ${row.label}: worker spawns now use ${row.label}`, "info");
-		} else {
-			ctx.ui.notify(
-				`selected ${row.label}: no per-agent model to apply (workers keep ${runtime.config.model ?? "the session default model"})`,
-				"warning",
-			);
-		}
-		refreshPanel(ctx, runtime);
-	};
-
-	/** `q` in the panel: the same path `/swarm off` takes. */
-	const quitFromPanel = async (runtime: Runtime): Promise<void> => {
-		const ctx = panelCtx(runtime);
-		if (!ctx) return;
-		await disableAuto(ctx, runtime);
-		ctx.ui.notify("multi-agent mode OFF (q in the agent panel)", "info");
-	};
-
-	/**
-	 * Mount the agent list as a left-anchored overlay (`anchor: "left-center"`, the contract's
-	 * verdict). Only the interactive TUI can run an extension-owned component, so anything else
-	 * keeps the widget fallback `refreshPanel` paints.
-	 */
-	const openPanel = (ctx: ExtensionContext, runtime: Runtime): void => {
-		if (ctx.mode !== "tui" || !ctx.hasUI || runtime.panel !== undefined) return;
-		remember(runtime.root, ctx);
-		const session: AgentPanelSession = { close: () => {} };
-		runtime.panel = session;
-		let dismiss: ((result: string | undefined) => void) | undefined;
-		let closedEarly = false;
-		session.close = () => {
-			closedEarly = true;
-			dismiss?.(undefined);
-		};
-		const component = createAgentListPanel({
-			rows: () => panelRows(runtime),
-			onSelect: (row) => {
-				session.selected = { id: row.id, label: row.label };
-				const target = panelCtx(runtime);
-				if (target) selectAgent(target, runtime, row);
-			},
-			onReload: () => {
-				const target = panelCtx(runtime);
-				if (!target) return;
-				refreshPanel(target, runtime);
-				target.ui.notify(`agent list reloaded: ${panelRows(runtime).length} agent(s)`, "info");
-			},
-			onStatus: () => {
-				panelCtx(runtime)?.ui.notify(renderAgents(runtime.store.listAgents(), Date.now()), "info");
-			},
-			onQuit: () => void quitFromPanel(runtime),
-		});
-		const pending = ctx.ui.custom<string | undefined>(
-			(_tui, _theme, _keybindings, done) => {
-				dismiss = done;
-				// Closed before the host mounted us: settle immediately instead of waiting for a key.
-				if (closedEarly) queueMicrotask(() => done(undefined));
-				return component;
-			},
-			{ overlay: true, overlayOptions: { anchor: "left-center", width: PANEL_WIDTH, maxHeight: "100%", margin: 0 } },
-		);
-		const settle = (): void => {
-			dismiss = undefined;
-			if (runtime.panel === session) runtime.panel = undefined;
-		};
-		void pending.then(settle, (error) => {
-			settle();
-			panelCtx(runtime)?.ui.notify(`agent panel closed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-		});
-	};
-
-	/** The one `/swarm off` path: the command, and the panel's `q`, both land here. */
+	/** The one multi-agent-mode off path: `/swarm off`. */
 	const disableAuto = async (ctx: ExtensionContext, runtime: Runtime): Promise<void> => {
 		saveSwarmAuto(runtime.paths.configFile, false);
 		runtime.config.auto = false;
 		await autoFor(runtime, ctx).disable();
 		clearAutoTimer(runtime, ctx);
-		closePanel(runtime);
 		refreshPanel(ctx, runtime);
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		remember(ctx.cwd, ctx);
 		const paths = swarmPaths(resolve(ctx.cwd));
-		if (!existsSync(paths.configFile)) return; // a project without a swarm gets no panel and no writes
+		if (!existsSync(paths.configFile)) return; // a project without a swarm gets no status line and no writes
 		let runtime: Runtime;
 		try {
 			runtime = runtimes.for(ctx.cwd);
@@ -443,7 +219,6 @@ export default function swarm(pi: ExtensionAPI): void {
 		if (runtime.config.auto) {
 			autoFor(runtime, ctx).enable();
 			autoTimer(runtime, ctx);
-			openPanel(ctx, runtime);
 		}
 		refreshPanel(ctx, runtime);
 	});
@@ -518,7 +293,6 @@ export default function swarm(pi: ExtensionAPI): void {
 					autoFor(runtime, ctx).enable();
 					autoTimer(runtime, ctx);
 					refreshPanel(ctx, runtime);
-					openPanel(ctx, runtime);
 					ctx.ui.notify(
 						`multi-agent mode ON in ${runtime.root}\n每一条新任务都会被拆成 swarm 任务并行执行；/swarm off 关闭。`,
 						"info",

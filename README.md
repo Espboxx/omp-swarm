@@ -33,7 +33,7 @@ and ownership conflicts are settled by the database, never by agent etiquette.
 | Subagent observability | `session.subscribe()` (`agent_start` / `agent_end.isTerminal`) | idle detection for tick delivery |
 | Message delivery | `session.prompt()` / `sendUserMessage({deliverAs: "steer" \| "followUp"})` | a peer message is delivered as a prompt, not over a private protocol |
 | Managed timers | `ctx.setInterval` / `ctx.clearTimer` | heartbeat, sweeper, tick, panel — throws stay contained |
-| TUI | `ctx.ui.setStatus` / `ctx.ui.setWidget`; `ctx.ui.custom` with `overlay: true` | live swarm panel — a string widget above the editor, or a left-anchored overlay component |
+| TUI | `ctx.ui.setStatus` / `ctx.ui.setWidget` | live swarm status line + the `swarm-panel` text widget above the editor |
 | Slash commands | `pi.registerCommand("swarm", …)` | `/swarm start`, `/swarm status`, … |
 | Isolated checkouts | `git worktree` (as OMP does for tasks) | `worktrees: true` gives each worker a branch + checkout |
 | Process execution | `pi.exec` | worktree creation |
@@ -61,22 +61,16 @@ extension/
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary and tool output
-  panel.ts     the agent-list panel: list model, key reducer and text rendering (no host API)
   types.ts     domain types
 tests/
   unit/store.test.ts           32 unit tests of the store (incl. cross-process claim races and task-graph refusals)
   unit/auto.test.ts            28 unit tests of the roster, its mid-run growth and the state machine
   unit/render.test.ts          15 unit tests of the panel, task table and summary rendering
-  unit/panel.test.ts           20 unit tests of the agent-list model, key reducer and rendering
-  unit/panel-wiring.test.ts    13 unit tests of the panel host adapter (key bytes -> hooks)
   helpers/swarm-child.ts       child-process worker used by the race tests
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
   integration/auto-run.ts       multi-agent mode end to end: one plain task, no /swarm command
-  integration/panel-run.ts      the agent panel end to end: the TUI key walk + the RPC widget fallback
-  integration/panel-probe.ts    the OMP UI-surface probe (overlay mount, sizing, key capture)
-  integration/panel-probe-ext.ts  the probe extension loaded by panel-probe.ts
   integration/rpc-client.ts    minimal OMP RPC client (NDJSON over stdio)
   integration/rpc-dump.ts      frame-level RPC diagnostics
 ```
@@ -204,28 +198,6 @@ Tasks that appear while no pool is running — a hand-made `/swarm task`, leftov
 — start a pool for them on the same terms. Tasks published while a pool is running are picked up by
 that pool, which grows toward them up to `config.workers`.
 
-#### The agent panel (arrow keys)
-
-While the mode is on, the roster is also a navigable list: a `MULTI-AGENT MODE      2 agents` header,
-one numbered row per agent (` 2  CalmTiger  · idle`), the row under the cursor prefixed `>`, the
-selected agent marked `●`, and the key legend below it. `↑`/`↓` (or `k`/`j`) move the cursor, `Enter`
-selects the agent under the cursor, `r` reloads the list, `s` shows the agent status, and `q` leaves
-multi-agent mode — the same path `/swarm off` takes. Selecting an agent writes it into the status line
-(`MULTI-AGENT MODE · CalmTiger (selected)`) and applies it to `config.model` for later worker spawns
-when the host can resolve the name; when it cannot, it says so instead of failing silently. Rows come
-from the configured roster first, so the list is meaningful before any pool starts, with live agents
-merged in as they join.
-
-Where it is drawn depends on the host, and the difference is worth knowing:
-
-| Host | Surface | Keys |
-|---|---|---|
-| Interactive TUI | left-anchored **overlay component** — `ctx.ui.custom(..., { overlay: true, overlayOptions: { anchor: "left-center", width: 30, maxHeight: "100%", margin: 0 } })` | all of them; the component holds focus |
-| headless (`--mode rpc` / `--mode rpc-ui`, print) | the same rows and legend as a **string widget above the editor** | none — those hosts have no component surface (`custom()` returns `undefined`) and no way to inject a keystroke |
-
-So `q`/`r`/`s`/`Enter` are panel keys, not global shortcuts: `Enter` is reserved by the host and could
-not be registered as one anyway. Verified frame by frame by `tests/integration/panel-run.ts`.
-
 Reproduce the UI surface without a TUI (repeat `--command` to walk a sequence in one session):
 
 ```bash
@@ -300,12 +272,11 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 108 unit tests in tests/unit (32 store + 28 auto-mode + 15 render + 20 agent panel + 13 panel wiring, incl. a 3-process claim race)
+bun run test                   # 75 unit tests in tests/unit (32 store + 28 auto-mode + 15 render, incl. a 3-process claim race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
 bun run auto:rpc               # multi-agent mode: config says auto, ONE plain task, no /swarm command
-bun run tests/integration/panel-run.ts   # agent panel: the key walk on a real TUI engine + the RPC widget fallback
 bun run rpc:dump -- --command "/swarm status"   # frame-level RPC diagnostics
 ```
 
@@ -315,9 +286,7 @@ result), start N workers, kill one worker mid-task to force lease recovery, and 
 database plus the event log. `tests/integration/last-run.json` is written by BOTH runners
 (`swarm-run.ts:112` for RPC and `sdk-run.ts:138` for SDK), so a live SDK run overwrites the RPC
 run's report; `last-run-sdk.json` on disk is a stale leftover from an earlier run. Multi-agent mode
-reports land in `last-run-auto.json` / `last-run-auto-ui.json` (`auto-run.ts:260`). The agent panel's
-key walk lands in `tests/integration/last-run-panel.json` (`panel-run.ts`), split by the surface that
-proves each of its six checks — the RPC widget fallback versus the TUI key walk.
+reports land in `last-run-auto.json` / `last-run-auto-ui.json` (`auto-run.ts:260`).
 `auto-run.ts` boots the project with `"auto": true` and sends one plain task — a report on the mode
 assembling itself, with no `/swarm` command in the transcript.
 
