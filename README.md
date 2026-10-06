@@ -533,3 +533,7 @@ Bottlenecks in the order they bite:
    concurrent checkouts on one machine, prefer a few shard repos over 32 worktrees.
 5. **Two agents editing one file** is solved by reservations, not by luck — but reservations are
    advisory to the LLM, so cap parallelism per file area in the role config instead of hoping.
+
+## License
+
+MIT — Copyright (c) 2026 Espboxx. See [LICENSE](LICENSE).

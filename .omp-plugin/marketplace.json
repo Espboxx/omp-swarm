@@ -15,6 +15,10 @@
       "source": "./",
       "category": "development",
       "version": "0.1.0",
+      "author": {
+        "name": "Espboxx"
+      },
+      "license": "MIT",
       "homepage": "https://github.com/Espboxx/omp-swarm",
       "repository": "https://github.com/Espboxx/omp-swarm",
       "keywords": [

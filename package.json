@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Decentralized peer-agent swarm for OMP: shared task pool, atomic claims, leases, blackboard.",
+  "license": "MIT",
   "omp": {
     "extensions": [
       "./extension/index.ts"
