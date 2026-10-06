@@ -1,0 +1,18 @@
+{
+  "workers": 4,
+  "leaseSeconds": 120,
+  "heartbeatSeconds": 10,
+  "offlineAfterSeconds": 45,
+  "idleTickSeconds": 20,
+  "review": true,
+  "auto": false,
+  "worktrees": true,
+  "model": "provider/model-selector",
+  "thinkingLevel": "medium",
+  "roles": [
+    { "name": "general", "count": 2, "capabilities": ["general"] },
+    { "name": "reviewer", "count": 1, "capabilities": ["general", "reviewer"] },
+    { "name": "integrator", "count": 1, "capabilities": ["integrator", "reviewer"] }
+  ],
+  "tools": ["read", "grep", "glob", "edit", "write", "bash", "ast_grep", "ast_edit", "todo"]
+}

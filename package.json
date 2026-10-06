@@ -1,0 +1,24 @@
+{
+  "name": "omp-swarm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Decentralized peer-agent swarm for OMP: shared task pool, atomic claims, leases, blackboard.",
+  "omp": {
+    "extensions": [
+      "./extension/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test tests/unit",
+    "typecheck": "bun node_modules/typescript/bin/tsc --noEmit",
+    "swarm:rpc": "bun run tests/integration/swarm-run.ts",
+    "auto:rpc": "bun run tests/integration/auto-run.ts",
+    "swarm:sdk": "bun run tests/integration/sdk-run.ts",
+    "rpc:dump": "bun run tests/integration/rpc-dump.ts"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.6.1",
+    "@types/bun": "^1.4.2"
+  }
+}
