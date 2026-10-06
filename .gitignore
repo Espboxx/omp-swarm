@@ -1,4 +1,4 @@
 node_modules/
 scratch/
 .swarm/
-tests/integration/last-run.json
+tests/integration/last-run*.json

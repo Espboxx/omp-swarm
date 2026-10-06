@@ -361,7 +361,10 @@ result), start N workers, kill one worker mid-task to force lease recovery, and 
 database plus the event log. `tests/integration/last-run.json` is written by BOTH runners
 (`swarm-run.ts:112` for RPC and `sdk-run.ts:138` for SDK), so a live SDK run overwrites the RPC
 run's report; `last-run-sdk.json` on disk is a stale leftover from an earlier run. Multi-agent mode
-reports land in `last-run-auto.json` / `last-run-auto-ui.json` (`auto-run.ts:260`).
+reports land in `last-run-auto.json` / `last-run-auto-ui.json` (`auto-run.ts:260`). All of them are
+generated locally by the runner and are **not tracked** in this repo (`.gitignore`:
+`tests/integration/last-run*.json`), so the paths cited below are the local records of the runs on
+the machine that produced them, not files a clone contains.
 `auto-run.ts` boots the project with `"auto": true` and sends one plain task — a report on the mode
 assembling itself, with no `/swarm` command in the transcript.
 
