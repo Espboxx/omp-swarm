@@ -279,7 +279,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 75 unit tests in tests/unit (32 store + 28 auto-mode + 15 render, incl. a 3-process claim race)
+bun run test                   # 90 unit tests in tests/unit (32 store + 28 auto-mode + 15 render + 15 agent-list rows, incl. a 3-process claim race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
