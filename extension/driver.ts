@@ -625,16 +625,21 @@ export class SwarmDriver {
 	/**
 	 * The always-visible widget body: the run header, one rich row per worker, then the fleet
 	 * counters and the board tally. With no workers it stays the iteration-2 surface verbatim, so a
-	 * swarm that is simply off reads as stopped instead of as an empty list.
+	 * swarm that is simply off reads as stopped instead of as an empty list. `opts.color` is the
+	 * caller's single decision (see `extension/index.ts`); false is byte-identical to the plain body.
 	 */
-	panelLines(width = 0): string[] {
+	panelLines(width = 0, opts: { color?: boolean } = {}): string[] {
 		const snapshot = this.#deps.store.snapshot(this.#deps.config.offlineAfterSeconds, this.#running);
-		const lines = renderPanel(snapshot, 10);
+		const lines = renderPanel(snapshot, 10, opts);
 		if (this.#workers.size === 0) return lines;
 		const header = lines.at(0);
 		const tail = lines.slice(-2);
 		if (header === undefined || tail.length < 2) return lines;
-		return [header, ...renderAgentInfoRows(this.agentInfoRows(snapshot.now), { width, now: snapshot.now }), ...tail];
+		return [
+			header,
+			...renderAgentInfoRows(this.agentInfoRows(snapshot.now), { width, now: snapshot.now, color: opts.color }),
+			...tail,
+		];
 	}
 
 	/**

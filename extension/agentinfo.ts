@@ -9,6 +9,7 @@
  * terminal is narrow - see `renderAgentInfoRows`.
  */
 import type { AgentStatus } from "./types";
+import { assignAgentColors, fitColored, paint, sanitizeField, statusColor, visibleWidth } from "./color";
 
 export interface AgentInfo {
 	id: string;
@@ -121,61 +122,115 @@ export function sortAgentInfo(rows: AgentInfo[]): AgentInfo[] {
 	});
 }
 
-/** The full, untruncated row for one agent. */
-export function formatRow(row: AgentInfo, opts: { now: number }): string {
-	return buildRow(row, opts.now, TASK_TITLE_MAX, OPTIONAL_FIELDS);
-}
-
-/** The list, most visible agent first; `[]` reads `no agents`. */
-export function renderAgentInfoRows(rows: AgentInfo[], opts: { width: number; now: number }): string[] {
-	if (rows.length === 0) return ["no agents"];
-	return sortAgentInfo(rows).map((row) => fitRow(row, opts));
+/** The full, untruncated row for one agent. `color` paints only the name and status tokens. */
+export function formatRow(row: AgentInfo, opts: { now: number; color?: boolean }): string {
+	const tokens = rowTokens(row, opts.now, TASK_TITLE_MAX, OPTIONAL_FIELDS);
+	return renderTokens(tokens, row, opts.color === true ? assignAgentColors([row.id]).get(row.id) : undefined);
 }
 
 /**
- * Build the row with the last `keep` optional fields present and the task title clipped to
- * `titleMax`. Fields are always joined whole, so dropping one can never leave a dangling ` · `.
+ * The roster colour, keyed on IDENTITY, not on the line the id happens to sit on: the palette is
+ * dealt over the agent ids sorted by name, while `sortAgentInfo` decides only the line order.
+ * Dealing over the display order would recolour every agent whenever any one of them changed state,
+ * because the display order itself is state-ranked - which defeats the point of a reminder colour.
+ * A roster that gains an agent may still shift a later slot (a slot cannot be both stable and unique
+ * without configuration); a state change never does.
  */
-function buildRow(row: AgentInfo, now: number, titleMax: number, keep: number): string {
+function rosterColors(rows: AgentInfo[]): Map<string, number> {
+	return assignAgentColors([...new Set(rows.map((row) => row.id))].sort());
+}
+
+/** The list, most visible agent first; `[]` reads `no agents`. Colour follows the agent, not the line. */
+export function renderAgentInfoRows(
+	rows: AgentInfo[],
+	opts: { width: number; now: number; color?: boolean },
+): string[] {
+	if (rows.length === 0) return ["no agents"];
+	const sorted = sortAgentInfo(rows);
+	const colors = opts.color === true ? rosterColors(rows) : undefined;
+	return sorted.map((row) => fitRow(row, opts, colors?.get(row.id)));
+}
+
+/**
+ * The row's fields, left to right: the `glyph name` head, the state, the task field, then the
+ * last `keep` optional fields. Fields stay whole, so dropping one can never leave a dangling
+ * ` · ` - the caller joins them with `SEP`. Every field that carries text from outside this module
+ * (a task title, an id, a branch) is sanitized first: the widget path writes its bytes to the
+ * terminal verbatim, so a control sequence in a title would otherwise be executed by the terminal.
+ */
+function rowTokens(row: AgentInfo, now: number, titleMax: number, keep: number): string[] {
 	const optionals = [
 		`ctx ${contextPct(row.ctx)}`,
 		`${compactTokens(row.tokens?.in ?? 0)}/${compactTokens(row.tokens?.out ?? 0)} tok`,
 		compactCost(row.costUsd),
-		row.branch === undefined || row.branch === "" ? "-" : row.branch,
+		row.branch === undefined || row.branch === "" ? "-" : sanitizeField(row.branch),
 		activityField(row, now),
 	];
-	const head = [`${GLYPH[row.state] ?? "-"} ${row.name}`, row.state, taskField(row, titleMax)];
-	return [...head, ...optionals.slice(0, keep).filter((field) => field !== "")].join(SEP);
+	const head = [`${GLYPH[row.state] ?? "-"} ${sanitizeField(row.name)}`, sanitizeField(row.state), taskField(row, titleMax)];
+	// A field that sanitization emptied (an id that was only an escape sequence) drops out, so the
+	// row can still never carry a dangling ` · `.
+	return [...head, ...optionals.slice(0, keep)].filter((field) => field !== "");
+}
+
+/**
+ * Join the fields into one line, painting the `glyph name` head and the state token when a
+ * `nameColor` is given (the state always takes its own `statusColor`). The visible text is
+ * untouched - paint only wraps it - so the line's width is the same as the plain one.
+ */
+function renderTokens(tokens: string[], row: AgentInfo, nameColor: number | undefined): string {
+	if (nameColor === undefined) return tokens.join(SEP);
+	const painted = tokens.map((token, index) => {
+		if (index === 0) return paint(token, nameColor, { enabled: true });
+		if (index === 1) return paint(token, statusColor(row.state), { enabled: true });
+		return token;
+	});
+	return painted.join(SEP);
 }
 
 /**
  * Fit one row into `width`. Drops whole optional fields from the right (turns/age, then branch,
  * cost, tokens, ctx), then shrinks the task title, then - last resort, a name longer than the
- * terminal - hard-clips. `width <= 0` means no truncation.
+ * terminal - hard-clips. `width <= 0` means no truncation. Every row is measured by VISIBLE width
+ * (escapes count zero, CJK and emoji count what the terminal draws), colored or not: the host
+ * wraps by that same measure, so a row measured with `.length` would wrap under itself.
  */
-function fitRow(row: AgentInfo, opts: { width: number; now: number }): string {
-	if (opts.width <= 0) return buildRow(row, opts.now, TASK_TITLE_MAX, OPTIONAL_FIELDS);
+function fitRow(row: AgentInfo, opts: { width: number; now: number }, nameColor?: number): string {
+	if (opts.width <= 0) {
+		return renderTokens(rowTokens(row, opts.now, TASK_TITLE_MAX, OPTIONAL_FIELDS), row, nameColor);
+	}
 	let keep = OPTIONAL_FIELDS;
 	let titleMax = TASK_TITLE_MAX;
 	for (;;) {
-		const line = buildRow(row, opts.now, titleMax, keep);
-		if (line.length <= opts.width) return line;
+		const line = renderTokens(rowTokens(row, opts.now, titleMax, keep), row, nameColor);
+		const measured = visibleWidth(line);
+		if (measured <= opts.width) return line;
 		if (keep > 0) {
 			keep -= 1;
 		} else if (titleMax > 0) {
 			// Every pass strips at least one char, so this terminates.
-			titleMax = Math.max(0, titleMax - (line.length - opts.width));
+			titleMax = Math.max(0, titleMax - (measured - opts.width));
 		} else {
 			// Nothing left to drop: a name longer than the terminal. Clip it and mark the loss.
-			return opts.width <= 1 ? line.slice(0, Math.max(0, opts.width)) : `${line.slice(0, opts.width - 1)}…`;
+			return clipped(line, opts.width);
 		}
 	}
 }
 
+/**
+ * Last-resort hard clip of a row wider than the terminal: `width` VISIBLE columns with a `…`
+ * marking the loss (a single-column budget keeps the one character it can). The clip never splits
+ * a grapheme cluster and never lands inside a color, so the `…` cannot inherit one.
+ */
+function clipped(line: string, width: number): string {
+	if (width <= 1) return fitColored(line, width);
+	return `${fitColored(line, width - 1)}…`;
+}
+
 function taskField(row: AgentInfo, titleMax: number): string {
 	if (!row.taskId) return "no task";
-	const title = row.taskTitle === undefined ? "" : clip(row.taskTitle, titleMax);
-	return title === "" ? row.taskId : `${row.taskId} "${title}"`;
+	const id = sanitizeField(row.taskId);
+	const title = row.taskTitle === undefined ? "" : clip(sanitizeField(row.taskTitle), titleMax);
+	return title === "" ? id : `${id} "${title}"`;
 }
 
 /** `7t 3m`; either half alone when the other is unknown, `` when both are. */
@@ -186,8 +241,14 @@ function activityField(row: AgentInfo, now: number): string {
 	return parts.join(" ");
 }
 
+/** Flattened text clipped to `max` code units, ending in `…`; never leaves half a surrogate pair. */
 function clip(text: string, max: number): string {
 	const flat = text.replace(/\s+/g, " ").trim();
 	if (max <= 0 || flat === "") return "";
-	return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+	if (flat.length <= max) return flat;
+	const cut = flat.slice(0, max - 1);
+	// `slice` counts code units, so a cut can land inside a surrogate pair (an emoji split in half):
+	// the host's native wrap then draws that half wider than `visibleWidth` measures it and the row
+	// wraps under itself. Drop the orphaned high surrogate instead.
+	return /[\uD800-\uDBFF]$/.test(cut) ? `${cut.slice(0, -1)}…` : `${cut}…`;
 }

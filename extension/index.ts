@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { AUTO_TICK_MS, AutoController } from "./auto";
+import { colorEnabled } from "./color";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
 import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
 import { SwarmDriver, type SwarmDriverDeps, type TimerApi } from "./driver";
@@ -13,6 +14,7 @@ import {
 	fitSummaryLines,
 	progressBar,
 	progressLine,
+	progressStatusLine,
 	renderAgents,
 	renderBoard,
 	renderSummary,
@@ -174,6 +176,13 @@ export default function swarm(pi: ExtensionAPI): void {
 		clearTimer: (timer: Timer) => ctx.clearTimer(timer),
 	});
 
+	/**
+	 * Whether the widget may carry SGR: an interactive TTY with `NO_COLOR` unset (or empty) and
+	 * `FORCE_COLOR` not `0`. The decision lives here and nowhere else; every pure formatter receives
+	 * it as a flag and none of them reads `process.env` or the TTY itself.
+	 */
+	const panelColor = (): boolean => colorEnabled(process.env, Boolean(process.stdout.isTTY));
+
 	const refreshPanel = (ctx: ExtensionContext, runtime: Runtime | undefined): void => {
 		if (!runtime) {
 			ctx.ui.setStatus(PANEL_STATUS_KEY, undefined);
@@ -182,36 +191,39 @@ export default function swarm(pi: ExtensionAPI): void {
 		}
 		const snapshot = runtime.store.snapshot(runtime.config.offlineAfterSeconds, runtime.driver?.running ?? false);
 		const counts = snapshot.counts;
+		// The ONE place color is decided. Every line below takes it as a flag - a pure formatter
+		// never reads process.env or the TTY itself, so `NO_COLOR=1 omp` and `omp | cat` both paint
+		// nothing and the bytes stay exactly what this extension emitted before colors existed.
+		const color = panelColor();
 		const legacy = runtime.driver?.running
 			? `swarm ${snapshot.agents.length}a r${counts.ready} c${counts.claimed} v${counts.review} d${counts.done}`
 			: undefined;
 		// Actionable work again means the last batch's summary is history: drop the marker so the
 		// status line goes back to reporting the live pool.
 		if (runtime.drainMarker !== undefined && counts.ready + counts.claimed + counts.review > 0) runtime.drainMarker = undefined;
-		const live = runtime.drainMarker === undefined ? progressStatus(runtime) : undefined;
+		const live = runtime.drainMarker === undefined ? progressStatus(runtime, color) : undefined;
 		const status = runtime.drainMarker?.status ?? [runtime.auto?.statusText() ?? legacy, live].filter(isText).join(" · ");
 		ctx.ui.setStatus(PANEL_STATUS_KEY, status === "" ? undefined : status);
-		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(runtime), { placement: "aboveEditor" });
+		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(runtime, color), { placement: "aboveEditor" });
 	};
 
 	/** `SWARM 7/9 done` while the pool works; nothing once no work is actionable. */
-	const progressStatus = (runtime: Runtime): string | undefined => {
+	const progressStatus = (runtime: Runtime, color: boolean): string | undefined => {
 		if (!(runtime.driver?.running ?? false)) return undefined;
-		const counts = runtime.store.counts();
-		const actionable = counts.ready + counts.claimed + counts.review + counts.done + counts.failed;
-		return actionable === 0 ? undefined : `SWARM ${counts.done + counts.failed}/${actionable} done`;
+		return progressStatusLine(runtime.store.counts(), { color });
 	};
 
 	/**
 	 * The bar and the counts line while the pool works; the drained summary once it is over. Both
 	 * answer to `room` - the widget lines left after the header, run line, rows and counters - so
-	 * the block never pushes the footer past the host's cap.
+	 * the block never pushes the footer past the host's cap. The bar itself stays plain: it is a
+	 * reading aid, and its shape already carries the progress the color would only repeat.
 	 */
-	const progressWidgetLines = (runtime: Runtime, width: number, room: number): string[] => {
+	const progressWidgetLines = (runtime: Runtime, width: number, room: number, color: boolean): string[] => {
 		if (runtime.drainMarker !== undefined) return fitSummaryLines(runtime.drainMarker.lines, room);
 		if (!(runtime.driver?.running ?? false)) return [];
 		const counts = runtime.store.counts();
-		const line = progressLine(counts);
+		const line = progressLine(counts, { color });
 		if (room >= 2) return [progressBar(counts, Math.min(PROGRESS_BAR_WIDTH, width)), line];
 		return room >= 1 ? [line] : [];
 	};
@@ -228,13 +240,13 @@ export default function swarm(pi: ExtensionAPI): void {
 	 * follows the host's own rule (`pi-tui/src/terminal.ts`): the PTY reports nothing until its
 	 * first resize, so `COLUMNS` and then 80 stand in.
 	 */
-	const panelWidgetLines = (runtime: Runtime): string[] => {
+	const panelWidgetLines = (runtime: Runtime, color: boolean): string[] => {
 		const columns = process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
 		const width = Math.max(20, columns - 2);
 		const headers = runtime.auto?.header() ?? [];
-		const body = runtime.driver?.panelLines(width) ?? [];
+		const body = runtime.driver?.panelLines(width, { color }) ?? [];
 		const room = WIDGET_LINE_BUDGET - headers.length - body.length;
-		return [...headers, ...body.slice(0, 1), ...progressWidgetLines(runtime, width, room), ...body.slice(1)];
+		return [...headers, ...body.slice(0, 1), ...progressWidgetLines(runtime, width, room, color), ...body.slice(1)];
 	};
 
 	const autoFor = (runtime: Runtime, ctx: ExtensionContext): AutoController => {

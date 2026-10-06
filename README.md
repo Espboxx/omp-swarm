@@ -171,6 +171,28 @@ dropping whole fields from the right. For the store's view of the same swarm, `/
 the roster (`role`, `state`, `task`, heartbeat age, capabilities, worktree) and `/swarm tasks` the
 task table.
 
+### Reminder colors
+
+The widget's agent rows and the counters take reminder colors instead of reading as one white block:
+each worker's name gets its own slot from a fixed 8-color palette, dealt over the agent ids in name
+order rather than over the display order — the slots are distinct within one frame, and a worker that
+changes state reorders the rows without recoloring anyone, so the color identifies the agent across
+repaints (a worker joining the roster can still shift a later slot). Its state token gets that state's
+color (`working` green, `reviewing` cyan, `waiting` amber, `blocked` red, `idle`/`offline` grey), and
+the non-zero counters carry the same language — `BLOCKED` red, `FAILED` bright red, `DONE` green, with a
+zero counter left plain so a clean pool stays calm. Color is decided in exactly one place,
+`extension/index.ts` (`colorEnabled(process.env, process.stdout.isTTY)`), and is off whenever the
+output is not an interactive terminal or `NO_COLOR` is set: `NO_COLOR=1 omp` and `omp | cat` emit the
+byte-identical plain text, with zero escape bytes. The escapes are zero-width — every line is still
+measured and clipped on VISIBLE columns with the host's own `Bun.stringWidth` rule (ANSI counted zero,
+three cells per tab) — so a colored row fits the terminal exactly as the plain one does, a CJK or emoji
+title included. Every row field that carries store text (name, state, task id and title, branch) is
+sanitized before it is measured or painted: escape sequences and C0/C1 control characters are dropped,
+so a task title can never smuggle a cursor move, a clear-screen or a clipboard write into the terminal.
+The status line's `SWARM n/m done` is formed with the same colors, but the host sanitizes status text
+before painting it (`pi-tui` `sanitizeStatusText`), so that one surface reads plain — measured, not
+assumed.
+
 ### Batch completion alert
 
 The operator gets **one** alert per batch, never repeated on a repaint. The edge is evaluated on the

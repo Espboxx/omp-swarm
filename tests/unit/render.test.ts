@@ -1,18 +1,24 @@
 import { describe, expect, test } from "bun:test";
+import { Text } from "@oh-my-pi/pi-tui";
+import { fitColored, visibleWidth } from "../../extension/color";
 import {
 	drainSummaryLines,
 	drainSummaryTitle,
 	fitSummaryLines,
 	progressBar,
 	progressLine,
+	progressStatusLine,
 	renderAgents,
+	renderBoard,
+	renderInbox,
 	renderPanel,
 	renderSummary,
+	renderTaskDetail,
 	renderTasks,
 } from "../../extension/render";
 import type { DrainSummary } from "../../extension/render";
 import type { StatusSnapshot } from "../../extension/store";
-import type { SwarmAgent, SwarmTask, TaskCounts } from "../../extension/types";
+import type { BlackboardEntry, SwarmAgent, SwarmMessage, SwarmTask, TaskCounts } from "../../extension/types";
 
 const NOW = 1_700_000_000_000;
 const SECOND = 1000;
@@ -487,5 +493,172 @@ describe("fitSummaryLines", () => {
 
 	test("keeps every fitted line tab-free", () => {
 		for (const line of fitSummaryLines(marker(12), 5)) expect(line).not.toContain("\t");
+	});
+});
+
+/** Every SGR the color module emits, removed - what a terminal would show as text. */
+function strip(sgr: string): string {
+	return sgr.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function countersLineOf(overrides: Partial<TaskCounts>, color?: boolean): string {
+	const lines = renderPanel(makeSnapshot({ counts: counts(overrides) }), 10, color === true ? { color: true } : {});
+	const line = lines.at(-2);
+	if (line === undefined) throw new Error("renderPanel carries no counter line");
+	return line;
+}
+
+describe("reminder colors", () => {
+	test("colors the non-zero counters and leaves a zero one plain", () => {
+		const busy = { ready: 2, claimed: 1, review: 4, blocked: 3, done: 6, failed: 1 };
+		const plain = countersLineOf(busy);
+		const colored = countersLineOf(busy, true);
+		expect(strip(colored)).toBe(plain);
+		expect(plain).toBe(" READY 2  CLAIMED 1  REVIEW 4  BLOCKED 3  DONE 6  FAILED 1");
+		expect(colored).toContain("\x1b[38;5;220mREADY 2\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;40mCLAIMED 1\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;45mREVIEW 4\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;203mBLOCKED 3\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;35mDONE 6\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;196mFAILED 1\x1b[0m");
+	});
+
+	test("a clean pool turns exactly one counter green instead of the whole line", () => {
+		const colored = countersLineOf({ done: 6 }, true);
+		expect(colored).toBe(" READY 0  CLAIMED 0  REVIEW 0  BLOCKED 0  \x1b[38;5;35mDONE 6\x1b[0m  FAILED 0");
+		expect(countersLineOf({ done: 6 })).toBe(" READY 0  CLAIMED 0  REVIEW 0  BLOCKED 0  DONE 6  FAILED 0");
+	});
+
+	test("a colored counter line has the plain line's visible width", () => {
+		for (const c of [{ ready: 1 }, { blocked: 6 }, { done: 9, failed: 3 }, { ready: 2, claimed: 1, review: 1, blocked: 1, done: 1, failed: 1 }]) {
+			const plain = countersLineOf(c);
+			expect(visibleWidth(countersLineOf(c, true))).toBe(visibleWidth(plain));
+			expect(visibleWidth(countersLineOf(c, true))).toBe(plain.length);
+		}
+	});
+
+	test("the status line stays plain in flight and reads as success or failure when it settles", () => {
+		expect(progressStatusLine(counts())).toBeUndefined();
+		expect(progressStatusLine(counts({ blocked: 6 }))).toBeUndefined();
+		expect(progressStatusLine(counts({ ready: 1, claimed: 1, done: 1 }), { color: true })).toBe("SWARM 1/3 done");
+		expect(progressStatusLine(counts({ done: 3 }), { color: true })).toBe("\x1b[38;5;35mSWARM 3/3 done\x1b[0m");
+		expect(progressStatusLine(counts({ done: 2, failed: 1 }), { color: true })).toBe("\x1b[38;5;203mSWARM 3/3 done\x1b[0m");
+		// Off is the plain form for every pool, settled or not.
+		expect(progressStatusLine(counts({ done: 3 }))).toBe("SWARM 3/3 done");
+		expect(progressStatusLine(counts({ done: 2, failed: 1 }))).toBe("SWARM 3/3 done");
+	});
+
+	test("colors the progress line's segments without touching its wording or width", () => {
+		const busy = counts({ claimed: 1, done: 6, failed: 1, ready: 1, blocked: 1 });
+		const plain = progressLine(busy);
+		const colored = progressLine(busy, { color: true });
+		expect(plain).toBe("TASKS 7/9 · 1 running · 1 ready · 1 blocked · 78%");
+		expect(strip(colored)).toBe(plain);
+		expect(visibleWidth(colored)).toBe(visibleWidth(plain));
+		expect(colored).toContain("\x1b[38;5;40m1 running\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;220m1 ready\x1b[0m");
+		expect(colored).toContain("\x1b[38;5;203m1 blocked\x1b[0m");
+		// The head and the percentage stay plain, and a zero segment stays omitted.
+		expect(colored.startsWith("TASKS 7/9 · ")).toBe(true);
+		expect(colored.endsWith("78%")).toBe(true);
+		expect(progressLine(counts({ ready: 3 }), { color: true })).toBe("TASKS 0/3 · \x1b[38;5;220m3 ready\x1b[0m · 0%");
+		expect(progressLine(counts(), { color: true })).toBe("TASKS - · no tasks");
+	});
+
+	test("clips a colored counter line on visible columns, not on its escapes", () => {
+		const plain = countersLineOf({ ready: 2, claimed: 1, review: 4, blocked: 3, done: 6, failed: 1 });
+		const colored = countersLineOf({ ready: 2, claimed: 1, review: 4, blocked: 3, done: 6, failed: 1 }, true);
+		// A line that already fits comes back byte-identically - no escape is added by measuring it.
+		expect(fitColored(colored, 200)).toBe(colored);
+		// Clipping lands on the same visible column it would have without the color.
+		for (const width of [1, 5, 12, 20, 33]) {
+			const cut = fitColored(colored, width);
+			expect(visibleWidth(cut)).toBe(width);
+			expect(strip(cut)).toBe(plain.slice(0, width));
+			expect(cut.length).toBeGreaterThan(strip(cut).length);
+		}
+	});
+});
+
+/** The drain block the widget paints after every batch, for one finished task with `title`. */
+function drainOf(title: string, status: "done" | "failed" = "done"): DrainSummary {
+	return {
+		counts: counts({ done: status === "done" ? 1 : 0, failed: status === "failed" ? 1 : 0 }),
+		elapsedMs: 4 * MINUTE,
+		agents: 1,
+		tasks: [{ id: "task-9", title, status, agent: "BrightTiger", durationMs: 4 * MINUTE, reason: status === "failed" ? "boom" : undefined }],
+	};
+}
+
+/** Characters the terminal would execute rather than print; newlines are the block's own structure. */
+function injectedControls(text: string): string[] {
+	return [...text].filter((ch) => {
+		const code = ch.codePointAt(0) ?? 0;
+		return ch !== "\n" && (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f));
+	});
+}
+
+describe("store text safety", () => {
+	// The titles a peer can publish: ASCII, CJK, emoji, a ZWJ family and one carrying terminal
+	// commands. The metrics below are the host's own, not a re-implementation of them.
+	const titles = [
+		"plain ascii title long enough to need a clip somewhere inside the line",
+		"修复颜色并记录每一个细节".repeat(4),
+		"done 🎉🚀✅🄴 every emoji doubled".repeat(3),
+		"family 👨‍👩‍👧‍👦 portrait".repeat(6),
+		"task \u001b[2J wiped \u001b]52;c;cGF3bmVk\u0007 clipped",
+	];
+
+	test("a wide task title never overruns the width the host wraps at", () => {
+		for (const title of titles) {
+			for (let width = 20; width <= 160; width += 1) {
+				for (const line of drainSummaryLines(drainOf(title), { width })) {
+					expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+					// The widget hands the host `width = columns - 2` and the host wraps at
+					// `columns - 2 * paddingX`; a line claiming `width` columns must stay one row.
+					expect(new Text(line, 1, 0).render(width + 2).length).toBe(1);
+				}
+			}
+		}
+	});
+
+	test("a control sequence in store text reaches none of the terminal surfaces", () => {
+		const title = "task \u001b[2J wiped \u001b]52;c;cGF3bmVk\u0007 and \u001b]8;;http://evil\u0007link\u001b]8;;\u0007 clipped";
+		const task = makeTask({ title, description: `desc ${title}`, createdBy: "peer\u001b[2J", dependencies: ["task-\u001b[2J1"] });
+		const entry: BlackboardEntry = {
+			id: 7,
+			type: "FACT",
+			content: `content ${title}`,
+			tags: ["t\u001b[2J"],
+			agentId: "peer\u001b[2J",
+			taskId: "task-\u001b[2J9",
+			files: [],
+			createdAt: NOW,
+		};
+		const message: SwarmMessage = {
+			id: 3,
+			from: "peer\u001b[2J",
+			to: "CalmTiger",
+			body: `body ${title}`,
+			urgent: false,
+			createdAt: NOW,
+		};
+
+		const surfaces: Record<string, string> = {
+			drain: drainSummaryLines(drainOf(title, "failed"), { width: 118 }).join("\n"),
+			tasks: renderTasks([task], NOW),
+			detail: renderTaskDetail(task),
+			board: renderBoard([entry]),
+			inbox: renderInbox([message]),
+		};
+		for (const [name, text] of Object.entries(surfaces)) {
+			expect({ name, controls: injectedControls(text) }).toEqual({ name, controls: [] });
+			expect(text).toContain("clipped");
+		}
+		// The visible text survives: only the sequences are gone.
+		expect(surfaces.tasks).toContain("wiped");
+		expect(surfaces.detail).toContain("link");
+		expect(surfaces.board).toContain("content");
+		expect(surfaces.inbox).toContain("body");
 	});
 });
