@@ -2,11 +2,22 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { AUTO_TICK_MS, AutoController } from "./auto";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
 import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
 import { SwarmDriver, type SwarmDriverDeps, type TimerApi } from "./driver";
-import { renderAgents, renderBoard, renderSummary, renderTasks } from "./render";
+import {
+	drainSummaryLines,
+	drainSummaryTitle,
+	progressBar,
+	progressLine,
+	renderAgents,
+	renderBoard,
+	renderSummary,
+	renderTasks,
+	type DrainSummary,
+} from "./render";
 import { SwarmStore } from "./store";
 import { buildSwarmTools, isBoardType, isTaskStatus, type SwarmIdentity } from "./tools";
 import { DEFAULT_CONFIG, type SwarmConfig } from "./types";
@@ -14,6 +25,21 @@ import { DEFAULT_CONFIG, type SwarmConfig } from "./types";
 const MAIN_AGENT_ID = "main";
 const PANEL_STATUS_KEY = "swarm";
 const PANEL_WIDGET_KEY = "swarm-panel";
+/** The progress bar is a reading aid, not a ruler: keep it short enough to sit beside the text. */
+const PROGRESS_BAR_WIDTH = 20;
+
+/** What the completion alert leaves behind, so the operator can still read it after the fact. */
+interface DrainMarker {
+	/** The full summary, kept in the widget above the editor. */
+	lines: string[];
+	/** The same headline on the status line. */
+	status: string;
+}
+
+/** The status line's parts are optional by construction; drop the absent and the empty ones. */
+function isText(value: string | undefined): value is string {
+	return value !== undefined && value !== "";
+}
 
 interface Runtime {
 	root: string;
@@ -23,6 +49,8 @@ interface Runtime {
 	driver?: SwarmDriver;
 	auto?: AutoController;
 	autoTimer?: Timer;
+	/** Set once a batch drained; cleared by the next actionable task or the next start. */
+	drainMarker?: DrainMarker;
 }
 
 /**
@@ -146,13 +174,34 @@ export default function swarm(pi: ExtensionAPI): void {
 		const legacy = runtime.driver?.running
 			? `swarm ${snapshot.agents.length}a r${counts.ready} c${counts.claimed} v${counts.review} d${counts.done}`
 			: undefined;
-		ctx.ui.setStatus(PANEL_STATUS_KEY, runtime.auto?.statusText() ?? legacy);
+		// Actionable work again means the last batch's summary is history: drop the marker so the
+		// status line goes back to reporting the live pool.
+		if (runtime.drainMarker !== undefined && counts.ready + counts.claimed + counts.review > 0) runtime.drainMarker = undefined;
+		const live = runtime.drainMarker === undefined ? progressStatus(runtime) : undefined;
+		const status = runtime.drainMarker?.status ?? [runtime.auto?.statusText() ?? legacy, live].filter(isText).join(" · ");
+		ctx.ui.setStatus(PANEL_STATUS_KEY, status === "" ? undefined : status);
 		ctx.ui.setWidget(PANEL_WIDGET_KEY, panelWidgetLines(runtime), { placement: "aboveEditor" });
 	};
 
+	/** `SWARM 7/9 done` while the pool works; nothing once no work is actionable. */
+	const progressStatus = (runtime: Runtime): string | undefined => {
+		if (!(runtime.driver?.running ?? false)) return undefined;
+		const counts = runtime.store.counts();
+		const actionable = counts.ready + counts.claimed + counts.review + counts.done + counts.failed;
+		return actionable === 0 ? undefined : `SWARM ${counts.done + counts.failed}/${actionable} done`;
+	};
+
+	/** The bar and the counts line while the pool works; the drained summary once it is over. */
+	const progressWidgetLines = (runtime: Runtime, width: number): string[] => {
+		if (runtime.drainMarker !== undefined) return runtime.drainMarker.lines;
+		if (!(runtime.driver?.running ?? false)) return [];
+		const counts = runtime.store.counts();
+		return [progressBar(counts, Math.min(PROGRESS_BAR_WIDTH, width)), progressLine(counts)];
+	};
+
 	/**
-	 * What the string-array widget carries: the mode header followed by the driver's summary -
-	 * the run line, one rich row per worker and the fleet counters.
+	 * What the string-array widget carries: the mode header, the driver's run line, the live
+	 * progress (or the drained summary in its place), one rich row per worker and the counters.
 	 *
 	 * Width: the host paints each line as `new Text(line, 1, 0)`, which wraps at
 	 * `width - 2 * paddingX` (`pi-tui/src/components/text.ts`), so rows have to fit in the
@@ -162,7 +211,9 @@ export default function swarm(pi: ExtensionAPI): void {
 	 */
 	const panelWidgetLines = (runtime: Runtime): string[] => {
 		const columns = process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
-		return [...(runtime.auto?.header() ?? []), ...(runtime.driver?.panelLines(Math.max(20, columns - 2)) ?? [])];
+		const width = Math.max(20, columns - 2);
+		const body = runtime.driver?.panelLines(width) ?? [];
+		return [...(runtime.auto?.header() ?? []), ...body.slice(0, 1), ...progressWidgetLines(runtime, width), ...body.slice(1)];
 	};
 
 	const autoFor = (runtime: Runtime, ctx: ExtensionContext): AutoController => {
@@ -256,6 +307,34 @@ export default function swarm(pi: ExtensionAPI): void {
 		await runtimes.stopAll();
 	});
 
+	/**
+	 * The one-shot batch-completion alert. `onDrained` fires once per batch (the driver latches it),
+	 * and this is the only consumer, so nothing here may repeat on a repaint.
+	 *
+	 * Prominence (per the task-38 probe): `ui.notify` is a 2.4 s toast or a single replaced status
+	 * line, and its loudest legal level would be "error" for a success, so the alert goes out on the
+	 * host's own completion channel - `TERMINAL.sendNotification`, the exact one the host uses for
+	 * its "Complete" banner - with the headline, while the summary itself persists in the widget and
+	 * on the status line. Multi-agent mode off has no controller to announce anything, so the full
+	 * summary also lands in the transcript; with the mode on the auto controller posts its own
+	 * notice, and one alert in the chat is enough.
+	 */
+	const alertDrained = (ctx: ExtensionContext, runtime: Runtime, summary: DrainSummary): void => {
+		const width = Math.max(20, (process.stdout.columns || Number(Bun.env.COLUMNS) || 80) - 2);
+		const title = drainSummaryTitle(summary);
+		runtime.drainMarker = { lines: drainSummaryLines(summary, { width }), status: title };
+		try {
+			TERMINAL.sendNotification({ title: "SWARM DONE", body: title, type: "completion", urgency: "normal" });
+		} catch {
+			// A terminal without the capability: the widget and status markers still carry it.
+		}
+		if (ctx.hasUI) ctx.ui.notify(title, "info");
+		if (runtime.auto === undefined) {
+			pi.sendMessage({ customType: "swarm", content: runtime.drainMarker.lines.join("\n"), display: true }, { deliverAs: "followUp" });
+		}
+		refreshPanel(ctx, runtime);
+	};
+
 	const ensureDriver = (ctx: ExtensionContext, runtime: Runtime): SwarmDriver => {
 		if (runtime.driver) return runtime.driver;
 		const exec = async (command: string, args: string[], cwd: string) => {
@@ -268,7 +347,12 @@ export default function swarm(pi: ExtensionAPI): void {
 			exec,
 			notify: (text, level) => ctx.ui.notify(text, level ?? "info"),
 			onPanel: () => refreshPanel(ctx, runtime),
-			onDrained: () => runtime.auto?.noteDrained(),
+			onDrained: (summary) => {
+				// The controller still has to hear about the drain: its own drain branch is what stops
+				// the pool and tells the coordinator to report to the user.
+				runtime.auto?.noteDrained();
+				alertDrained(ctx, runtime, summary);
+			},
 			deliverToMain: (text, urgent) => pi.sendMessage({ customType: "swarm", content: text, display: true }, { deliverAs: urgent ? "steer" : "followUp" }),
 		});
 	};
@@ -324,6 +408,8 @@ export default function swarm(pi: ExtensionAPI): void {
 						ctx.ui.notify("swarm is already running; /swarm stop first", "warning");
 						return;
 					}
+					// A new run is a new batch: the previous summary is history.
+					runtime.drainMarker = undefined;
 					const planned = await driver.start(count);
 					refreshPanel(ctx, runtime);
 					ctx.ui.notify(

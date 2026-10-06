@@ -4,10 +4,10 @@ import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-
 import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgentInfoRows, type AgentInfo } from "./agentinfo";
 import { expandWorkers, type WorkerSpec } from "./config";
-import { renderPanel } from "./render";
+import { renderPanel, type DrainSummary } from "./render";
 import type { SwarmStore } from "./store";
 import { buildSwarmTools, SWARM_TOOL_NAMES, type SwarmIdentity } from "./tools";
-import type { RoleConfig, SwarmConfig } from "./types";
+import type { RoleConfig, SwarmConfig, SwarmTask, TaskCounts } from "./types";
 
 type HostSdk = ExtensionAPI["pi"];
 type CreateOptions = NonNullable<Parameters<HostSdk["createAgentSession"]>[0]>;
@@ -39,8 +39,11 @@ export interface SwarmDriverDeps {
 	notify(text: string, level?: "info" | "warning" | "error"): void;
 	/** Called whenever the roster changes so the host can repaint its panel. */
 	onPanel(): void;
-	/** Called once per run when every task is terminal (done or failed) and nothing is claimable. */
-	onDrained?(): void;
+	/**
+	 * Called ONCE per batch when nothing is actionable any more and at least one task of that batch
+	 * finished, with the data for the completion summary. Never called twice for the same batch.
+	 */
+	onDrained?(summary: DrainSummary): void;
 	/** Deliver a message to the main session (native `pi.sendMessage` path). */
 	deliverToMain?(text: string, urgent: boolean): void;
 }
@@ -67,6 +70,13 @@ interface WorkerRuntime {
 
 const TICK_INTERVAL_MS = 3000;
 const PANEL_INTERVAL_MS = 2000;
+/**
+ * The pool must hold still this long with nothing actionable before it counts as drained: a worker
+ * that finished its task two ticks ago may not have claimed the next one yet.
+ */
+const DRAIN_SETTLE_MS = 10_000;
+/** One scan covers the whole pool; the store is local and this is the same query the board uses. */
+const TASK_SCAN_LIMIT = 500;
 const STOP_GRACE_MS = 90_000;
 const SPAWN_TIMEOUT_MS = 120_000;
 /** The session-stats fold walks the transcript, so refresh it at most this often per worker. */
@@ -165,7 +175,17 @@ export class SwarmDriver {
 	#tickHandle: Timer | undefined;
 	#heartbeatHandle: Timer | undefined;
 	#panelHandle: Timer | undefined;
+	/** The batch-completion alert already fired for the batch currently on the board. */
 	#drained = false;
+	/** Task ids of the current batch (non-terminal at start, or created while it ran). */
+	#batch = new Set<string>();
+	/** Every id this run has seen, so a task that appears later reads as new. */
+	#seen = new Set<string>();
+	/** When the pool's counts last moved, and the key they moved to: the settle window's clock. */
+	#countsAt = 0;
+	#countsKey = "";
+	/** Driver start, for the summary's elapsed time. */
+	#startedAt = 0;
 	/** Branch per git cwd, re-read at most every `BRANCH_TTL_MS`; the spawn is the expensive part. */
 	readonly #branches = new Map<string, { at: number; value: string | undefined }>();
 
@@ -203,7 +223,7 @@ export class SwarmDriver {
 		if (this.#running) throw new Error("swarm is already running");
 		const specs = expandWorkers(this.#deps.config, count, roles);
 		this.#running = true;
-		this.#drained = false;
+		this.#openBatch();
 		this.#started = [];
 		this.#slots = roleSlots(specs);
 		// Workers come up in the background: the caller (an extension command frame)
@@ -385,12 +405,101 @@ export class SwarmDriver {
 				worker.lastTickAt = Date.now();
 			}
 		}
-		const counts = this.#deps.store.counts();
-		if (!this.#drained && counts.ready + counts.claimed + counts.review + counts.blocked === 0 && counts.done + counts.failed > 0) {
-			this.#drained = true;
-			this.#trace("tick: swarm drained");
-			this.#deps.onDrained?.();
+		this.#checkDrained();
+	}
+
+	/**
+	 * Start the batch this run is responsible for: every task that is still non-terminal right now.
+	 * Tasks created while the run is going join it in `#checkDrained`, so a batch is "what this run
+	 * had to do", not "whatever the board happens to hold when the last worker goes idle".
+	 */
+	#openBatch(): void {
+		const tasks = this.#deps.store.listTasks({ limit: TASK_SCAN_LIMIT });
+		this.#seen = new Set(tasks.map((task) => task.id));
+		this.#batch = new Set(tasks.filter((task) => task.status !== "done" && task.status !== "failed").map((task) => task.id));
+		this.#drained = false;
+		this.#countsKey = "";
+		this.#countsAt = Date.now();
+		this.#startedAt = Date.now();
+	}
+
+	/**
+	 * The batch-completion edge, evaluated on the tick that already exists - no new timer.
+	 *
+	 * It fires when nothing is actionable (`ready`/`claimed`/`review` are all empty), at least one
+	 * member of the batch finished, and the counts have held still for `DRAIN_SETTLE_MS`. Blocked
+	 * work is deliberately outside the predicate: a task whose dependency was closed as superseded
+	 * stays blocked forever, so including it would mean this edge never fires at all in a pool that
+	 * carries such a residue (see the 23/24/25/27/28/29 chain). The latch keeps the alert one-shot
+	 * per batch; a task that shows up later opens a new one.
+	 */
+	#checkDrained(): void {
+		const now = Date.now();
+		const { store } = this.#deps;
+		const counts = store.counts();
+		const key = `${counts.ready}/${counts.claimed}/${counts.blocked}/${counts.review}/${counts.done}/${counts.failed}`;
+		if (key !== this.#countsKey) {
+			this.#countsKey = key;
+			this.#countsAt = now;
 		}
+		let arrived = false;
+		for (const task of store.listTasks({ limit: TASK_SCAN_LIMIT })) {
+			const known = this.#seen.has(task.id);
+			this.#seen.add(task.id);
+			if (known && (task.status === "done" || task.status === "failed")) continue;
+			// New to this run, or still open: either way the batch owns it.
+			if (!this.#batch.has(task.id)) arrived = true;
+			this.#batch.add(task.id);
+		}
+		if (arrived) this.#drained = false;
+		if (this.#drained || counts.ready + counts.claimed + counts.review > 0) return;
+		if (now - this.#countsAt < DRAIN_SETTLE_MS) return;
+		const finished = [...this.#batch]
+			.map((id) => store.getTask(id))
+			.filter((task): task is SwarmTask => task !== undefined && (task.status === "done" || task.status === "failed"));
+		// Nothing finished means the run ended without doing anything: the stall notice owns that
+		// case, and "the swarm finished" would be a lie.
+		if (finished.length === 0) return;
+		this.#drained = true;
+		this.#trace(`tick: batch drained - ${finished.length} of ${this.#batch.size} task(s) finished`);
+		this.#deps.onDrained?.(this.#drainSummary(counts, finished, now));
+	}
+
+	/**
+	 * The data for the one-shot completion alert. Two facts the store cannot give directly, handled
+	 * honestly rather than guessed: `complete()`/`fail()` null `claimedBy`/`claimedAt`, so the
+	 * finisher is joined from the event log (the only place it survives) and the duration is
+	 * creation-to-completion (the working window is not recoverable). Cost is per session, never per
+	 * task: it is the fold over this batch's workers, and it is omitted when the host will not say.
+	 */
+	#drainSummary(counts: TaskCounts, finished: SwarmTask[], now: number): DrainSummary {
+		const finisher = new Map<string, string>();
+		for (const event of this.#deps.store.recentEvents(200)) {
+			if (event.taskId === undefined || event.agentId === undefined || finisher.has(event.taskId)) continue;
+			finisher.set(event.taskId, event.agentId);
+		}
+		let cost = 0;
+		let priced = false;
+		for (const worker of this.#workers.values()) {
+			const usage = this.#usage(worker, now);
+			if (usage === undefined) continue;
+			cost += usage.costUsd;
+			priced = true;
+		}
+		return {
+			counts,
+			elapsedMs: Math.max(0, now - this.#startedAt),
+			agents: this.#workers.size,
+			costUsd: priced ? cost : undefined,
+			tasks: finished.map((task) => ({
+				id: task.id,
+				title: task.title,
+				status: task.status === "failed" ? "failed" : "done",
+				agent: finisher.get(task.id),
+				durationMs: Math.max(0, task.updatedAt - task.createdAt),
+				reason: task.status === "failed" ? task.result : undefined,
+			})),
+		};
 	}
 
 	#continuationPrompt(worker: WorkerRuntime, messages: number, mine: number, ready = 0, reviews = 0): string {

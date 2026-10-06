@@ -33,7 +33,8 @@ and ownership conflicts are settled by the database, never by agent etiquette.
 | Subagent observability | `session.subscribe()` (`agent_start` / `agent_end.isTerminal`) | idle detection for tick delivery |
 | Message delivery | `session.prompt()` / `sendUserMessage({deliverAs: "steer" \| "followUp"})` | a peer message is delivered as a prompt, not over a private protocol |
 | Managed timers | `ctx.setInterval` / `ctx.clearTimer` | heartbeat, sweeper, tick, panel — throws stay contained |
-| TUI | `ctx.ui.setStatus` / `ctx.ui.setWidget` | live swarm status line + the `swarm-panel` text widget above the editor |
+| TUI | `ctx.ui.setStatus` / `ctx.ui.setWidget` / `ctx.ui.notify` | live swarm status line, the `swarm-panel` text widget above the editor, and the alert line |
+| Completion banner | `TERMINAL.sendNotification` (`@oh-my-pi/pi-tui`) | the batch-completion alert goes out on the host's own "Complete" channel |
 | Slash commands | `pi.registerCommand("swarm", …)` | `/swarm start`, `/swarm status`, … |
 | Isolated checkouts | `git worktree` (as OMP does for tasks) | `worktrees: true` gives each worker a branch + checkout |
 | Process execution | `pi.exec` | worktree creation |
@@ -60,13 +61,13 @@ extension/
   store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
-  render.ts    text rendering for the panel, task table, summary and tool output
+  render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
   agentinfo.ts pure agent-list rows: AgentInfo facts -> one fitted ASCII line per worker
   types.ts     domain types
 tests/
   unit/store.test.ts           32 unit tests of the store (incl. cross-process claim races and task-graph refusals)
   unit/auto.test.ts            28 unit tests of the roster, its mid-run growth and the state machine
-  unit/render.test.ts          15 unit tests of the panel, task table and summary rendering
+  unit/render.test.ts          33 unit tests of the panel, task table, summary, progress bar and batch-completion rendering
   unit/agentinfo.test.ts       15 unit tests of the agent-row format, compaction, degradation and truncation
   helpers/swarm-child.ts       child-process worker used by the race tests
   integration/harness.ts       scratch project, seeded tasks, shared assertions
@@ -158,11 +159,45 @@ expanded into callsigns (`SwiftTiger`, `CalmFalcon`, …); `capabilities` gate c
 instead of blocking the swarm. Set `SWARM_TRACE=1` to write per-worker milestones to
 `.swarm/driver.log`.
 
-While the swarm runs, the widget above the editor and the `swarm` status line update live. The
-widget carries one row per worker — `state`, the task it holds, git branch, `ctx <n>%`, tokens
-in/out, `$cost`, turns and last activity — fitted to the terminal width by dropping whole fields
-from the right. For the store's view of the same swarm, `/swarm agents` lists the roster (`role`,
-`state`, `task`, heartbeat age, capabilities, worktree) and `/swarm tasks` the task table.
+While the swarm runs, the widget above the editor and the `swarm` status line update live. Above
+the worker rows the widget carries the task progress — a bar (`██████░░░░`) over a
+`TASKS 7/9 · 1 running · 1 blocked · 78%` line — and the status line carries the compact form
+(`SWARM 7/9 done`). The denominator is the ACTIONABLE work (`ready + claimed + review + done +
+failed`); `blocked` is deliberately excluded and reported as its own segment, because a task whose
+dependency was closed as superseded stays blocked forever and a bar that counted it would never
+reach 100 %. The widget then carries one row per worker — `state`, the task it holds, git branch,
+`ctx <n>%`, tokens in/out, `$cost`, turns and last activity — fitted to the terminal width by
+dropping whole fields from the right. For the store's view of the same swarm, `/swarm agents` lists
+the roster (`role`, `state`, `task`, heartbeat age, capabilities, worktree) and `/swarm tasks` the
+task table.
+
+### Batch completion alert
+
+The operator gets **one** alert per batch, never repeated on a repaint. The edge is evaluated on the
+tick that already runs (no new timer): nothing actionable, at least one task of the batch finished,
+and the counts held still for `DRAIN_SETTLE_MS` (10 s — the driver samples every 3 s, so the alert
+lands 10–13 s after the last task finishes, which is also what keeps a worker that is about to claim
+the next task from ending the batch early). A task that appears later opens a new batch and the
+alert can fire again for it.
+
+The alert goes out on three surfaces:
+
+- the host's own completion channel — `TERMINAL.sendNotification({ title: "SWARM DONE", body:
+  <headline>, type: "completion" })`, the same one the host uses for its "Complete" banner
+  (suppressed by `PI_NOTIFICATIONS=off`, a no-op in a headless terminal);
+- a `ui.notify` line, plus the full multi-line summary in the transcript when multi-agent mode is
+  off (with the mode on the controller posts its own finish notice, and one alert in the chat is
+  enough);
+- a **persistent marker**: the widget keeps the summary lines and the status line the headline —
+  `SWARM DONE · 9/9 tasks (7 done, 2 failed) · 3 agents · 12m40s · $0.42` — until new actionable
+  work appears or the next `/swarm start`.
+
+The batch is what that run was responsible for: the tasks that were non-terminal when the pool
+started, plus any created while it ran. The summary stays honest about what it knows: the finisher
+is joined from the event log (`complete()`/`fail()` clear `claimedBy`), the duration is
+creation-to-completion (the working window is not recoverable), and the cost is this batch's worker
+sessions folded together — there is no per-task price, so none is printed. A run that ends with
+nothing finished is the stall notice's case, not this one, and never claims "the swarm finished".
 
 ### Multi-agent mode (`/swarm on`)
 
@@ -190,13 +225,17 @@ session does both by itself:
    still coming up neither triggers a growth of its own nor gets counted twice. A task published after
    the pool started (the coordinator adding work, a worker splitting an oversized one) therefore gets
    workers instead of queueing behind a pool too small for it.
-4. When every task is `done`/`failed`, the swarm stops itself and the main session receives a
-   finish notice with the counts — answer, then send the next task if you have one.
+4. When every task is `done`/`failed`, the swarm stops itself, the main session receives a finish
+   notice with the counts, and the operator gets the batch-completion alert (see above) — answer,
+   then send the next task if you have one.
 
 The status line tracks the mode: `idle`, `planning`, `running` (`3a r0 c2 v0 d1` = online agents,
-ready/claimed/review/done), `done n/m`, `stalled`; the widget above the editor carries a
-`MULTI-AGENT MODE · <phase>` header over one rich row per worker (state, task, branch, ctx%,
-tokens, cost, turns, age — see above); `/swarm agents` lists the roster from the store. `/swarm off`
+ready/claimed/review/done), `done n/m`, `stalled`, prefixed while a pool is up by the compact
+progress (`SWARM 7/9 done`) and replaced once a batch drains by its headline
+(`SWARM DONE · 9/9 tasks (7 done, 2 failed) · 3 agents · 12m40s · $0.42`); the widget above the
+editor carries a `MULTI-AGENT MODE · <phase>` header over the progress block and one rich row per
+worker (state, task, branch, ctx%, tokens, cost, turns, age — see above), and keeps the drained
+summary in place of the progress block; `/swarm agents` lists the roster from the store. `/swarm off`
 stops running workers and persists
 `"auto": false`; a swarm blocked with nothing claimable is stopped after 90 s and reported as
 `stalled` instead of spinning. If the coordinator never publishes tasks for a request that is still
@@ -280,7 +319,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 90 unit tests in tests/unit (32 store + 28 auto-mode + 15 render + 15 agent-list rows, incl. a 3-process claim race)
+bun run test                   # 108 unit tests in tests/unit (32 store + 28 auto-mode + 33 render + 15 agent-list rows, incl. a 3-process claim race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
@@ -369,6 +408,20 @@ received the finish notice, the panel read `SWARM stopped · 0 agents` and the l
 `· idle` (mode still on); `/swarm off` cleared the line and persisted `"auto": false`. `bun test` in
 that project exits 0.
 
+Live progress + completion alert (Windows Terminal, isolated sandbox root, `workers: 2`,
+`review: false`, `/swarm start 2`):
+
+| Frame | Evidence |
+|---|---|
+| mid-run | `██████████░░░░░░░░░░` over `TASKS 2/4 · 2 running · 50%`, both workers `working` on their own task, footer `READY 0 CLAIMED 2 REVIEW 0 BLOCKED 0 DONE 2 FAILED 0`, status line `swarm 2a r0 c2 v0 d2 · SWARM 2/4 done` |
+| drain | one banner box `SWARM DONE · 4/4 tasks (4 done) · 2 agents · 3m39s · $0.01` with a line per task (`v task-3 Write out/three.txt (SwiftTiger · 1m)`), the same summary in the widget in place of the progress block, and the headline on the status line |
+| ≥30 s later | identical — no second alert, same two batch boxes in the transcript, widget and status unchanged |
+| composer | intact in every frame: the widget sits above the editor, the `╰─` composer line and the status line below it, nothing painted through |
+
+A second batch (two tasks published while the pool ran) fired its own alert with the right per-task
+lines once its own settle window passed, which is the one-batch-one-alert rule and the
+"new task re-opens the edge" rule in the same run.
+
 ## Known limits
 
 - Workers are in-process sessions: one OMP process hosts the swarm. Cross-machine swarms are out of
@@ -394,6 +447,14 @@ that project exits 0.
   The delta itself is measured against `max(live, planned)` (`auto.ts:304`).
 - The status line and widget are extension UI frames — a headless session (`--no-ui`) emits none by
   host contract; use a UI-mode session to see them.
+- The batch-completion alert is one per batch and lands `DRAIN_SETTLE_MS` (10 s) after the task
+  counts stop moving, not the instant the last task finishes: the pool has to look idle for longer
+  than a tick, or a worker about to claim the next task would end the batch early. A batch's tasks
+  are the ones it started with plus any created while it ran, so a run restarted later does not
+  re-report finished work.
+- The loud surface is `TERMINAL.sendNotification`, which `PI_NOTIFICATIONS=off` suppresses and a
+  headless terminal drops. The persistent marker (widget + status line) is UI-only too, so a
+  `--no-ui` session gets the summary as a transcript message only when multi-agent mode is off.
 - `swarm_wait` blocks a worker turn; it is not a scheduler replacement.
 - Cycles cannot enter the graph any more (`store.ts:createTask` refuses unknown/self/cyclic
   dependencies), but rows created before that check existed can still be cyclic: they stay `blocked`

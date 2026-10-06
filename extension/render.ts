@@ -1,4 +1,4 @@
-import type { BlackboardEntry, SwarmAgent, SwarmMessage, SwarmTask } from "./types";
+import type { BlackboardEntry, SwarmAgent, SwarmMessage, SwarmTask, TaskCounts } from "./types";
 import type { StatusSnapshot } from "./store";
 
 function age(now: number, then: number): string {
@@ -159,4 +159,175 @@ export function renderSummary(snapshot: StatusSnapshot): string {
 	const done = completion === undefined ? c.done : snapshot.recentDone.length;
 	lines.push(start === undefined ? `throughput done ${done}` : `throughput done ${done} in ${age(snapshot.now, start)}`);
 	return lines.join("\n");
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Task progress + one-shot batch-completion summary.
+ *
+ * Both are pure and host-free: deterministic given their inputs, no I/O, no clock of their own.
+ * The denominator is the ACTIONABLE work (`ready + claimed + review + done + failed`); blocked
+ * tasks are excluded because they can be permanently blocked by a dependency that will never
+ * finish - counting them would leave the bar short of 100% forever - and are reported separately
+ * instead. Nothing is invented: a field that is not known is omitted, never replaced by a
+ * placeholder or a fabricated number.
+ * ---------------------------------------------------------------------------------------------- */
+
+export interface ProgressInput {
+	counts: TaskCounts;
+}
+
+function finishedCount(counts: TaskCounts): number {
+	return counts.done + counts.failed;
+}
+
+/** The work the bar can still finish: blocked is deliberately not part of it. */
+function actionableCount(counts: TaskCounts): number {
+	return counts.ready + counts.claimed + counts.review + counts.done + counts.failed;
+}
+
+/**
+ * `██████░░░░` - full blocks for the finished share of the actionable work, light for the rest.
+ * `width` is in characters. A non-positive width, or a pool with nothing actionable, renders "".
+ */
+export function progressBar(counts: ProgressInput["counts"], width: number): string {
+	if (width <= 0) return "";
+	const actionable = actionableCount(counts);
+	if (actionable === 0) return "";
+	const filled = Math.min(width, Math.max(0, Math.round((finishedCount(counts) / actionable) * width)));
+	return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
+/**
+ * `TASKS 7/9 · 1 running · 1 blocked · 78%` - finished/actionable, then the non-zero segments
+ * (running = claimed + review, ready, blocked) and the percentage. Nothing actionable reads as
+ * `TASKS - · no tasks`; a zero segment is omitted rather than printed as `0 …`.
+ */
+export function progressLine(counts: ProgressInput["counts"]): string {
+	const actionable = actionableCount(counts);
+	if (actionable === 0) return "TASKS - · no tasks";
+	const finished = finishedCount(counts);
+	const running = counts.claimed + counts.review;
+	const parts = [`TASKS ${finished}/${actionable}`];
+	if (running > 0) parts.push(`${running} running`);
+	if (counts.ready > 0) parts.push(`${counts.ready} ready`);
+	if (counts.blocked > 0) parts.push(`${counts.blocked} blocked`);
+	parts.push(`${Math.round((100 * finished) / actionable)}%`);
+	return parts.join(" · ");
+}
+
+export interface DrainSummary {
+	counts: ProgressInput["counts"];
+	elapsedMs: number;
+	agents: number;
+	costUsd?: number;
+	tasks: Array<{ id: string; title: string; status: "done" | "failed"; agent?: string; durationMs?: number; reason?: string }>;
+}
+
+/** `45s`, `12m40s`, `3m`, `1h06m` - sub-minute, then minutes (seconds dropped at the whole minute), then hours with the minutes carried. */
+function compactDuration(ms: number): string {
+	const total = Math.max(0, Math.round(ms / 1000));
+	if (total < 60) return `${total}s`;
+	const minutes = Math.floor(total / 60);
+	if (minutes < 60) {
+		const seconds = total % 60;
+		return seconds === 0 ? `${minutes}m` : `${minutes}m${String(seconds).padStart(2, "0")}s`;
+	}
+	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+/**
+ * Flattened text clipped to `width` characters, ending in `…`. A non-positive width yields "",
+ * and a cut is never allowed to land inside a surrogate pair.
+ */
+function clipTo(text: string, width: number): string {
+	if (width <= 0) return "";
+	const flat = text.replace(/\s+/g, " ").trim();
+	if (flat.length <= width) return flat;
+	if (width === 1) return "…";
+	let cut = flat.slice(0, width - 1);
+	if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+	return `${cut}…`;
+}
+
+/** Last-resort guard: the width and no-tab invariants hold even for a pathological width. */
+function fitLine(line: string, width: number): string {
+	const safe = line.replace(/\t/g, " ");
+	if (width <= 0 || safe.length <= width) return safe;
+	if (width === 1) return "…";
+	return `${safe.slice(0, width - 1)}…`;
+}
+
+/**
+ * `SWARM DONE · 9/9 tasks (7 done, 2 failed) · 3 agents · 12m40s · $0.42`. The `(… done, … failed)`
+ * split drops the failed half at zero; `· $cost` is omitted entirely when the cost is unknown
+ * (never `$?`); blocked tasks stay out of the denominator, as in `progressLine`.
+ */
+export function drainSummaryTitle(s: DrainSummary): string {
+	const c = s.counts;
+	const parts = [
+		"SWARM DONE",
+		`${finishedCount(c)}/${actionableCount(c)} tasks (${c.done} done${c.failed > 0 ? `, ${c.failed} failed` : ""})`,
+		`${s.agents} agents`,
+		compactDuration(s.elapsedMs),
+	];
+	if (s.costUsd !== undefined) parts.push(`$${s.costUsd.toFixed(2)}`);
+	return parts.join(" · ");
+}
+
+/** `task-2` sorts before `task-10`: same prefix, numeric suffix decides. */
+function compareTaskIds(a: string, b: string): number {
+	const ma = /^(.*?)(\d+)$/.exec(a);
+	const mb = /^(.*?)(\d+)$/.exec(b);
+	if (ma !== null && mb !== null && ma[1] === mb[1]) return Number(ma[2]) - Number(mb[2]);
+	if (a === b) return 0;
+	return a < b ? -1 : 1;
+}
+
+/**
+ * `  v task-30 <title> (SwiftTiger · 3m)` / `  x task-31 <title> (failed: <reason>)`. Only the
+ * title is clipped to fit; a known agent/duration or failed reason is carried verbatim unless the
+ * line itself cannot fit, in which case the detail text (never the id) shrinks. Unknown fields are
+ * omitted - no `()`, no `undefined`, no invented duration.
+ */
+function drainTaskLine(task: DrainSummary["tasks"][number], width: number): string {
+	const prefix = `  ${task.status === "done" ? "v" : "x"} ${task.id} `;
+	const duration = task.durationMs === undefined ? undefined : compactDuration(task.durationMs);
+	let detail: string;
+	if (task.status === "done") {
+		detail = [task.agent, duration]
+			.filter((part): part is string => part !== undefined && part !== "")
+			.join(" · ");
+	} else {
+		const reason = task.reason?.replace(/\s+/g, " ").trim();
+		detail = reason === undefined || reason === "" ? "failed" : `failed: ${reason}`;
+	}
+	const room = width > 0 ? width - prefix.length : Number.POSITIVE_INFINITY;
+	if (room <= 0) return fitLine(prefix.trimEnd(), width);
+	let suffix = detail === "" ? "" : ` (${detail})`;
+	if (suffix.length > room - 1) {
+		// The line cannot hold the detail and a title: shrink the detail (never the id), leaving one
+		// character so the title still shows that it was clipped instead of vanishing.
+		detail = clipTo(detail, room - 4);
+		suffix = detail === "" ? "" : ` (${detail})`;
+	}
+	const titleBudget = width > 0 ? width - prefix.length - suffix.length : Number.POSITIVE_INFINITY;
+	const title = titleBudget > 0 ? clipTo(task.title, titleBudget) : "";
+	const head = title === "" ? prefix.trimEnd() : prefix;
+	return fitLine(`${head}${title}${suffix}`, width);
+}
+
+const MAX_SUMMARY_TASKS = 8;
+
+/**
+ * The headline, then one line per finished task (sorted by id, numeric suffix included), capped at
+ * eight plus a `… +N more` tail. Every line fits `opts.width` when it is positive, and none carries
+ * a tab.
+ */
+export function drainSummaryLines(s: DrainSummary, opts: { width: number }): string[] {
+	const width = opts.width;
+	const lines = [fitLine(drainSummaryTitle(s), width)];
+	const ordered = [...s.tasks].sort((a, b) => compareTaskIds(a.id, b.id));
+	for (const task of ordered.slice(0, MAX_SUMMARY_TASKS)) lines.push(drainTaskLine(task, width));
+	if (ordered.length > MAX_SUMMARY_TASKS) lines.push(fitLine(`  … +${ordered.length - MAX_SUMMARY_TASKS} more`, width));
+	return lines;
 }

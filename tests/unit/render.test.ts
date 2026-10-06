@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { renderAgents, renderPanel, renderSummary, renderTasks } from "../../extension/render";
+import {
+	drainSummaryLines,
+	drainSummaryTitle,
+	progressBar,
+	progressLine,
+	renderAgents,
+	renderPanel,
+	renderSummary,
+	renderTasks,
+} from "../../extension/render";
+import type { DrainSummary } from "../../extension/render";
 import type { StatusSnapshot } from "../../extension/store";
-import type { SwarmAgent, SwarmTask } from "../../extension/types";
+import type { SwarmAgent, SwarmTask, TaskCounts } from "../../extension/types";
 
 const NOW = 1_700_000_000_000;
 const SECOND = 1000;
@@ -216,5 +226,180 @@ describe("renderSummary", () => {
 			}),
 		);
 		expect(summary).toContain("throughput done 1 in 5m");
+	});
+});
+
+function counts(overrides: Partial<TaskCounts> = {}): TaskCounts {
+	return { ready: 0, claimed: 0, blocked: 0, review: 0, done: 0, failed: 0, ...overrides };
+}
+
+function drain(overrides: Partial<DrainSummary> = {}): DrainSummary {
+	return { counts: counts({ done: 1 }), elapsedMs: 0, agents: 1, tasks: [], ...overrides };
+}
+
+describe("progressBar", () => {
+	test("fills the finished half and leaves the rest light", () => {
+		expect(progressBar(counts({ done: 5, ready: 5 }), 10)).toBe("█████░░░░░");
+		expect(progressBar(counts({ done: 7, failed: 1, ready: 1 }), 10)).toBe("█████████░");
+		expect(progressBar(counts({ claimed: 2, ready: 2 }), 4)).toBe("░░░░");
+	});
+
+	test("reaches the end only when every actionable task is finished", () => {
+		expect(progressBar(counts({ done: 7, failed: 2 }), 4)).toBe("████");
+		expect(progressBar(counts({ done: 1, ready: 1 }), 4)).toBe("██░░");
+	});
+
+	test("ignores the permanently-blocked residue that would hold the bar short of the end", () => {
+		// 1 finished of 2 actionable - the six blocked tasks are not part of the denominator
+		expect(progressBar(counts({ done: 1, ready: 1, blocked: 6 }), 10)).toBe("█████░░░░░");
+	});
+
+	test("renders nothing without actionable work or without room", () => {
+		expect(progressBar(counts({ blocked: 6 }), 10)).toBe("");
+		expect(progressBar(counts({ done: 3 }), 0)).toBe("");
+		expect(progressBar(counts({ done: 3 }), -3)).toBe("");
+	});
+});
+
+describe("progressLine", () => {
+	test("reads 0% with the ready work named", () => {
+		expect(progressLine(counts({ ready: 3 }))).toBe("TASKS 0/3 · 3 ready · 0%");
+	});
+
+	test("counts claimed and review as running, blocked separately, finished over actionable", () => {
+		// 7 finished + 1 running + 1 ready = 9 actionable; the blocked task is excluded from it
+		expect(progressLine(counts({ claimed: 1, done: 6, failed: 1, ready: 1, blocked: 1 }))).toBe(
+			"TASKS 7/9 · 1 running · 1 ready · 1 blocked · 78%",
+		);
+		expect(progressLine(counts({ claimed: 1, done: 6, failed: 1 }))).toBe("TASKS 7/8 · 1 running · 88%");
+		expect(progressLine(counts({ review: 1, done: 1, ready: 1 }))).toBe("TASKS 1/3 · 1 running · 1 ready · 33%");
+	});
+
+	test("counts a failure as finished work", () => {
+		expect(progressLine(counts({ failed: 1 }))).toBe("TASKS 1/1 · 100%");
+		expect(progressLine(counts({ done: 9 }))).toBe("TASKS 9/9 · 100%");
+	});
+
+	test("an empty actionable pool reads as a sentence, blocked or not", () => {
+		expect(progressLine(counts())).toBe("TASKS - · no tasks");
+		expect(progressLine(counts({ blocked: 6 }))).toBe("TASKS - · no tasks");
+	});
+});
+
+describe("drainSummaryTitle", () => {
+	test("carries the done/failed split, the agents, the compact elapsed and the cost", () => {
+		expect(
+			drainSummaryTitle({ counts: counts({ done: 7, failed: 2 }), elapsedMs: 12 * MINUTE + 40 * SECOND, agents: 3, costUsd: 0.42, tasks: [] }),
+		).toBe("SWARM DONE · 9/9 tasks (7 done, 2 failed) · 3 agents · 12m40s · $0.42");
+	});
+
+	test("drops the failed half at zero and omits an unknown cost instead of faking one", () => {
+		expect(drainSummaryTitle(drain({ counts: counts({ done: 9 }), elapsedMs: 45 * SECOND, agents: 2, tasks: [] }))).toBe(
+			"SWARM DONE · 9/9 tasks (9 done) · 2 agents · 45s",
+		);
+		expect(drainSummaryTitle(drain({ costUsd: undefined }))).not.toContain("$");
+	});
+
+	test("compacts the hour boundary and keeps the blocked residue out of the denominator", () => {
+		expect(drainSummaryTitle(drain({ elapsedMs: 66 * MINUTE }))).toContain(" · 1h06m");
+		expect(drainSummaryTitle(drain({ counts: counts({ done: 5, blocked: 6 }) }))).toContain("5/5 tasks");
+	});
+});
+
+describe("drainSummaryLines", () => {
+	test("leads with the title and orders the tasks by their numeric id", () => {
+		const summary = drain({
+			tasks: [
+				{ id: "task-10", title: "second", status: "done" },
+				{ id: "task-2", title: "first", status: "done" },
+			],
+		});
+		const lines = drainSummaryLines(summary, { width: 120 });
+		expect(lines[0]).toBe(drainSummaryTitle(summary));
+		expect(lines[1]).toContain("task-2 first");
+		expect(lines[2]).toContain("task-10 second");
+	});
+
+	test("prints who finished a task and how long it took, and omits what is unknown", () => {
+		const lines = drainSummaryLines(
+			drain({
+				tasks: [
+					{ id: "task-30", title: "fix the panel", status: "done", agent: "SwiftTiger", durationMs: 12 * MINUTE + 40 * SECOND },
+					{ id: "task-31", title: "build the page", status: "done", durationMs: 45 * SECOND },
+					{ id: "task-32", title: "no detail", status: "done" },
+				],
+			}),
+			{ width: 120 },
+		);
+		expect(lines[1]).toBe("  v task-30 fix the panel (SwiftTiger · 12m40s)");
+		expect(lines[2]).toBe("  v task-31 build the page (45s)");
+		expect(lines[3]).toBe("  v task-32 no detail");
+		expect(lines.join("\n")).not.toContain("undefined");
+		expect(lines.join("\n")).not.toContain("()");
+	});
+
+	test("prints a failure with its reason, and says only that it failed when there is none", () => {
+		const lines = drainSummaryLines(
+			drain({
+				tasks: [
+					{ id: "task-31", title: "build the page", status: "failed", reason: "typecheck: missing export" },
+					{ id: "task-32", title: "silent failure", status: "failed" },
+				],
+			}),
+			{ width: 120 },
+		);
+		expect(lines[1]).toBe("  x task-31 build the page (failed: typecheck: missing export)");
+		expect(lines[2]).toBe("  x task-32 silent failure (failed)");
+	});
+
+	test("caps the list at eight tasks and counts the rest", () => {
+		const tasks = Array.from({ length: 10 }, (_, i) => ({ id: `task-${i + 1}`, title: `job ${i + 1}`, status: "done" as const }));
+		const lines = drainSummaryLines(drain({ tasks }), { width: 120 });
+		expect(lines.length).toBe(10); // title + 8 tasks + the tail
+		expect(lines.at(-1)).toBe("  … +2 more");
+		expect(lines[8]).toContain("task-8");
+		expect(lines.join("\n")).not.toContain("job 9");
+	});
+
+	test("fits every line to the width by clipping the title only", () => {
+		const task = { id: "task-30", title: "x".repeat(200), status: "done" as const, agent: "SwiftTiger", durationMs: 3 * MINUTE };
+		for (const width of [80, 120]) {
+			const lines = drainSummaryLines(drain({ tasks: [task] }), { width });
+			for (const line of lines) {
+				expect(line.length).toBeLessThanOrEqual(width);
+				expect(line).not.toContain("\t");
+			}
+			expect(lines[1]).toContain("(SwiftTiger · 3m)");
+			expect(lines[1]).toContain("…");
+		}
+		expect(drainSummaryLines(drain({ tasks: [task] }), { width: 80 })[1].length).toBe(80);
+	});
+
+	test("keeps the id separated by one space and still marks a clipped title at tight widths", () => {
+		const task = {
+			id: "task-26",
+			title: "Build the pure split-page layout module (left rail geometry + hit testing)",
+			status: "failed" as const,
+			reason: "superseded by the operator rollback; no code change made",
+		};
+		for (const width of [40, 50, 60, 70, 80]) {
+			const line = drainSummaryLines(drain({ tasks: [task] }), { width })[1];
+			expect(line.length).toBeLessThanOrEqual(width);
+			expect(line.startsWith("  x task-26 …")).toBe(true);
+			expect(line.slice(0, 12)).toBe("  x task-26 ");
+			expect(line[12]).toBe("…"); // the title slot is never dropped, only clipped
+			expect(line).not.toMatch(/\s{2}\(/);
+		}
+	});
+
+	test("clipping a wide title never leaves half a character behind", () => {
+		const task = { id: "task-30", title: "🎬 场景".repeat(40), status: "done" as const, agent: "A", durationMs: 1000 };
+		const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+		for (let width = 12; width <= 100; width += 1) {
+			for (const line of drainSummaryLines(drain({ tasks: [task] }), { width })) {
+				expect(line.length).toBeLessThanOrEqual(width);
+				expect(lone.test(line)).toBe(false);
+			}
+		}
 	});
 });
