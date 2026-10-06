@@ -63,12 +63,18 @@ extension/
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
   agentinfo.ts pure agent-list rows: AgentInfo facts -> one fitted ASCII line per worker
+  color.ts     the reminder palette: per-agent and per-status colours, host-parity visible width, control-byte sanitization
+  agentnav.ts  the agent-list selection model: main-first entries, cursor movement with wrap, the marker column, row rendering
   types.ts     domain types
 tests/
-  unit/store.test.ts           32 unit tests of the store (incl. cross-process claim races and task-graph refusals)
-  unit/auto.test.ts            28 unit tests of the roster, its mid-run growth and the state machine
-  unit/render.test.ts          33 unit tests of the panel, task table, summary, progress bar and batch-completion rendering
-  unit/agentinfo.test.ts       15 unit tests of the agent-row format, compaction, degradation and truncation
+  unit/store.test.ts           32 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
+  unit/auto.test.ts            28 unit tests of multi-agent mode: roster derivation, mid-run growth and the assemble/self-stop state machine
+  unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
+  unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
+  unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
+  unit/agentnav.test.ts        23 unit tests of the selection model: main-first entries, cursor wrap and clamping, the marker column and row rendering
+  unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
+  unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
@@ -409,7 +415,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 108 unit tests in tests/unit (32 store + 28 auto-mode + 33 render + 15 agent-list rows, incl. a 3-process claim race)
+bun run test                   # 212 unit tests in the 8 files under tests/unit (incl. a 3-process claim race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
