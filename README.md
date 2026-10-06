@@ -242,6 +242,13 @@ selection lives in the extension's per-root runtime, survives repaints, and is c
 live roster: a cursor can never sit past the last row, and a target whose agent left falls back to
 main.
 
+The main row costs one of the host's ten widget lines, and it is charged to the block that was always
+budget-dependent: the progress bar and its counts line both fit up to three workers, the counts line
+alone at four, and at five or more neither is in the widget — the worker rows, the counters and the
+board tally are untouched, and the `SWARM n/m done` status line plus `/swarm status` keep reporting
+the progress itself. The persistent batch summary shrinks by the same line when the roster is large;
+the status-line headline and the transcript copy are unaffected.
+
 **What `Enter` does, exactly:** it marks the target. It does **not** switch the session pane, because
 no extension-facing API can do that and the host's own Agent Hub (`Alt+A`) lists only host subagents
 — swarm workers are created with a private agent registry and `hasUI: false`, so they never appear
