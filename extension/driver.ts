@@ -2,7 +2,8 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type * as zod from "@oh-my-pi/omptype/zod";
-import { renderAgentInfoRows, type AgentInfo } from "./agentinfo";
+import { renderAgentInfoRows, sortAgentInfo, type AgentInfo } from "./agentinfo";
+import { MAIN_ID, moveSelection, navEntries, renderNavLines } from "./agentnav";
 import { expandWorkers, type WorkerSpec } from "./config";
 import { renderPanel, type DrainSummary } from "./render";
 import type { SwarmStore } from "./store";
@@ -26,6 +27,21 @@ const THINKING_LEVELS: Record<NonNullable<HostThinkingLevel>, true> = {
 };
 
 export type TimerApi = Pick<ExtensionContext, "setInterval" | "clearTimer">;
+
+/**
+ * The agent-list selection the widget paints and `/swarm nav` edits. It lives on the per-root
+ * extension runtime (`extension/index.ts`), never in the store: it is view state, not swarm state.
+ * `index` is the cursor row (main first) and `targetId` is the entry `Enter` committed to - the two
+ * are independent, so the operator can walk the cursor without changing the target.
+ *
+ * `panelLines` NORMALISES both against the roster it just read (a worker that left must not leave
+ * the cursor on a row that no longer exists, nor the target on an agent that is gone), which is why
+ * it takes the object itself rather than a copy.
+ */
+export interface NavState {
+	index: number;
+	targetId: string;
+}
 
 export interface SwarmDriverDeps {
 	sdk: HostSdk;
@@ -628,18 +644,38 @@ export class SwarmDriver {
 	 * swarm that is simply off reads as stopped instead of as an empty list. `opts.color` is the
 	 * caller's single decision (see `extension/index.ts`); false is byte-identical to the plain body.
 	 */
-	panelLines(width = 0, opts: { color?: boolean } = {}): string[] {
+	panelLines(width = 0, opts: { color?: boolean; nav?: NavState } = {}): string[] {
 		const snapshot = this.#deps.store.snapshot(this.#deps.config.offlineAfterSeconds, this.#running);
 		const lines = renderPanel(snapshot, 10, opts);
 		if (this.#workers.size === 0) return lines;
 		const header = lines.at(0);
 		const tail = lines.slice(-2);
 		if (header === undefined || tail.length < 2) return lines;
-		return [
-			header,
-			...renderAgentInfoRows(this.agentInfoRows(snapshot.now), { width, now: snapshot.now, color: opts.color }),
-			...tail,
-		];
+		return [header, ...this.#agentRows(this.agentInfoRows(snapshot.now), width, snapshot.now, opts), ...tail];
+	}
+
+	/**
+	 * The rows between the run header and the counters: the navigable list when the caller passes a
+	 * selection, the plain roster otherwise (byte-identical to the surface without it). One roster
+	 * read feeds both, so the marker can never describe a different frame than the rows it sits in.
+	 *
+	 * The caller's selection is normalised in place against THIS roster: `moveSelection(index, 0, n)`
+	 * clamps a cursor that outlived its row, and a target whose agent is gone falls back to main - so
+	 * the widget can never paint a cursor past the last row nor a `*` on an entry that left.
+	 */
+	#agentRows(rows: AgentInfo[], width: number, now: number, opts: { color?: boolean; nav?: NavState }): string[] {
+		const nav = opts.nav;
+		if (nav === undefined) return renderAgentInfoRows(rows, { width, now, color: opts.color });
+		const entries = navEntries(sortAgentInfo(rows), { id: MAIN_ID });
+		nav.index = moveSelection(nav.index, 0, entries.length);
+		if (!entries.some((entry) => entry.id === nav.targetId)) nav.targetId = entries[0]?.id ?? MAIN_ID;
+		return renderNavLines(entries, {
+			selectedIndex: nav.index,
+			currentTargetId: nav.targetId,
+			width,
+			now,
+			color: opts.color,
+		});
 	}
 
 	/**

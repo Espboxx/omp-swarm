@@ -167,6 +167,7 @@ expanded into callsigns (`SwiftTiger`, `CalmFalcon`, …); `capabilities` gate c
 /swarm start 4        # spawn 4 workers (reads .swarm/config.json for roles/lease/review)
 /swarm status         # full snapshot: mode phase, agents, task counts, in-flight tasks with elapsed/attempts, throughput, board histogram
 /swarm agents         # roster with role, state, task, heartbeat age, capabilities, worktree
+/swarm nav            # the same list as an overlay: arrows move the cursor, Enter marks the target (see below)
 /swarm tasks ready    # task pool by status
 /swarm board FAIL     # blackboard by type
 /swarm task <title>   # operator-created task (bootstrap)
@@ -214,6 +215,38 @@ so a task title can never smuggle a cursor move, a clear-screen or a clipboard w
 The status line's `SWARM n/m done` is formed with the same colors, but the host sanitizes status text
 before painting it (`pi-tui` `sanitizeStatusText`), so that one surface reads plain — measured, not
 assumed.
+
+### Agent list navigation
+
+`/swarm nav` opens the agent list as a left-anchored overlay whose keys are yours:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` (or `k` / `j`) | move the cursor; it wraps at both ends |
+| `Enter` | make the highlighted row the **current target**, then close |
+| `Esc` (or `q`) | close and change nothing |
+
+Every row carries a three-column ASCII marker: `>` is the cursor, `*` is the current target, and the
+two are independent — walking the list does not move `*`, only `Enter` does. Row 0 is the main
+session (`main session · this terminal`), so main and the workers are one list the operator can move
+between; the other rows are exactly what the widget paints (`state`, task, branch, `ctx`, tokens,
+`$cost`, turns). The widget keeps painting both markers while the picker is closed, so the current
+target is readable at all times and a repaint never loses the selection.
+
+The overlay is what makes the keys possible, not a style choice: OMP silently drops `enter`/`escape`
+from any extension `registerShortcut`, and the above-editor widget is never focused, so a focused
+component is the only surface that can own the arrows **and** Enter. Nothing is claimed globally —
+typing in the composer is unaffected (the picker only sees keys after `/swarm nav`), `Esc` closes it
+without touching the selection, and a host with no TUI keeps the plain `/swarm agents` text. The
+selection lives in the extension's per-root runtime, survives repaints, and is clamped against the
+live roster: a cursor can never sit past the last row, and a target whose agent left falls back to
+main.
+
+**What `Enter` does, exactly:** it marks the target. It does **not** switch the session pane, because
+no extension-facing API can do that and the host's own Agent Hub (`Alt+A`) lists only host subagents
+— swarm workers are created with a private agent registry and `hasUI: false`, so they never appear
+there. `/swarm message <id> <text>` (or the `swarm_message` tool) stays the way to reach the agent you
+marked.
 
 ### Batch completion alert
 

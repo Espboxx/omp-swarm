@@ -2,12 +2,14 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { TERMINAL } from "@oh-my-pi/pi-tui";
+import { matchesKey, TERMINAL, type Component, type KeyId } from "@oh-my-pi/pi-tui";
+import { sortAgentInfo } from "./agentinfo";
+import { MAIN_ID, moveSelection, navEntries, renderNavLines, type NavEntry } from "./agentnav";
 import { AUTO_TICK_MS, AutoController } from "./auto";
-import { colorEnabled } from "./color";
+import { colorEnabled, fitColored } from "./color";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
 import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
-import { SwarmDriver, type SwarmDriverDeps, type TimerApi } from "./driver";
+import { SwarmDriver, type NavState, type SwarmDriverDeps, type TimerApi } from "./driver";
 import {
 	drainSummaryLines,
 	drainSummaryTitle,
@@ -25,11 +27,37 @@ import { SwarmStore } from "./store";
 import { buildSwarmTools, isBoardType, isTaskStatus, type SwarmIdentity } from "./tools";
 import { DEFAULT_CONFIG, type SwarmConfig } from "./types";
 
-const MAIN_AGENT_ID = "main";
+/** The main session's id in BOTH namespaces: the swarm's events and `agentnav`'s main row. */
+const MAIN_AGENT_ID = MAIN_ID;
 const PANEL_STATUS_KEY = "swarm";
 const PANEL_WIDGET_KEY = "swarm-panel";
 /** The progress bar is a reading aid, not a ruler: keep it short enough to sit beside the text. */
 const PROGRESS_BAR_WIDTH = 20;
+/** `/swarm nav`'s overlay: wide enough for a full agent row, narrow enough to leave the session visible. */
+const AGENT_NAV_WIDTH = 40;
+/** The picker's footer. ASCII only, and clipped to whatever inner width the overlay actually got. */
+const AGENT_NAV_HINT = "up/down move | Enter target | Esc close";
+
+/**
+ * The host keys the picker answers, mapped to this feature's actions. `enter` and `escape` are here
+ * only because the overlay - not `registerShortcut` - owns the keyboard: the host drops those two
+ * from any extension shortcut (`pi-coding-agent/src/extensibility/extensions/runner.ts:1218-1234`).
+ */
+const AGENT_NAV_KEYS: ReadonlyArray<readonly [KeyId, "up" | "down" | "enter" | "close"]> = [
+	["up", "up"],
+	["k", "up"],
+	["down", "down"],
+	["j", "down"],
+	["enter", "enter"],
+	["escape", "close"],
+	["q", "close"],
+];
+
+/** Terminal bytes -> the picker's action, or undefined for a key the picker does not own. */
+function agentNavKey(data: string): "up" | "down" | "enter" | "close" | undefined {
+	for (const [keyId, action] of AGENT_NAV_KEYS) if (matchesKey(data, keyId)) return action;
+	return undefined;
+}
 
 /**
  * The host's own cap on a `string[]` widget: `MAX_WIDGET_LINES = 10` in
@@ -64,6 +92,10 @@ interface Runtime {
 	autoTimer?: Timer;
 	/** Set once a batch drained; cleared by the next actionable task or the next start. */
 	drainMarker?: DrainMarker;
+	/** Agent-list selection (cursor row + committed target); view state, so it never reaches the store. */
+	nav: NavState;
+	/** Set while `/swarm nav`'s overlay owns the keyboard, so a second one cannot mount on top. */
+	navDismiss?: () => void;
 }
 
 /**
@@ -85,7 +117,13 @@ class SwarmRuntimes {
 		const config = loadSwarmConfig(paths.configFile);
 		const existing = this.#runtimes.get(absolute);
 		if (existing) return existing;
-		const runtime: Runtime = { root: absolute, paths, store: new SwarmStore(openDatabase(paths), paths), config };
+		const runtime: Runtime = {
+			root: absolute,
+			paths,
+			store: new SwarmStore(openDatabase(paths), paths),
+			config,
+			nav: { index: 0, targetId: MAIN_AGENT_ID },
+		};
 		this.#runtimes.set(absolute, runtime);
 		return runtime;
 	}
@@ -131,6 +169,8 @@ export default function swarm(pi: ExtensionAPI): void {
 	/** Newest `ExtensionContext` per root: the controller's closures outlive the hook that built them. */
 	const contexts = new Map<string, ExtensionContext>();
 	const controllers = new Set<AutoController>();
+	/** Close handles for every open `/swarm nav` overlay, so shutdown cannot leave one mounted. */
+	const navClosers = new Set<() => void>();
 	const remember = (root: string, ctx: ExtensionContext): void => {
 		contexts.set(resolve(root), ctx);
 	};
@@ -244,7 +284,7 @@ export default function swarm(pi: ExtensionAPI): void {
 		const columns = process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
 		const width = Math.max(20, columns - 2);
 		const headers = runtime.auto?.header() ?? [];
-		const body = runtime.driver?.panelLines(width, { color }) ?? [];
+		const body = runtime.driver?.panelLines(width, { color, nav: runtime.nav }) ?? [];
 		const room = WIDGET_LINE_BUDGET - headers.length - body.length;
 		return [...headers, ...body.slice(0, 1), ...progressWidgetLines(runtime, width, room, color), ...body.slice(1)];
 	};
@@ -301,6 +341,112 @@ export default function swarm(pi: ExtensionAPI): void {
 		refreshPanel(ctx, runtime);
 	};
 
+	/** The navigable roster: main first, then the workers in exactly the order the widget prints them. */
+	const navEntriesFor = (runtime: Runtime, now: number): NavEntry[] => {
+		const rows = runtime.driver === undefined ? [] : sortAgentInfo(runtime.driver.agentInfoRows(now));
+		return navEntries(rows, { id: MAIN_AGENT_ID });
+	};
+
+	/**
+	 * `Enter` in the picker: the row becomes the current target, which is what the widget's `*` marks
+	 * and what the status line keeps in step.
+	 *
+	 * It does NOT switch the session pane, and the wording says so instead of implying it: swarm
+	 * workers are created with a private `AgentRegistry` and `hasUI: false` (`extension/driver.ts`),
+	 * so the host's Agent Hub - the only surface that can focus another session, `Alt+A` - never lists
+	 * them, and no extension-facing API can request that focus (`omp://agent-hub.md`).
+	 */
+	const commitNavTarget = (ctx: ExtensionContext, runtime: Runtime, entry: NavEntry): void => {
+		runtime.nav.targetId = entry.id;
+		refreshPanel(ctx, runtime);
+		ctx.ui.notify(
+			entry.isMain
+				? "current target: the main session (this terminal)"
+				: `current target: ${entry.id} - /swarm message ${entry.id} <text> reaches it. The host cannot focus a worker's session in the main pane (its Agent Hub lists only host subagents); see README "Agent list navigation".`,
+			"info",
+		);
+	};
+
+	/**
+	 * `/swarm nav`: the agent list as a focusable overlay, where the arrow keys and Enter are ours.
+	 *
+	 * The overlay is the whole point, not a style choice. `registerShortcut` silently drops
+	 * `enter`/`escape` (`pi-coding-agent/src/extensibility/extensions/runner.ts:1218-1234`), and the
+	 * above-editor widget is never focused (`pi-tui/src/tui.ts:2781-2787`), so a component that owns
+	 * focus (`ctx.ui.custom`, `extensions/types.ts:313-320`) is the only place that can see both.
+	 * The selection itself lives on the runtime, so the widget's marker follows the picker live and
+	 * survives a repaint, and a non-TUI host - which can run no component at all - keeps the plain
+	 * roster text it has always printed.
+	 */
+	const openAgentNav = (ctx: ExtensionContext, runtime: Runtime): void => {
+		if (runtime.navDismiss !== undefined) return;
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify(`${renderAgents(runtime.store.listAgents(), Date.now())}\n/swarm nav needs the interactive TUI`, "info");
+			return;
+		}
+		let dismiss: ((result: string | undefined) => void) | undefined;
+		let closedEarly = false;
+		const closeNav = (): void => {
+			closedEarly = true;
+			dismiss?.(undefined);
+		};
+		const component: Component = {
+			render(inner: number): readonly string[] {
+				const now = Date.now();
+				const budget = Math.max(16, Math.min(AGENT_NAV_WIDTH, inner));
+				return [
+					...renderNavLines(navEntriesFor(runtime, now), {
+						selectedIndex: runtime.nav.index,
+						currentTargetId: runtime.nav.targetId,
+						width: budget,
+						now,
+						color: panelColor(),
+					}),
+					fitColored(AGENT_NAV_HINT, budget),
+				];
+			},
+			handleInput(data: string): void {
+				const action = agentNavKey(data);
+				if (action === undefined) return;
+				if (action === "close") {
+					// Escape commits nothing: the cursor and the target stay exactly as they were.
+					closeNav();
+					return;
+				}
+				const entries = navEntriesFor(runtime, Date.now());
+				if (action === "enter") {
+					const entry = entries[moveSelection(runtime.nav.index, 0, entries.length)];
+					if (entry !== undefined) commitNavTarget(ctx, runtime, entry);
+					closeNav();
+					return;
+				}
+				runtime.nav.index = moveSelection(runtime.nav.index, action === "up" ? -1 : 1, entries.length);
+				refreshPanel(ctx, runtime); // the widget paints the same selection: keep the two in step
+			},
+		};
+		runtime.navDismiss = closeNav;
+		navClosers.add(closeNav);
+		const settle = (): void => {
+			dismiss = undefined;
+			navClosers.delete(closeNav);
+			if (runtime.navDismiss === closeNav) runtime.navDismiss = undefined;
+		};
+		void ctx.ui
+			.custom<string | undefined>(
+				(_tui, _theme, _keybindings, done) => {
+					dismiss = done;
+					// Closed before the host mounted us: settle now instead of waiting for a key.
+					if (closedEarly) queueMicrotask(() => done(undefined));
+					return component;
+				},
+				{ overlay: true, overlayOptions: { anchor: "left-center", width: AGENT_NAV_WIDTH, maxHeight: "100%", margin: 0 } },
+			)
+			.then(settle, (error) => {
+				settle();
+				ctx.ui.notify(`agent list closed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			});
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		remember(ctx.cwd, ctx);
 		const paths = swarmPaths(resolve(ctx.cwd));
@@ -336,6 +482,8 @@ export default function swarm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
+		for (const close of navClosers) close();
+		navClosers.clear();
 		for (const controller of controllers) controller.dispose();
 		await runtimes.stopAll();
 	});
@@ -391,7 +539,7 @@ export default function swarm(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("swarm", {
-		description: "Decentralized agent swarm: /swarm [status|on|off|start [n]|stop|agents|tasks [status]|board [type]|task <title>|message <agent> <text>|approve <id> [notes]|reject <id> <notes>|config|roles]",
+		description: "Decentralized agent swarm: /swarm [status|on|off|start [n]|stop|agents|nav|tasks [status]|board [type]|task <title>|message <agent> <text>|approve <id> [notes]|reject <id> <notes>|config|roles]",
 		handler: async (args, ctx: ExtensionCommandContext) => {
 			const runtime = runtimes.for(ctx.cwd);
 			const [sub = "status", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -463,6 +611,10 @@ export default function swarm(pi: ExtensionAPI): void {
 				}
 				case "agents": {
 					ctx.ui.notify(renderAgents(runtime.store.listAgents(), Date.now()), "info");
+					return;
+				}
+				case "nav": {
+					openAgentNav(ctx, runtime);
 					return;
 				}
 				case "tasks": {
