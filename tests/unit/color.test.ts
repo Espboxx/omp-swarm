@@ -332,7 +332,8 @@ describe("sanitizeField", () => {
 
 // The counterexamples task-53 found in the task-51 delta: an OSC 66 span is zero cells to
 // `Bun.stringWidth` but three or five to the host, so `fitColored` used to return a clip the
-// host measured wider than its budget (and would wrap under itself, the 8e1a468 defect).
+// host measured wider than its budget (and would wrap under itself - the same defect as the panel
+// rollback, commit subject `rollback: remove the agent-list panel (operator decision)`).
 describe("OSC 66 / APC host parity", () => {
 	test("a text-sizing span is counted by the host's rule, not stripped to zero", () => {
 		const scaledOutOfRange = "\x1b]66;s=20;abc\x07"; // s=20 is outside 1..7, so the scale stays 1

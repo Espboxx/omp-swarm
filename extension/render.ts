@@ -334,7 +334,8 @@ function clipTo(text: string, width: number): string {
  * pathological width. The sanitizer drops every escape and every control character (tab included -
  * see `sanitizeField`), and everything left is measured on VISIBLE columns: `.length` counts escape
  * bytes and misses the column a CJK glyph occupies, which is what let a summary line wrap under
- * itself (the 8e1a468 defect).
+ * itself - the same defect as the panel rollback (commit subject
+ * `rollback: remove the agent-list panel (operator decision)`).
  */
 function fitLine(line: string, width: number): string {
 	const safe = sanitizeField(line);

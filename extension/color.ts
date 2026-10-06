@@ -11,7 +11,8 @@
  * itself wraps with - `Bun.stringWidth` under the host's own options, three cells per tab - so a
  * row this module calls "fits" is a row the host will not wrap under itself. A hand-rolled width
  * table drifts on CJK, emoji and zero-width joiners, and the wrapped row then paints over the
- * composer (the defect that got the previous panel reverted, commit 8e1a468). (2) Every row
+ * composer (the defect that got the previous panel reverted by the commit whose subject is
+ * `rollback: remove the agent-list panel (operator decision)`). (2) Every row
  * field goes through `sanitizeField`, so a task title cannot smuggle a clear-screen, an OSC 52
  * clipboard write or a hyperlink into the terminal: the widget path writes these bytes verbatim.
  */
