@@ -160,9 +160,9 @@ instead of blocking the swarm. Set `SWARM_TRACE=1` to write per-worker milestone
 `.swarm/driver.log`.
 
 While the swarm runs, the widget above the editor and the `swarm` status line update live. Above
-the worker rows the widget carries the task progress — a bar (`██████░░░░`) over a
-`TASKS 7/9 · 1 running · 1 blocked · 78%` line — and the status line carries the compact form
-(`SWARM 7/9 done`). The denominator is the ACTIONABLE work (`ready + claimed + review + done +
+the worker rows the widget carries the task progress — a bar (`█████████░`) over a
+`TASKS 7/8 · 1 running · 1 blocked · 88%` line — and the status line carries the compact form
+(`SWARM 7/8 done`). The denominator is the ACTIONABLE work (`ready + claimed + review + done +
 failed`); `blocked` is deliberately excluded and reported as its own segment, because a task whose
 dependency was closed as superseded stays blocked forever and a bar that counted it would never
 reach 100 %. The widget then carries one row per worker — `state`, the task it holds, git branch,
