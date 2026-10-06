@@ -318,6 +318,35 @@ function drainTaskLine(task: DrainSummary["tasks"][number], width: number): stri
 
 const MAX_SUMMARY_TASKS = 8;
 
+/** The `… +N more` tail this module emits, matched back to recover how many task lines it hides. */
+const SUMMARY_TAIL = /^\s*… \+(\d+) more/;
+
+/**
+ * Fit an already-rendered summary block into `room` lines — the host keeps only the first ten
+ * declared lines of a `string[]` widget and replaces the rest with "... (widget truncated)"
+ * (`pi-coding-agent/.../extension-ui-controller.ts:45`, `:362`), so a block that ignores its budget
+ * is silently cut and the `… +N more` tail disappears with it. The widget's other rows (mode
+ * header, run line, worker rows, counters, BOARD) are the caller's to budget; this owns the block.
+ *
+ * The headline is always kept while anything fits, and the `… +N more` tail survives whenever two
+ * lines fit: the count it reports absorbs the task lines the smaller budget hides, so the operator
+ * can still tell how much is not shown. `room <= 0` returns `[]` (nothing fits); the tail is only
+ * ever counted, never fabricated - a block that hid nothing keeps hiding nothing.
+ */
+export function fitSummaryLines(lines: readonly string[], room: number): string[] {
+	const budget = Math.floor(room);
+	if (budget <= 0 || lines.length === 0) return [];
+	if (lines.length <= budget) return [...lines];
+	const headline = lines[0] as string;
+	if (budget === 1) return [headline];
+	const tail = SUMMARY_TAIL.exec(lines[lines.length - 1] as string);
+	const taskLines = lines.slice(1, tail === null ? undefined : -1);
+	const hiddenByTail = tail === null ? 0 : Number(tail[1]);
+	const total = taskLines.length + hiddenByTail;
+	const visible = taskLines.slice(0, Math.max(0, budget - 2));
+	return [headline, ...visible, `  … +${total - visible.length} more`];
+}
+
 /**
  * The headline, then one line per finished task (sorted by id, numeric suffix included), capped at
  * eight plus a `… +N more` tail. Every line fits `opts.width` when it is positive, and none carries

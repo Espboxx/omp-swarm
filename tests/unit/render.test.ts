@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	drainSummaryLines,
 	drainSummaryTitle,
+	fitSummaryLines,
 	progressBar,
 	progressLine,
 	renderAgents,
@@ -401,5 +402,90 @@ describe("drainSummaryLines", () => {
 				expect(lone.test(line)).toBe(false);
 			}
 		}
+	});
+});
+
+describe("fitSummaryLines", () => {
+	const marker = (taskCount: number): string[] =>
+		drainSummaryLines(
+			drain({
+				tasks: Array.from({ length: taskCount }, (_, index) => ({
+					id: `task-${index + 1}`,
+					title: `work ${index + 1}`,
+					status: "done" as const,
+					agent: "SwiftTiger",
+					durationMs: MINUTE,
+				})),
+			}),
+			{ width: 120 },
+		);
+
+	test("hands an already-fitting block back untouched, tail and all", () => {
+		const block = marker(3); // headline + 3 task lines
+		expect(block).toHaveLength(4);
+		expect(fitSummaryLines(block, 10)).toEqual(block);
+		expect(fitSummaryLines(block, 4)).toEqual(block);
+		// A copy, so a later repaint cannot mutate the stored marker.
+		const fitted = fitSummaryLines(block, 10);
+		fitted.push("x");
+		expect(block).toHaveLength(4);
+	});
+
+	test("returns nothing when no line fits or the block is empty", () => {
+		expect(fitSummaryLines(marker(3), 0)).toEqual([]);
+		expect(fitSummaryLines(marker(3), -4)).toEqual([]);
+		expect(fitSummaryLines([], 5)).toEqual([]);
+	});
+
+	test("keeps only the headline when a single line fits", () => {
+		expect(fitSummaryLines(marker(3), 1)).toEqual([drainSummaryTitle(drain({ tasks: [] }))]);
+	});
+
+	test("spends the room on the headline, the task lines and a recomputed tail", () => {
+		const block = marker(5); // headline + 5 task lines
+		expect(block).toHaveLength(6);
+		expect(fitSummaryLines(block, 2)).toEqual([block[0] as string, "  … +5 more"]);
+		expect(fitSummaryLines(block, 3)).toEqual([block[0] as string, block[1] as string, "  … +4 more"]);
+		expect(fitSummaryLines(block, 5)).toEqual([block[0] as string, block[1] as string, block[2] as string, block[3] as string, "  … +2 more"]);
+	});
+
+	test("absorbs the tail the block already carried instead of dropping its count", () => {
+		const block = marker(12); // headline + 8 task lines + "… +4 more"
+		expect(block).toHaveLength(10);
+		expect(block[9]).toBe("  … +4 more");
+		const fitted = fitSummaryLines(block, 4);
+		expect(fitted).toHaveLength(4);
+		expect(fitted[0]).toBe(block[0] as string);
+		expect(fitted[1]).toBe(block[1] as string);
+		expect(fitted[2]).toBe(block[2] as string);
+		expect(fitted[3]).toBe("  … +10 more"); // 12 tasks, 2 shown
+	});
+
+	test("reports exactly the hidden task count when it truncates", () => {
+		const block = marker(4); // headline + 4 task lines
+		expect(block).toHaveLength(5);
+		const fitted = fitSummaryLines(block, 3);
+		expect(fitted).toEqual([block[0] as string, block[1] as string, "  … +3 more"]);
+		// A block that fits is never given a tail (see the pass-through case above).
+		expect(fitSummaryLines(block, 5)).toEqual(block);
+	});
+
+	test("floors a fractional budget and never returns more lines than the room", () => {
+		const block = marker(12);
+		for (let room = 0; room <= 10; room += 0.5) {
+			const fitted = fitSummaryLines(block, room);
+			expect(fitted.length).toBeLessThanOrEqual(Math.max(0, Math.floor(room)));
+		}
+		expect(fitSummaryLines(block, 3.9)).toHaveLength(3);
+		// The real widget budget: 4 workers + auto header + run line + counters + BOARD leaves 2.
+		const widgetRoom = 10 - 1 - (1 + 4 + 2);
+		expect(widgetRoom).toBe(2);
+		const inWidget = fitSummaryLines(block, widgetRoom);
+		expect(inWidget).toHaveLength(2);
+		expect(inWidget[1]).toBe("  … +12 more"); // 12 tasks, none shown
+	});
+
+	test("keeps every fitted line tab-free", () => {
+		for (const line of fitSummaryLines(marker(12), 5)) expect(line).not.toContain("\t");
 	});
 });

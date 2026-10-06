@@ -10,6 +10,7 @@ import { SwarmDriver, type SwarmDriverDeps, type TimerApi } from "./driver";
 import {
 	drainSummaryLines,
 	drainSummaryTitle,
+	fitSummaryLines,
 	progressBar,
 	progressLine,
 	renderAgents,
@@ -27,6 +28,16 @@ const PANEL_STATUS_KEY = "swarm";
 const PANEL_WIDGET_KEY = "swarm-panel";
 /** The progress bar is a reading aid, not a ruler: keep it short enough to sit beside the text. */
 const PROGRESS_BAR_WIDTH = 20;
+
+/**
+ * The host's own cap on a `string[]` widget: `MAX_WIDGET_LINES = 10` in
+ * `pi-coding-agent/src/modes/controllers/extension-ui-controller.ts:45`, applied at `:362` as
+ * `content.slice(0, MAX_WIDGET_LINES)` plus a "... (widget truncated)" marker. Every declared line
+ * after the tenth is discarded - the mode header, the run line, the progress block (or the drained
+ * summary), the worker rows, the counters and the BOARD share this one budget, so a block that
+ * ignores it silently eats the footer.
+ */
+const WIDGET_LINE_BUDGET = 10;
 
 /** What the completion alert leaves behind, so the operator can still read it after the fact. */
 interface DrainMarker {
@@ -191,17 +202,25 @@ export default function swarm(pi: ExtensionAPI): void {
 		return actionable === 0 ? undefined : `SWARM ${counts.done + counts.failed}/${actionable} done`;
 	};
 
-	/** The bar and the counts line while the pool works; the drained summary once it is over. */
-	const progressWidgetLines = (runtime: Runtime, width: number): string[] => {
-		if (runtime.drainMarker !== undefined) return runtime.drainMarker.lines;
+	/**
+	 * The bar and the counts line while the pool works; the drained summary once it is over. Both
+	 * answer to `room` - the widget lines left after the header, run line, rows and counters - so
+	 * the block never pushes the footer past the host's cap.
+	 */
+	const progressWidgetLines = (runtime: Runtime, width: number, room: number): string[] => {
+		if (runtime.drainMarker !== undefined) return fitSummaryLines(runtime.drainMarker.lines, room);
 		if (!(runtime.driver?.running ?? false)) return [];
 		const counts = runtime.store.counts();
-		return [progressBar(counts, Math.min(PROGRESS_BAR_WIDTH, width)), progressLine(counts)];
+		const line = progressLine(counts);
+		if (room >= 2) return [progressBar(counts, Math.min(PROGRESS_BAR_WIDTH, width)), line];
+		return room >= 1 ? [line] : [];
 	};
 
 	/**
 	 * What the string-array widget carries: the mode header, the driver's run line, the live
-	 * progress (or the drained summary in its place), one rich row per worker and the counters.
+	 * progress (or the drained summary in its place), one rich row per worker and the counters. The
+	 * progress block gets whatever the rest of the widget leaves inside `WIDGET_LINE_BUDGET`, so the
+	 * footer survives the drain instead of being truncated away.
 	 *
 	 * Width: the host paints each line as `new Text(line, 1, 0)`, which wraps at
 	 * `width - 2 * paddingX` (`pi-tui/src/components/text.ts`), so rows have to fit in the
@@ -212,8 +231,10 @@ export default function swarm(pi: ExtensionAPI): void {
 	const panelWidgetLines = (runtime: Runtime): string[] => {
 		const columns = process.stdout.columns || Number(Bun.env.COLUMNS) || 80;
 		const width = Math.max(20, columns - 2);
+		const headers = runtime.auto?.header() ?? [];
 		const body = runtime.driver?.panelLines(width) ?? [];
-		return [...(runtime.auto?.header() ?? []), ...body.slice(0, 1), ...progressWidgetLines(runtime, width), ...body.slice(1)];
+		const room = WIDGET_LINE_BUDGET - headers.length - body.length;
+		return [...headers, ...body.slice(0, 1), ...progressWidgetLines(runtime, width, room), ...body.slice(1)];
 	};
 
 	const autoFor = (runtime: Runtime, ctx: ExtensionContext): AutoController => {
