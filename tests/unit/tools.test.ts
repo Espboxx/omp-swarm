@@ -195,3 +195,53 @@ describe("the worker's instruction pair states the rule the driver can honour", 
 		expect(bootstrap).not.toContain("then claim again");
 	});
 });
+
+describe("swarm_wait reports only rows this agent can actually take", () => {
+	/**
+	 * The read-side half of the same family: `swarm_wait` consulted capabilities but not the file
+	 * reservations that gate the claim path, so it reported `work available: task-N` for a row
+	 * `swarm_claim` is certain to refuse — one full model turn per idle agent per attempt, for work
+	 * that was never theirs (FAIL #648).
+	 */
+	test("a row whose declared files another agent holds is NOT work available", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-wait-blocked")));
+		const { call } = workerTools(store, "RapidTiger", fakeClock());
+		store.createTask({ title: "someone else's file", createdBy: "main", files: ["omp-swarm/extension/driver.ts"] });
+		expect(store.acquireReservations("SwiftTiger", ["omp-swarm/extension/driver.ts"], 600, "task-97").ok).toBe(true);
+
+		const { text, details } = await call("swarm_wait", { seconds: 25 });
+		expect(details.wake).toBe("timeout");
+		expect(text).toContain("END YOUR TURN");
+		expect(text).not.toContain("work available");
+	});
+
+	test("the same row is work with no reservation, or when the caller is the holder", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-wait-owner")));
+		const { call } = workerTools(store, "RapidTiger", fakeClock());
+		store.createTask({ title: "the only row", createdBy: "main", files: ["omp-swarm/extension/driver.ts"] });
+
+		const free = await call("swarm_wait", { seconds: 25 });
+		expect(free.details.wake).toBe("task");
+		expect(free.text).toContain("work available");
+
+		// The caller's own hold is not a conflict: `acquireReservations` exempts the owner, so the claim
+		// path is open and the row must stay reported as work.
+		expect(store.acquireReservations("RapidTiger", ["omp-swarm/extension/driver.ts"], 600, "task-98").ok).toBe(true);
+		const own = await call("swarm_wait", { seconds: 25 });
+		expect(own.details.wake).toBe("task");
+		expect(own.text).toContain("work available");
+	});
+
+	test("a row with no declared files stays claimable, and an unblocked row wins over a blocked one", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-wait-second")));
+		const { call } = workerTools(store, "RapidTiger", fakeClock());
+		store.createTask({ title: "blocked", createdBy: "main", files: ["omp-swarm/extension/driver.ts"] });
+		expect(store.acquireReservations("SwiftTiger", ["omp-swarm/extension/driver.ts"], 600, "task-97").ok).toBe(true);
+		store.createTask({ title: "free", createdBy: "main" });
+
+		const { text, details } = await call("swarm_wait", { seconds: 25 });
+		expect(details.wake).toBe("task");
+		expect(text).toContain("task-2");
+		expect(text).not.toContain("task-1");
+	});
+});

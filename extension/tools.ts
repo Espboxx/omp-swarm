@@ -4,7 +4,7 @@ import type { TSchema } from "@oh-my-pi/pi-ai";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgents, renderBoard, renderInbox, renderTaskDetail, renderTasks } from "./render";
 import { poolFloor } from "./scaling";
-import type { SwarmStore } from "./store";
+import { patternsConflict, type SwarmStore } from "./store";
 import type { BoardType, SwarmConfig, SwarmMessage, SwarmTask, TaskStatus } from "./types";
 
 export interface SwarmIdentity {
@@ -105,10 +105,21 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		if (mine.length > 0) store.releaseReservations(identity.id, mine.map((row) => row.pattern));
 	};
 
-	const claimable = () =>
-		store.listTasks({ status: "ready", limit: 100 }).filter(
-			(t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => identity.capabilities.includes(cap)),
-		);
+	/**
+	 * The ready rows THIS agent can actually take: capability-matching, and not blocked by a live file
+	 * reservation another agent holds. The claim path reserves a task's declared files and refuses on a
+	 * conflict, so a row whose files someone else holds is not work — reporting it as available spent a
+	 * full model turn on an attempt that could only fail (FAIL #648). Read-only: the wait never acquires
+	 * anything. `swarm_tasks` deliberately still lists the whole pool; only the wake decision narrows here.
+	 */
+	const claimable = () => {
+		const now = Date.now();
+		const held = store.listReservations().filter((row) => row.owner !== identity.id && row.leaseUntil > now);
+		return store
+			.listTasks({ status: "ready", limit: 100 })
+			.filter((t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => identity.capabilities.includes(cap)))
+			.filter((t) => t.files.length === 0 || !held.some((row) => t.files.some((file) => patternsConflict(file, row.pattern))));
+	};
 
 	const statusSchema = z.object({});
 	const statusTool: CustomTool<typeof statusSchema> = {
