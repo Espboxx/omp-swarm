@@ -52,8 +52,7 @@ export const STRINGS = {
 		"tasks.owner": "负责人",
 		"tasks.unowned": "无人认领",
 		"tasks.attempts": "尝试 {n} 次",
-		"tasks.age": "停留",
-		"tasks.updated": "最后更新",
+		"tasks.age": "创建",
 		"tasks.deps": "依赖",
 		"tasks.files": "文件",
 		"tasks.blockedReason": "阻塞原因",
@@ -65,7 +64,6 @@ export const STRINGS = {
 		"tasks.result": "结果",
 		"tasks.commit": "提交",
 		"tasks.priority": "优先级 {n}",
-		"tasks.doneFailedCollapsed": "已完成 / 失败（{n}）",
 
 		"collab.title": "协作",
 		"collab.tab.board": "黑板",
@@ -77,7 +75,6 @@ export const STRINGS = {
 		"collab.urgent": "紧急",
 		"collab.read": "已读",
 		"collab.unread": "未读",
-		"collab.to": "发给 {to}",
 		"collab.all": "所有代理",
 		"collab.showMore": "显示更多（还有 {n} 条）",
 		"collab.showLess": "收起",
@@ -103,8 +100,6 @@ export const STRINGS = {
 		"time.expired": "已过期",
 
 		"value.none": "—",
-		"value.yes": "是",
-		"value.no": "否",
 	},
 
 	en: {
@@ -156,8 +151,7 @@ export const STRINGS = {
 		"tasks.owner": "owner",
 		"tasks.unowned": "unclaimed",
 		"tasks.attempts": "{n} attempts",
-		"tasks.age": "age",
-		"tasks.updated": "last update",
+		"tasks.age": "created",
 		"tasks.deps": "deps",
 		"tasks.files": "files",
 		"tasks.blockedReason": "blocked because",
@@ -169,7 +163,6 @@ export const STRINGS = {
 		"tasks.result": "result",
 		"tasks.commit": "commit",
 		"tasks.priority": "priority {n}",
-		"tasks.doneFailedCollapsed": "done / failed ({n})",
 
 		"collab.title": "Collaboration",
 		"collab.tab.board": "board",
@@ -181,7 +174,6 @@ export const STRINGS = {
 		"collab.urgent": "urgent",
 		"collab.read": "read",
 		"collab.unread": "unread",
-		"collab.to": "to {to}",
 		"collab.all": "all",
 		"collab.showMore": "Show more ({n} left)",
 		"collab.showLess": "Show less",
@@ -207,8 +199,6 @@ export const STRINGS = {
 		"time.expired": "expired",
 
 		"value.none": "—",
-		"value.yes": "yes",
-		"value.no": "no",
 	},
 };
 

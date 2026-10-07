@@ -778,6 +778,9 @@ function startStream() {
 }
 
 async function boot() {
+	// Paint something honest before the first byte arrives: an empty page reads as a broken page.
+	buildShell();
+	append(dom.feedBody, [el("p", { class: "empty", text: t("app.loading") })]);
 	const ok = await refresh();
 	if (!ok) renderEmptyShell();
 	startClock();
