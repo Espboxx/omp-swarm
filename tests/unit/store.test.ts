@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { openDatabase, swarmPaths, type SwarmPaths } from "../../extension/db";
 import { findStarvation } from "../../extension/starvation";
 import { SwarmStore, UNROUTABLE_GRACE_MS, patternsConflict } from "../../extension/store";
+import { DEFAULT_CONFIG } from "../../extension/types";
 
 const CHILD = join(import.meta.dir, "..", "helpers", "swarm-child.ts");
 const roots: string[] = [];
@@ -924,6 +925,127 @@ describe("sqlite handles", () => {
 		const row = reader.get<{ n: number }>("SELECT COUNT(*) AS n FROM tasks");
 		reader.close();
 		expect(row?.n).toBe(1);
+		store.close();
+	});
+});
+
+/**
+ * goal-14's clause 1, at the createTask mint site (task-249).
+ *
+ * WHY THIS FILE AND WHY THESE TESTS. `swarm_task_create` bypasses `mergeProposals` and reaches
+ * `#createTaskLocked` directly, so commit 495ec30's merge guard does not cover it: a direct create
+ * with a capability no configured role can hold is still ACCEPTED, which is exactly how task-221/
+ * 222/223 sat `ready` for two hours. The guard is opt-in (`reachable?: Set<string>`, the shape
+ * `mergeProposals` already took) so that every other caller of `#createTaskLocked` — the goal's
+ * planning task, `swarm_integrate`'s hardcoded `["integrator"]`, the operator's `/swarm task`, the
+ * vote-executed creates — is byte-identical when it passes nothing.
+ */
+describe("a mint whose capability no configured role can reach is refused, not created", () => {
+	const LIVE = new Set<string>(["general"]);
+	const ROLED = new Set<string>(["general", "reviewer"]);
+
+	test("an unreachable capability is refused with the reason, and no row is created", () => {
+		const { store } = makeRoot();
+		const before = store.listTasks({ limit: 1000 }).length;
+		const refused = store.createTask({
+			title: "Verify the voting view non-author",
+			description: "the historical shape: a label nobody in the pool holds",
+			createdBy: "main",
+			requiredCapabilities: ["reviewer"],
+			files: ["scratch/goal11/webverify/VERDICT.md"],
+			reachable: LIVE,
+		});
+		// The refusal is a REPORT, not an exception and not a silently dropped row: the caller gets a
+		// task-shaped object marked `refused`, so it can act on it without a second query.
+		expect(refused.status).toBe("refused");
+		expect(refused.mintRefusal).toContain("reviewer");
+		expect(refused.mintRefusal).toContain("general"); // the reachable alternative is named
+		expect(refused.mintRefusal).toContain("config.roles"); // the operator's path is named
+		// And no row was written: the pool cannot see a refused mint through any query.
+		expect(store.listTasks({ limit: 1000 }).length).toBe(before);
+		expect(store.listTasks({ status: ["ready"], limit: 1000 }).some((task) => task.title === "Verify the voting view non-author")).toBe(false);
+		store.close();
+	});
+
+	test("the same row is accepted once a role provides the capability", () => {
+		const { store } = makeRoot();
+		const made = store.createTask({
+			title: "Verify the voting view non-author",
+			description: "the operator added the role",
+			createdBy: "main",
+			requiredCapabilities: ["reviewer"],
+			reachable: ROLED,
+		});
+		expect(made.status).not.toBe("refused");
+		expect(made.requiredCapabilities).toEqual(["reviewer"]);
+		store.close();
+	});
+
+	test("no capability and a reachable capability are unchanged", () => {
+		const { store } = makeRoot();
+		expect(store.createTask({ title: "no label", createdBy: "main", reachable: LIVE }).status).toBe("ready");
+		expect(store.createTask({ title: "general work", createdBy: "main", requiredCapabilities: ["general"], reachable: LIVE }).status).toBe("ready");
+		// And the same two rows, with NO reachability set at all: the historical behaviour.
+		expect(store.createTask({ title: "no label, unguarded", createdBy: "main" }).status).toBe("ready");
+		expect(store.createTask({ title: "reviewer, unguarded", createdBy: "main", requiredCapabilities: ["reviewer"] }).status).toBe("ready");
+		store.close();
+	});
+
+	test("a partly-unreachable label names only the capability that strands it", () => {
+		const { store } = makeRoot();
+		const refused = store.createTask({
+			title: "verify, then integrate",
+			description: "one reachable and one unreachable capability",
+			createdBy: "main",
+			requiredCapabilities: ["general", "integrator"],
+			reachable: LIVE,
+		});
+		expect(refused.status).toBe("refused");
+		expect(refused.mintRefusal).toContain("integrator");
+		store.close();
+	});
+
+	test("the refusal is reported on the board, so the pool can see a row it never got", () => {
+		const { store } = makeRoot();
+		store.createTask({ title: "Verify the voting view non-author", createdBy: "main", requiredCapabilities: ["reviewer"], reachable: LIVE });
+		const entries = store.searchBoard({ type: "DECISION", limit: 20 });
+		expect(entries.some((entry) => entry.tags.includes("mint-refusal"))).toBe(true);
+		store.close();
+	});
+
+	test("a merged round whose row nobody can claim is refused as a whole, and nothing is written", () => {
+		const { store } = makeRoot();
+		const opened = store.createGoal({ goal: "split the work", agents: 2, createdBy: "main" });
+		store.postProposal(opened.goal, "A", [
+			{ title: "Verify the voting view non-author", deliverable: "d1", files: ["a.md"], capabilities: ["reviewer"] },
+		]);
+		store.postProposal(opened.goal, "B", [{ title: "General work", deliverable: "d2", files: ["b.md"], capabilities: [] }]);
+		store.claim(opened.planningTask.id, "A", 300, ["general"]);
+		const rowsBefore = store.listTasks({ limit: 100 }).length;
+		const planned = store.planGoal(opened.goal.id, "A", { ceiling: 6, config: { ...DEFAULT_CONFIG, roles: [] } });
+		expect(planned.ok).toBe(false);
+		expect(planned.reason).toContain("reviewer");
+		// The whole round rolled back: only the planning task exists, and the goal stays open so the
+		// round can be re-taken by the next scribe rather than sitting half-written.
+		expect(store.listTasks({ limit: 100 }).length).toBe(rowsBefore);
+		expect(store.getGoal(opened.goal.id)?.status).toBe("open");
+		store.close();
+	});
+
+	test("the same round plans normally without a config, and with a clean one with a config", () => {
+		const { store } = makeRoot();
+		const unguarded = store.createGoal({ goal: "no roster", agents: 2, createdBy: "main" });
+		store.postProposal(unguarded.goal, "A", [{ title: "Reviewer row", deliverable: "d1", files: ["z.md"], capabilities: ["reviewer"] }]);
+		store.postProposal(unguarded.goal, "B", [{ title: "Another row", deliverable: "d2", files: ["y.md"], capabilities: [] }]);
+		store.claim(unguarded.planningTask.id, "A", 300, ["general"]);
+		// No config: the pre-existing behaviour, byte for byte.
+		expect(store.planGoal(unguarded.goal.id, "A", { ceiling: 6 }).created.length).toBe(2);
+
+		const clean = store.createGoal({ goal: "clean round", agents: 2, createdBy: "main" });
+		store.postProposal(clean.goal, "A", [{ title: "Clean one", deliverable: "d1", files: ["c.md"], capabilities: ["general"] }]);
+		store.postProposal(clean.goal, "B", [{ title: "Clean two", deliverable: "d2", files: ["d.md"], capabilities: [] }]);
+		store.claim(clean.planningTask.id, "A", 300, ["general"]);
+		expect(store.planGoal(clean.goal.id, "A", { ceiling: 6, config: { ...DEFAULT_CONFIG, roles: [] } }).ok).toBe(true);
 		store.close();
 	});
 });

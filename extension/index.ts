@@ -767,6 +767,10 @@ export default function swarm(pi: ExtensionAPI): void {
 						createdBy: MAIN_AGENT_ID,
 						description: "Created by the operator as a bootstrap task.",
 					});
+					if (task.status === "refused") {
+						ctx.ui.notify(`create refused: ${task.mintRefusal ?? "the row's capability is unreachable"}`, "warning");
+						return;
+					}
 					ctx.ui.notify(`created ${task.id}: ${task.title} (${task.status})`, "info");
 					refreshPanel(ctx, runtime);
 					return;

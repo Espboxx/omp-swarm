@@ -5,6 +5,7 @@ import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgents, renderBoard, renderInbox, renderTaskDetail, renderTasks } from "./render";
 import { poolFloor } from "./scaling";
 import { patternsConflict, type SwarmStore } from "./store";
+import { reachableCapabilities } from "./caps-repair";
 import type { BoardType, DecisionKind, SwarmConfig, SwarmMessage, SwarmTask, SwarmVote, TaskStatus } from "./types";
 import { resolveVotingConfig, type VoteOutcome, type VotingConfig } from "./voting";
 
@@ -360,9 +361,16 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			};
 			let task: SwarmTask;
 			try {
-				const gated = voteGate("create-task", params.vote_id, fields, () => store.createTask({ ...fields, createdBy: identity.id }));
+				const gated = voteGate("create-task", params.vote_id, fields, () =>
+					// goal-14 clause 1: this mint site refuses a capability no configured role can reach,
+					// naming the reachable alternative and the operator's path. The set comes from
+					// `config` the way `repairCaps`'s does, so the store never holds a second copy of
+					// the roster derivation.
+					store.createTask({ ...fields, createdBy: identity.id, reachable: reachableCapabilities(config) }),
+				);
 				if (!gated.ok) return err(gated.reason, { created: false, gated: true });
 				task = gated.value;
+				if (task.status === "refused") return err(`create refused: ${task.mintRefusal ?? "the row's capability is unreachable"}`, { created: false });
 			} catch (error) {
 				// A rejected dependency graph is a tool error, never a blocked row.
 				return err(`create refused: ${error instanceof Error ? error.message : String(error)}`, { created: false });
@@ -484,7 +492,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 					{ planned: false },
 				);
 			}
-			const result = store.planGoal(goal.id, identity.id, { ceiling: config.workers });
+			const result = store.planGoal(goal.id, identity.id, { ceiling: config.workers, config });
 			if (!result.ok) return err(`plan refused: ${result.reason}`, { planned: false });
 			const done = store.complete(goal.planningTask, identity.id, {
 				summary: `planned ${goal.id}: ${result.created.length} task(s) from ${result.proposals} proposal(s)`,
@@ -585,9 +593,14 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			};
 			let task: SwarmTask;
 			try {
+				// No `reachable` set: this row's `["integrator"]` label is the operator's routing
+				// decision, not a strand this tool can diagnose. Refusing it here would close
+				// `swarm_integrate` until the operator adds the role, which is the exact overreach
+				// goal-14 exists to stop.
 				const gated = voteGate("create-task", params.vote_id, fields, () => store.createTask({ ...fields, createdBy: identity.id }));
 				if (!gated.ok) return err(gated.reason, { created: false, gated: true });
 				task = gated.value;
+				if (task.status === "refused") return err(`integrate refused: ${task.mintRefusal ?? "the row's capability is unreachable"}`, { created: false });
 			} catch (error) {
 				return err(`integrate refused: ${error instanceof Error ? error.message : String(error)}`, { created: false });
 			}

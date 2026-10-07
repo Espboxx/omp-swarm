@@ -13,6 +13,8 @@ import {
 	planningTaskBrief,
 	peakParallelism,
 	poolSkipReason,
+	unclaimableReason,
+	unreachableCapabilities,
 	type DeliverableShape,
 	type MergedTask,
 	type Proposal,
@@ -38,7 +40,7 @@ import type {
 	TaskStatus,
 	VoteState,
 } from "./types";
-import { candidatesFromTasks, formatCapsRepair, planCapsRepair, strandedRows, type CapsRepairRecord, type StrandedRow } from "./caps-repair";
+import { candidatesFromTasks, formatCapsRepair, planCapsRepair, reachableCapabilities, strandedRows, type CapsRepairRecord, type StrandedRow } from "./caps-repair";
 import { decide, payloadSignature, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
 
 interface TaskRow {
@@ -298,6 +300,28 @@ export interface CreateTaskInput {
 	requiredCapabilities?: string[];
 	files?: string[];
 	reviewRequired?: boolean;
+	/**
+	 * goal-14's clause 1, at this mint site. The set of capabilities the roster can actually hand an
+	 * agent — `reachableCapabilities(config)` from `caps-repair.ts`, derived from `expandWorkers`.
+	 * When it is SUPPLIED, a required capability outside it makes the mint a REFUSAL (see
+	 * {@link CreateTaskResult}) with an actionable reason. When it is absent the guard is off and the
+	 * mint is exactly what it was before, so every caller that does not opt in — the goal's own
+	 * planning task, `swarm_integrate`'s `["integrator"]` label, the operator's `/swarm task`, the
+	 * vote-executed creates, and every takeover replay — keeps its behaviour byte for byte.
+	 */
+	reachable?: Set<string>;
+}
+
+/**
+ * The in-transaction sentinel for a refused mint inside `planGoal`: the round is refused as a whole
+ * and the transaction rolls back, so the caller sees a `PlanResult` with `ok:false` instead of a
+ * throw escaping the tool. It exists so a refusal is data, not an exception, wherever it surfaces.
+ */
+export class MintRefused extends Error {
+	constructor(reason: string) {
+		super(reason);
+		this.name = "MintRefused";
+	}
 }
 
 export interface BoardQuery {
@@ -609,6 +633,13 @@ export class SwarmStore {
 
 	// ----------------------------------------------------------------- tasks
 
+	/**
+	 * Mint one task. A required capability no configured role can reach — when the caller supplies
+	 * `input.reachable` — is REFUSED: the row is not written, and the returned task carries
+	 * `status:"refused"` plus the reason in `mintRefusal`, so the caller reports it rather than
+	 * discovering a stranded row two hours later. When `reachable` is absent the mint is exactly what
+	 * it was before.
+	 */
 	createTask(input: CreateTaskInput): SwarmTask {
 		return this.#db.transaction(() => this.#createTaskLocked(input));
 	}
@@ -616,8 +647,32 @@ export class SwarmStore {
 	/**
 	 * The task insert without its own transaction, so a caller that must be atomic across several
 	 * rows (`planGoal` creates a whole round) shares ONE write transaction instead of nesting them.
+	 *
+	 * A refusal returns a task-shaped object with `status:"refused"` and `mintRefusal` set — never a
+	 * throw, and never a silently dropped row. Every caller that passes no `reachable` set gets the
+	 * old behaviour exactly (`#createTaskLocked` is shared by the goal's planning task,
+	 * `swarm_integrate`, the operator's bootstrap, and the vote-executed creates).
 	 */
 	#createTaskLocked(input: CreateTaskInput): SwarmTask {
+		/** A task-shaped object for a refused mint: never written, never claimable, never counted. */
+		const refusal = (reason: string): SwarmTask => ({
+			...this.#blankTask(), status: "refused", mintRefusal: reason,
+		});
+		const required = [...new Set(input.requiredCapabilities ?? [])];
+		const unreachable = input.reachable === undefined ? [] : unreachableCapabilities(required, input.reachable);
+		if (unreachable.length > 0 && input.reachable !== undefined) {
+			// The refusal is reported on the board as well as returned, so a row the pool never got is
+			// still visible: the operator can see a stranded label being asked for, which is the exact
+			// information that was missing when task-221/222/223 sat ready for two hours.
+			const reason = unclaimableReason({ task: "", title: input.title, capability: unreachable[0] as string, reachable: [...input.reachable] });
+			this.postBoard({
+				type: "DECISION",
+				agentId: input.createdBy,
+				content: `MINT REFUSED (goal-14 clause 1): ${reason}\n\nThe row was NOT created. Either re-file it with a capability the pool holds, or ask the operator to add a role that carries ${unreachable.join(", ")} — that is the operator's decision, not a worker's.`,
+				tags: ["mint-refusal", "goal-14"],
+			});
+			return refusal(reason);
+		}
 		const now = Date.now();
 		const deps = [...new Set(input.dependencies ?? [])];
 		const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM tasks");
@@ -639,7 +694,7 @@ export class SwarmStore {
 			input.createdBy,
 			now,
 			now,
-			JSON.stringify(input.requiredCapabilities ?? []),
+			JSON.stringify(required),
 			JSON.stringify(input.files ?? []),
 			input.reviewRequired ? 1 : 0,
 		);
@@ -652,6 +707,30 @@ export class SwarmStore {
 
 	#deps(taskId: string): string[] {
 		return this.#db.all<{ depends_on: string }>("SELECT depends_on FROM task_deps WHERE task_id=? ORDER BY depends_on", taskId).map((r) => r.depends_on);
+	}
+
+	/**
+	 * The shape of a task object that exists only in the caller's hand: goal-14's mint refusal. It is
+	 * NOT a pool row — no id, no timestamps, no status a `WHERE status=?` query returns — so a refused
+	 * mint can be reported without any caller mistaking it for work.
+	 */
+	#blankTask(): SwarmTask {
+		const now = Date.now();
+		return {
+			id: "",
+			title: "",
+			description: "",
+			status: "refused",
+			priority: 0,
+			createdBy: "",
+			createdAt: now,
+			updatedAt: now,
+			dependencies: [],
+			requiredCapabilities: [],
+			files: [],
+			review: { required: false },
+			attempts: 0,
+		};
 	}
 
 	/** The whole dependency graph as `task -> [dependencies]`, for cycle walks. */
@@ -1074,7 +1153,9 @@ export class SwarmStore {
 			const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM goals");
 			const id = `goal-${next?.n ?? 1}`;
 			// The planning task is created first so the goal row can carry its id; the brief is built
-			// from the same values the row will hold.
+			// from the same values the row will hold. No `reachable` set: the planning task requires
+			// `["general"]`, which every roster carries, and this caller must never refuse a goal's
+			// own round over a capability the operator has not configured.
 			const planningTask = this.#createTaskLocked({
 				title: `Plan ${id}: merge the split proposals into the task graph`,
 				description: planningTaskBrief({ id, goal: input.goal, agents: input.agents, createdBy: input.createdBy }, deadlineMs),
@@ -1147,7 +1228,7 @@ export class SwarmStore {
 	 * - creation is idempotent against the pool: a deliverable a live task already carries is
 	 *   skipped (and reported), so a scribe that dies mid-merge cannot duplicate the rows it wrote.
 	 */
-	planGoal(goalId: string, agentId: string, options: { ceiling?: number } = {}): PlanResult {
+	planGoal(goalId: string, agentId: string, options: { ceiling?: number; config?: SwarmConfig } = {}): PlanResult {
 		const now = Date.now();
 		const created: string[] = [];
 		const skipped: { title: string; id: string }[] = [];
@@ -1160,7 +1241,13 @@ export class SwarmStore {
 		let unresolved: { task: string; dep: string }[] = [];
 		let peak = 0;
 		let recommended = 0;
-		const outcome = this.#db.transaction((): PlanResult => {
+		// goal-14 clause 1 at the store's mint site: when the caller supplies the config, the same
+		// reachability set 495ec30's merge guard uses reaches every INSERT this round makes, so a
+		// merged row nobody could claim is refused instead of minted. Absent config, nothing changes.
+		const reachable = options.config === undefined ? undefined : reachableCapabilities(options.config);
+		let outcome: PlanResult;
+		try {
+			outcome = this.#db.transaction((): PlanResult => {
 			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, folds, unresolved, peak, recommended, reason });
 			const goal = this.getGoal(goalId);
 			if (goal === undefined) return refuse(`unknown goal ${goalId}`);
@@ -1177,7 +1264,7 @@ export class SwarmStore {
 			if (round.length < MIN_PROPOSALS) {
 				return refuse(`no split proposal for ${goalId} yet; post yours with swarm_propose, or wait for the other workers`);
 			}
-			const merge = mergeProposals(round);
+			const merge = mergeProposals(round, reachable);
 			folded = merge.folded;
 			folds = merge.folds;
 			unresolved = merge.unresolved;
@@ -1221,7 +1308,17 @@ export class SwarmStore {
 					requiredCapabilities: merged.capabilities,
 					files: merged.files,
 					reviewRequired: merged.reviewRequired,
+					// goal-14 clause 1, at the store's mint site: the same reachability set 495ec30's
+					// merge guard reports with reaches every INSERT this round makes.
+					reachable,
 				});
+				if (row.status === "refused") {
+					// A merge whose row nobody can claim is not a plan: refuse the whole round rather
+					// than create the strand it was supposed to prevent. The transaction rolls the whole
+					// round back on this throw, and the reason is already on the board (the mint
+					// refusal), so the scribe's reply and the board agree.
+					throw new MintRefused(row.mintRefusal ?? "the row's capability is unreachable");
+				}
 				keys.set(merged.key, row.id);
 				idByKey.set(merged.key, row.id);
 				created.push(row.id);
@@ -1242,7 +1339,16 @@ export class SwarmStore {
 				folded: folded.length,
 			});
 			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, folds, unresolved, peak, recommended };
-		});
+			});
+		} catch (error) {
+			// A refused mint inside the round is DATA, not a crash: the round is refused with the mint
+			// refusal's own reason, and the transaction already rolled the whole round back. The reason
+			// is on the board too (the mint refusal), so the scribe's reply and the board agree.
+			if (error instanceof MintRefused) {
+				return { ok: false, created: [], skipped: [], proposals, folded, folds, unresolved, peak, recommended, reason: error.message };
+			}
+			throw error;
+		}
 		// The merged split is announced AFTER the write: the DECISION is the round's public record,
 		// never a correctness dependency of the plan itself.
 		if (outcome.ok && outcome.goal !== undefined) {
@@ -1634,6 +1740,7 @@ export class SwarmStore {
 					// The payload was written by the vote tool in CreateTaskInput's own shape; a malformed one
 					// fails the decision rather than creating a half-row.
 					const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
+					if (task.status === "refused") throw new MintRefused(task.mintRefusal ?? "the row's capability is unreachable");
 					// The round spends ITSELF on the task it authorised. Without this the same 2/2 pass stayed
 					// a standing permission and re-issued `swarm_task_create(..., { vote_id })` created one more
 					// task per call (VERDICT §3: ONE vote, THREE tasks).
@@ -1694,6 +1801,7 @@ export class SwarmStore {
 		if (vote.kind !== "create-task") return vote;
 		try {
 			const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
+			if (task.status === "refused") throw new MintRefused(task.mintRefusal ?? "the row's capability is unreachable");
 			this.#db.run("UPDATE votes SET result=?, updated_at=? WHERE id=?", `seeded: created ${task.id}`, Date.now(), vote.id);
 			this.#recordConsumptionLocked(vote.id, vote.kind, vote.payload, vote.openedBy, Date.now());
 			this.#log("vote.executed", vote.openedBy, undefined, { vote: vote.id, kind: vote.kind, task: task.id, seeded: true });

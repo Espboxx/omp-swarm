@@ -1,5 +1,15 @@
 /** Domain types shared by the swarm store, tools, driver, and renderers. */
 
+/**
+ * The state of a task the pool holds OR a refusal object a mint handed back.
+ *
+ * `"refused"` is deliberately not one of the DB-backed states ({@link TaskStatus}): it marks a task
+ * object a refused mint returned (goal-14 clause 1) that was never written to the pool, so no
+ * `WHERE status=?` query, no count, and no claim can ever see it. It is on this type only so a
+ * caller receives ONE type from the mint.
+ */
+export type RowStatus = "ready" | "claimed" | "blocked" | "review" | "done" | "failed" | "refused";
+/** The DB-backed subset of {@link RowStatus}: every value a `tasks.status` column can hold. */
 export type TaskStatus = "ready" | "claimed" | "blocked" | "review" | "done" | "failed";
 
 export type AgentStatus = "idle" | "working" | "reviewing" | "blocked" | "waiting" | "offline";
@@ -18,7 +28,8 @@ export interface SwarmTask {
 	id: string;
 	title: string;
 	description: string;
-	status: TaskStatus;
+	/** `RowStatus`, not `TaskStatus`: a refused mint returns a task-shaped object with `"refused"`. */
+	status: RowStatus;
 	priority: number;
 	createdBy: string;
 	createdAt: number;
@@ -38,6 +49,12 @@ export interface SwarmTask {
 		notes?: string;
 	};
 	attempts: number;
+	/**
+	 * goal-14 clause 1: set ONLY on a row returned by a refused mint. The row was never written to
+	 * the pool; it is handed to the caller so the refusal can be reported without an exception, and
+	 * `status` is `"refused"` so a writer of a generic row handler cannot mistake it for real work.
+	 */
+	mintRefusal?: string;
 }
 
 export interface SwarmAgent {
