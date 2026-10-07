@@ -7,12 +7,12 @@ import {
 	deliverableKey,
 	describeDeliverable,
 	goalTag,
-	isSameDeliverable,
 	mergeProposals,
 	orderForCreation,
 	parseProposal,
 	planningTaskBrief,
 	peakParallelism,
+	poolSkipReason,
 	type DeliverableShape,
 	type MergedTask,
 	type Proposal,
@@ -1124,10 +1124,16 @@ export class SwarmStore {
 			}
 			for (const merged of orderForCreation(merge.tasks).ordered) {
 				// The pool dedupes by the same deliverable rule the round does, so a re-takeover after a
-				// scribe dies recognises work an earlier round already created under other wording.
+				// scribe dies recognises work an earlier round already created under other wording. The
+				// predicate is deliberately NARROWER here than in the round: an unrelated finished row
+				// that merely names the same file must not swallow a new round's writer row, which is
+				// how goal-11's line A lost its only writer (its files were task-112's files).
 				const shape = describeDeliverable(merged.title, merged.files);
 				const existing =
-					keys.get(merged.key) ?? heldShapes.find((held) => isSameDeliverable(held.shape, shape))?.id;
+					keys.get(merged.key) ??
+					heldShapes
+						.map((held) => ({ held, skip: poolSkipReason(held.shape, shape) }))
+						.find((candidate) => candidate.skip !== undefined)?.held.id;
 				if (existing !== undefined) {
 					skipped.push({ title: merged.title, id: existing });
 					idByKey.set(merged.key, existing);

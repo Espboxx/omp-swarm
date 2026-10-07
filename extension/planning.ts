@@ -603,6 +603,87 @@ export function isSameDeliverable(left: DeliverableShape, right: DeliverableShap
 	return sameDeliverableReason(left, right) !== undefined;
 }
 
+/**
+ * Whether every artifact the incoming side declares is a file the held side declares BY THE SAME
+ * PATH. `sameArtifact` deliberately reads one path being the tail of the other as the same file
+ * (`/repo/docs/NOTES.md` and `docs/NOTES.md`), which is what makes cross-root spellings merge; this
+ * asks the stricter question, because a tail that differs is a different file on disk.
+ */
+function declaresTheSameFiles(held: DeliverableShape, incoming: DeliverableShape): boolean {
+	if (incoming.artifacts.length === 0) return false;
+	const known = new Set(held.artifacts);
+	return incoming.artifacts.every((artifact) => known.has(artifact));
+}
+
+/**
+ * Whether the incoming wording is CONTAINED in the held one: every word the incoming side carries is
+ * a word the held side carries too — either as wording, or inside one of its artifact paths. Not a
+ * similarity score, which cannot express the pairs this predicate has to tell apart: the goal-11 A
+ * row (11 words, 10 of them absent from task-112's 17) measures 0.09, while goal-9's tightest
+ * legitimate fold measures 0.00 (its wording is replaced across spellings). A threshold therefore
+ * keeps both or drops both, and only containment says "the same work described differently".
+ *
+ * The artifact route matters because `describeDeliverable` drops a path's own words from the wording:
+ * the held row that absorbed `scratch/goal11/cleanup/**` has no `cleanup` in its words, while a
+ * proposal whose own file list spells the same directory differently still carries it. Treating that
+ * as disagreement is how a re-takeover would mint a duplicate row for a deliverable it already holds.
+ */
+function carriesWording(held: DeliverableShape, incoming: DeliverableShape): boolean {
+	if (incoming.words.length === 0) return true;
+	const known = new Set(held.words);
+	for (const artifact of held.artifacts) for (const word of words(artifact)) known.add(word);
+	return incoming.words.every((word) => known.has(word));
+}
+
+/** Whether the two sides named at least one artifact under two spellings (the merge's own test). */
+function artifactSpelled(left: DeliverableShape, right: DeliverableShape): boolean {
+	return left.artifacts.some((a) => right.artifacts.some((b) => artifactName(a) !== artifactName(b) && namesShareAToken(a, b)));
+}
+
+/**
+ * Whether a merged deliverable of a NEW planning round may be SKIPPED because the pool already holds
+ * it, with the reason — or `undefined` when it must be created.
+ *
+ * `store.planGoal` asks this against every live AND finished row of the pool, which is the mirror
+ * image of goal-9's second-writer problem: there, a round minted two writers for one artifact; here,
+ * an UNRELATED finished deliverable silently swallowed the new round's writer row. goal-11's A row
+ * was dropped that way — it declares `extension/planning.ts` + `tests/unit/planning.test.ts`, and
+ * task-112 (a long-done version-tag dedupe fix) owns those same two files, so `isSameDeliverable`
+ * answered "two spellings of one artifact": `sameArtifact` reads one path being the tail of the
+ * other as the same file. Nothing in the round noticed; the DECISION politely recorded the skip, and
+ * the operator-approved line A had no work in the pool at all.
+ *
+ * The rule is NARROWER than {@link isSameDeliverable} on purpose, and the asymmetry is the point
+ * (in every direction the rule's usual one applies: a visible duplicate row beats a deliverable
+ * silently lost):
+ *
+ * 1. SAME KIND. A `fix` of a file must not absorb the `write` of that file in a new round and vice
+ *    versa, and an `other`-kind row must not absorb a known-kind row nor be absorbed by one. goal-9's
+ *    owner-clause folds are `fix`/`fix` and still skip; goal-3's false merge was a `fix` swallowing
+ *    a `verify` and is still refused.
+ * 2. THE ROUTE IT FOLDED BY MUST CARRY ITS OWN EVIDENCE:
+ *    - TWO MUTATING KINDS sharing a file are one owner — that is the round's own owner clause, and
+ *      the tightest of goal-9's folds (0.00 wording overlap) belongs here. It keeps skipping.
+ *    - A NON-MUTATING pair (two verifications, two `other` rows, a `document`) only ever folds
+ *      through the SPELLING route: one path being the tail of the other, or two names that share a
+ *      token. That route cannot tell "the same deliverable, spelled differently" from "a different
+ *      deliverable that happens to name a similar file" — exactly the goal-11 A drop. On this route
+ *      the incoming wording must ALSO be carried by the held row's, so a re-proposal of the same work
+ *      still folds while an unrelated finished row does not swallow the new round.
+ */
+export function poolSkipReason(held: DeliverableShape, incoming: DeliverableShape): string | undefined {
+	if (held.intent !== incoming.intent) {
+		// An unknown kind contradicts nothing, but it also proves nothing: `other` on one side against a
+		// known kind on the other is the writer-into-verifier fold this rule exists to refuse.
+		if (held.intent === "other" || incoming.intent === "other") return undefined;
+	}
+	const reason = sameDeliverableReason(held, incoming);
+	if (reason === undefined) return undefined;
+	if (MUTATING_KINDS[held.intent]) return reason;
+	if (carriesWording(held, incoming) || (declaresTheSameFiles(held, incoming) && artifactSpelled(held, incoming))) return reason;
+	return undefined;
+}
+
 export interface ProposedTask {
 	title: string;
 	deliverable?: string;

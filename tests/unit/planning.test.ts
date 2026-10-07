@@ -20,12 +20,14 @@ import {
 	parseProposedTask,
 	peakParallelism,
 	planningTaskBrief,
+	poolSkipReason,
 	sameDeliverableReason,
 	scribeVerdict,
 	type Proposal,
 } from "../../extension/planning";
 import type { BlackboardEntry } from "../../extension/types";
 import { GOAL3_ENTRIES, GOAL5_ENTRIES } from "./helpers/goal5-round";
+import { GOAL9_ENTRIES } from "./helpers/goal9-round";
 
 function entry(overrides: Partial<BlackboardEntry> = {}): BlackboardEntry {
 	return {
@@ -844,5 +846,137 @@ describe("task-212: one artifact has one owner, and a writer never folds into a 
 		const mutating = describeDeliverable("Fix the roster growth gate in src/tools.ts", ["src/tools.ts"]);
 		expect([unknown.intent, mutating.intent]).toEqual(["other", "fix"]);
 		expect(sameDeliverableReason(unknown, mutating)).toBeUndefined();
+	});
+});
+
+describe("task-224: the pool pass may not swallow a NEW round's writer row", () => {
+	// `store.planGoal` skips a merged deliverable the pool already holds. That skip used the round's own
+	// predicate, which reads one path being the tail of the other as the SAME artifact — so goal-11's A
+	// row, declaring `extension/planning.ts` + `tests/unit/planning.test.ts`, was swallowed by the
+	// long-done task-112, a version-tag dedupe fix that happens to own the same two files. Nothing in the
+	// round noticed and the DECISION recorded a polite "skipped". The mirror image of goal-9's
+	// second-writer problem, so the guard is a separate, NARROWER rule with its own name.
+
+	test("the goal-11 A drop: the held shape and the incoming row are the same files, and it must CREATE", () => {
+		// Verbatim from .swarm/swarm.db: task-112's stored title + files, and goal-11's A row as the two
+		// proposals (#861/#862) merged it.
+		const held = describeDeliverable(
+			"Dedupe: a version tag like `v1.0.beta` is still read as a file name, so two release-shaped writers can still merge",
+			["extension/planning.ts", "tests/unit/planning.test.ts"],
+		);
+		const incoming = describeDeliverable(
+			"Goal-11 A: fix the stale-merge second-writer root cause in extension/planning.ts and prove it with a real historical replay",
+			["omp-swarm/extension/planning.ts", "omp-swarm/tests/unit/planning.test.ts", "scratch/goal11/replay"],
+		);
+		// The old predicate said "yes, skip" — that is the defect, pinned so the diagnosis cannot drift.
+		expect(isSameDeliverable(held, incoming)).toBe(true);
+		expect(describeDeliverable("Goal-11 A: fix the stale-merge second-writer root cause in extension/planning.ts and prove it with a real historical replay").intent).toBe("other");
+		expect(poolSkipReason(held, incoming)).toBeUndefined();
+	});
+
+	test("wording containment counts the words of the held row's own artifacts", () => {
+		// `describeDeliverable` drops a path's own words from the wording, so the held row that absorbed
+		// `scratch/goal11/cleanup/**` has no `cleanup` word while a re-proposal whose own file list spells
+		// the directory differently still carries it. Without the artifact route a re-takeover would mint a
+		// duplicate row for a deliverable the pool already holds - the goal-6 complaint one round on.
+		// Measured against the real rows: task-220's stored title/files vs the second proposal's spelling.
+		const held = describeDeliverable(
+			"Goal-11 C: conservative cleanup with full before/after evidence",
+			["scratch/goal11/cleanup/**", ".swarm/*.txt", "omp-swarm/scratch/**"],
+		);
+		const incoming = describeDeliverable("Goal-11 C: conservative cleanup with full before/after evidence", [".swarm/*.txt", "omp-swarm/scratch"]);
+		expect(poolSkipReason(held, incoming)).toContain("the same artifact");
+	});
+
+	test("a genuine re-proposal of the same work still skips, so a re-takeover makes no duplicate row", () => {
+		// The pool pass exists: a later round re-wording a deliverable an earlier round already created
+		// under a different spelling must fold into it, or every re-plan duplicates the pool. The wording
+		// the incoming row carries is entirely the held row's own.
+		const held = describeDeliverable(
+			"Dedupe: a version tag like `v1.0.beta` is still read as a file name, so two release-shaped writers can still merge",
+			["extension/planning.ts", "tests/unit/planning.test.ts"],
+		);
+		const incoming = describeDeliverable(
+			"Dedupe: a version tag like `v1.0.beta` is still read as a file name, so two release-shaped writers can still merge",
+			["omp-swarm/extension/planning.ts", "omp-swarm/tests/unit/planning.test.ts"],
+		);
+		expect(poolSkipReason(held, incoming)).toContain("two spellings of one artifact");
+	});
+
+	test("two MUTATING kinds on one file are still one owner in the pool pass", () => {
+		// The owner clause's whole point: whatever their kinds are, two rows that would both edit one
+		// file are one deliverable, and the pool pass must not split them either — a `fix` and a
+		// `write` of src/limiter.ts are one row in a round AND one row in the pool. The wording bar
+		// above applies to the SPELLING route only; this pair is decided by the shared file.
+		const heldFix = describeDeliverable("Fix the retry bug in src/limiter.ts", ["src/limiter.ts"]);
+		const incomingWrite = describeDeliverable("Write the limiter rewrite for src/limiter.ts", ["src/limiter.ts"]);
+		expect([heldFix.intent, incomingWrite.intent]).toEqual(["fix", "write"]);
+		expect(poolSkipReason(heldFix, incomingWrite)).toContain("one artifact has one owner");
+	});
+
+	test("a different KIND of work on the same file is never a skip", () => {
+		// Acceptance (a): the pool pass must require the SAME kind of work. A `fix` of a file must not
+		// absorb the `verify` of that file in a new round — that is goal-3's false merge shape, which
+		// the round already refuses and the pool pass must too. (Two MUTATING kinds on one file are
+		// deliberately one owner even in the pool: that is the round's own owner clause, pinned above.)
+		const heldFix = describeDeliverable("Fix the retry bug in src/limiter.ts", ["src/limiter.ts"]);
+		const incomingVerify = describeDeliverable("Verify the retry fix in src/limiter.ts", ["src/limiter.ts"]);
+		expect([heldFix.intent, incomingVerify.intent]).toEqual(["fix", "verify"]);
+		expect(poolSkipReason(heldFix, incomingVerify)).toBeUndefined();
+		expect(poolSkipReason(incomingVerify, heldFix)).toBeUndefined();
+	});
+
+	test("an unknown kind never absorbs a known kind, in either direction", () => {
+		// The writer-into-verifier fold: an `other`-kind row must not absorb a `fix`/`verify` row, and a
+		// known kind must not absorb an unknown one, however much they look alike.
+		const unknown = describeDeliverable("Wire the ticket gate into src/tools.ts", ["src/tools.ts"]);
+		const known = describeDeliverable("Verify the ticket gate in src/tools.ts", ["src/tools.ts"]);
+		expect([unknown.intent, known.intent]).toEqual(["other", "verify"]);
+		expect(poolSkipReason(unknown, known)).toBeUndefined();
+	});
+
+	test("two rows of the same kind whose wording differs entirely are two deliverables, even on one file", () => {
+		// The case a similarity bar cannot express: a goal-9 owner-clause fold measures 0.00 of the
+		// shorter wording and STILL has to fold in the round — but that is the round's job. In the POOL
+		// pass the incoming wording must be carried by the held row, or an unrelated finished row that
+		// merely names the same file takes the new round's writer with it.
+		const held = describeDeliverable("Fix: a passed vote is bound to its payload and consumed once", ["omp-swarm/extension/store.ts"]);
+		const incoming = describeDeliverable("Goal-11 A: stale-merge second-writer root cause and mint-time guard", ["omp-swarm/extension/store.ts"]);
+		expect(poolSkipReason(held, incoming)).toBeUndefined();
+	});
+
+	test("wording containment, not a similarity score: a terse re-wording of the held row still skips", () => {
+		// The reason the rule is containment: "Fix votes" carries nothing the held row does not already
+		// carry, so it is the same work described more briefly, while the goal-11 A row's wording is
+		// a different subject. A Jaccard score punishes the terse one for being short, which is the
+		// opposite of what the pass needs.
+		const held = describeDeliverable("Fix the vote tickets: bind each round to the payload it voted on", ["extension/store.ts"]);
+		const terse = describeDeliverable("Fix the vote tickets", ["omp-swarm/extension/store.ts"]);
+		const unrelated = describeDeliverable("Set up the DeepSeek context knob", ["omp-swarm/extension/store.ts"]);
+		expect(poolSkipReason(held, terse)).toBeDefined();
+		expect(poolSkipReason(held, unrelated)).toBeUndefined();
+	});
+
+	test("the goal-9 round's OWN writer row still skips against the row that absorbed its spellings", () => {
+		// Skeleton pinned live: the goal-9 round folded three writers into one row on
+		// extension/store.ts. Re-running that round against the pool must recognise the survivor and
+		// skip it, not mint a second owner — the whole reason the narrow rule keeps the wording clause
+		// instead of a blanket "new round always creates".
+		const round = (): Proposal[] => GOAL9_ENTRIES.map((entry) => proposal(entry.agentId, { goal: "goal-9", tasks: entry.tasks }, entry.id));
+		const merged = mergeProposals(round());
+		expect(merged.tasks.length).toBe(8);
+		const survivor = merged.tasks[0];
+		expect(survivor?.files).toContain("omp-swarm/extension/store.ts");
+		const held = describeDeliverable(survivor?.title ?? "", survivor?.files ?? [], survivor?.deliverable ?? "");
+		for (const fold of merged.folds) {
+			if (!fold.reason.startsWith("one artifact has one owner")) continue;
+			const original = round()
+				.flatMap((p) => p.tasks)
+				.find((task) => task.title === fold.title);
+			if (original === undefined) continue;
+			// The ORIGINAL spelling of a folded row is recognised through the survivor's stored shape:
+			// this is what a re-takeover asks, and it must still be a skip.
+			expect(poolSkipReason(held, describeDeliverable(original.title, original.files ?? [], original.deliverable ?? ""))).toBeDefined();
+		}
 	});
 });
