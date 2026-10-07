@@ -76,7 +76,7 @@ web/
   lib/         the read-only DB handle, asset path resolution and the row types
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
-  unit/store.test.ts           46 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
+  unit/store.test.ts           50 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
   unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
@@ -85,7 +85,7 @@ tests/
   unit/coordinator-guard.test.ts 17 unit tests of the coordinator-edit guard: when a main session may be told it is doing the workers' job, when silence is the right answer, and which bash commands count as writes
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
   unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
-  unit/tools.test.ts            5 unit tests of the idle worker's instruction pair: swarm_wait's timeout return must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`), and the constitution/bootstrap text must state the same rule while still refusing to stop with work in flight
+  unit/tools.test.ts           10 unit tests of the worker's two contracts: swarm_wait's timeout must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`) while the constitution/bootstrap states the same rule and still refuses to stop with work in flight, and a lifecycle call (renew/complete/release/fail) must drop only its OWN task's file holds instead of every reservation the caller holds
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -609,7 +609,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 439 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 448 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
