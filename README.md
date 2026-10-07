@@ -1,3 +1,4 @@
+[**English**](README.md) · [简体中文](README.zh-CN.md)
 # omp-swarm — decentralized peer-agent swarm for OMP
 
 A flat multi-agent swarm: **N peer agents with no permanent manager**, coordinating through one
