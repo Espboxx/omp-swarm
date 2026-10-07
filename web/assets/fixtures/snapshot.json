@@ -16,7 +16,9 @@
       "role": "general",
       "status": "working",
       "currentTask": "task-101",
-      "capabilities": ["general"],
+      "capabilities": [
+        "general"
+      ],
       "worktree": null,
       "heartbeatAgeMs": 3200,
       "leaseUntilMs": 1791420000000,
@@ -27,7 +29,10 @@
       "role": "reviewer",
       "status": "reviewing",
       "currentTask": "task-97",
-      "capabilities": ["reviewer", "general"],
+      "capabilities": [
+        "reviewer",
+        "general"
+      ],
       "worktree": null,
       "heartbeatAgeMs": 9100,
       "leaseUntilMs": 1791419400000,
@@ -38,7 +43,9 @@
       "role": "general",
       "status": "working",
       "currentTask": "task-94",
-      "capabilities": ["general"],
+      "capabilities": [
+        "general"
+      ],
       "worktree": "C:/work/demo-project/.swarm/worktrees/VividTiger",
       "heartbeatAgeMs": 44000,
       "leaseUntilMs": 1791417960000,
@@ -49,7 +56,9 @@
       "role": "general",
       "status": "idle",
       "currentTask": null,
-      "capabilities": ["general"],
+      "capabilities": [
+        "general"
+      ],
       "worktree": null,
       "heartbeatAgeMs": 1200,
       "leaseUntilMs": null,
@@ -60,7 +69,11 @@
       "role": "coordinator",
       "status": "idle",
       "currentTask": null,
-      "capabilities": ["general", "reviewer", "integrator"],
+      "capabilities": [
+        "general",
+        "reviewer",
+        "integrator"
+      ],
       "worktree": null,
       "heartbeatAgeMs": 600,
       "leaseUntilMs": null,
@@ -71,7 +84,9 @@
       "role": "general",
       "status": "offline",
       "currentTask": null,
-      "capabilities": ["general"],
+      "capabilities": [
+        "general"
+      ],
       "worktree": null,
       "heartbeatAgeMs": 486000,
       "leaseUntilMs": 1791417000000,
@@ -93,8 +108,13 @@
       "ageMs": 62173000,
       "dependencies": [],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["extension/**", "tests/unit/**"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "extension/**",
+        "tests/unit/**"
+      ],
       "reviewRequired": true,
       "reviewStatus": "pending",
       "result": null,
@@ -114,8 +134,13 @@
       "ageMs": 306000,
       "dependencies": [],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["web/server.ts", "web/snapshot.ts"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "web/server.ts",
+        "web/snapshot.ts"
+      ],
       "reviewRequired": true,
       "reviewStatus": "pending",
       "result": null,
@@ -135,8 +160,12 @@
       "ageMs": 306000,
       "dependencies": [],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["web/assets/**"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "web/assets/**"
+      ],
       "reviewRequired": true,
       "reviewStatus": null,
       "result": null,
@@ -154,10 +183,17 @@
       "claimedAtMs": 1791380000000,
       "leaseUntilMs": null,
       "ageMs": 62173000,
-      "dependencies": ["task-94"],
+      "dependencies": [
+        "task-94"
+      ],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["README.md", "README.zh-CN.md"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "README.md",
+        "README.zh-CN.md"
+      ],
       "reviewRequired": true,
       "reviewStatus": "pending",
       "result": "Both READMEs updated, headings 1:1.",
@@ -175,9 +211,13 @@
       "claimedAtMs": null,
       "leaseUntilMs": null,
       "ageMs": 62139000,
-      "dependencies": ["task-94"],
+      "dependencies": [
+        "task-94"
+      ],
       "blockedReason": "waiting for dependencies: task-94",
-      "requiredCapabilities": ["general"],
+      "requiredCapabilities": [
+        "general"
+      ],
       "files": [],
       "reviewRequired": false,
       "reviewStatus": null,
@@ -196,9 +236,13 @@
       "claimedAtMs": null,
       "leaseUntilMs": null,
       "ageMs": 700000,
-      "dependencies": ["task-98"],
+      "dependencies": [
+        "task-98"
+      ],
       "blockedReason": "waiting for dependencies: task-98",
-      "requiredCapabilities": ["reviewer"],
+      "requiredCapabilities": [
+        "reviewer"
+      ],
       "files": [],
       "reviewRequired": false,
       "reviewStatus": null,
@@ -219,8 +263,12 @@
       "ageMs": 142600000,
       "dependencies": [],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["extension/render.ts"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "extension/render.ts"
+      ],
       "reviewRequired": false,
       "reviewStatus": null,
       "result": "Panel removed, iteration-2 layout restored.",
@@ -238,10 +286,16 @@
       "claimedAtMs": 1791399000000,
       "leaseUntilMs": null,
       "ageMs": 117600000,
-      "dependencies": ["task-43"],
+      "dependencies": [
+        "task-43"
+      ],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["extension/render.ts"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "extension/render.ts"
+      ],
       "reviewRequired": false,
       "reviewStatus": null,
       "result": "Marker bounded against the 10-line cap.",
@@ -261,8 +315,12 @@
       "ageMs": 157600000,
       "dependencies": [],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["extension/panel-page.ts"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "extension/panel-page.ts"
+      ],
       "reviewRequired": false,
       "reviewStatus": null,
       "result": "CLOSED AS SUPERSEDED: the operator ordered a rollback of the panel work.",
@@ -280,10 +338,16 @@
       "claimedAtMs": null,
       "leaseUntilMs": null,
       "ageMs": 157600000,
-      "dependencies": ["task-22"],
+      "dependencies": [
+        "task-22"
+      ],
       "blockedReason": null,
-      "requiredCapabilities": ["general"],
-      "files": ["extension/panel-page.ts"],
+      "requiredCapabilities": [
+        "general"
+      ],
+      "files": [
+        "extension/panel-page.ts"
+      ],
       "reviewRequired": false,
       "reviewStatus": null,
       "result": "CLOSED AS SUPERSEDED (dependency task-22 is failed).",
@@ -291,6 +355,22 @@
     }
   ],
   "board": [
+    {
+      "id": 381,
+      "type": "FAIL",
+      "taskId": null,
+      "author": "CalmTiger",
+      "createdAtMs": 1791417100000,
+      "content": "vote_failed vote-42 (close-task): Close task-98 as superseded by task-97?\ntimeout: 1/4 approved, needed 4 - not-yet-voted counted absent, default deny\ntally: for 1/4 [CalmTiger]; against 1 [SwiftTiger]; absent 2 [BrightTiger, VividTiger]; offline 0 [-]"
+    },
+    {
+      "id": 380,
+      "type": "DECISION",
+      "taskId": null,
+      "author": "SwiftTiger",
+      "createdAtMs": 1791416700000,
+      "content": "vote_passed vote-41 (spawn): Grow the pool toward 5 ready tasks?\n4/4 approved (needed 4, threshold 0.75)\ntally: for 4/4 [SwiftTiger, CalmTiger, VividTiger, BrightTiger]; against 0 [-]; absent 0 [-]; offline 0 [-]"
+    },
     {
       "id": 372,
       "type": "DECISION",
@@ -410,6 +490,11 @@
   ],
   "events": [
     {
+      "createdAtMs": 1791417540000,
+      "type": "vote.open",
+      "content": "{\"vote\": \"vote-43\", \"kind\": \"create-task\", \"question\": \"Split the polish row into a writer and a verifier?\", \"threshold\": 0.75, \"minBase\": 2, \"timeoutMs\": 90000, \"seeded\": false}"
+    },
+    {
       "createdAtMs": 1791417360000,
       "type": "task.claim",
       "content": "SwiftTiger claimed task-101"
@@ -420,6 +505,16 @@
       "content": "main created task-102 (Web dashboard frontend)"
     },
     {
+      "createdAtMs": 1791417100000,
+      "type": "vote.failed",
+      "content": "{\"vote\": \"vote-42\", \"kind\": \"close-task\", \"question\": \"Close task-98 as superseded by task-97?\", \"for\": [\"CalmTiger\"], \"against\": [\"SwiftTiger\"], \"absent\": [\"BrightTiger\", \"VividTiger\"], \"offline\": [], \"reason\": \"timeout: 1/4 approved, needed 4 - not-yet-voted counted absent, default deny\"}"
+    },
+    {
+      "createdAtMs": 1791417000000,
+      "type": "vote.open",
+      "content": "{\"vote\": \"vote-42\", \"kind\": \"close-task\", \"question\": \"Close task-98 as superseded by task-97?\", \"threshold\": 0.75, \"minBase\": 2, \"timeoutMs\": 900000, \"seeded\": false}"
+    },
+    {
       "createdAtMs": 1791417000000,
       "type": "task.claim",
       "content": "VividTiger claimed task-94"
@@ -428,6 +523,21 @@
       "createdAtMs": 1791416920000,
       "type": "roster.grow",
       "content": "swarm grew by 1 worker toward 3 ready task(s)"
+    },
+    {
+      "createdAtMs": 1791416700000,
+      "type": "vote.passed",
+      "content": "{\"vote\": \"vote-41\", \"kind\": \"spawn\", \"question\": \"Grow the pool toward 5 ready tasks?\", \"for\": [\"SwiftTiger\", \"CalmTiger\", \"VividTiger\", \"BrightTiger\"], \"against\": [], \"absent\": [], \"offline\": [], \"reason\": \"4/4 approved (needed 4, threshold 0.75)\"}"
+    },
+    {
+      "createdAtMs": 1791416500000,
+      "type": "vote.ballot",
+      "content": "{\"vote\": \"vote-41\", \"kind\": \"spawn\", \"approve\": true}"
+    },
+    {
+      "createdAtMs": 1791416400000,
+      "type": "vote.open",
+      "content": "{\"vote\": \"vote-41\", \"kind\": \"spawn\", \"question\": \"Grow the pool toward 5 ready tasks?\", \"threshold\": 0.75, \"minBase\": 2, \"timeoutMs\": 900000, \"seeded\": false}"
     },
     {
       "createdAtMs": 1791415800000,

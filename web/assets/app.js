@@ -14,6 +14,7 @@
  */
 import { STRINGS, LANGS } from "./strings.js";
 import { breakablePath } from "./format.js";
+import { votesFromSnapshot, voteBoardIds } from "./votes.js";
 
 const SNAPSHOT_URL = "/api/snapshot";
 const EVENTS_URL = "/api/events";
@@ -35,6 +36,8 @@ const state = {
 	activeTab: "board",
 	showAll: { board: false, messages: false, events: false },
 	showAllTasks: {},
+	activeVoteTab: "live",
+	showAllVotes: false,
 };
 
 function pickLang() {
@@ -204,6 +207,8 @@ function buildShell() {
 	dom.reservations = el("div", {});
 	dom.feedBody = el("div", {});
 	dom.progressBody = el("div", {});
+	dom.votesBody = el("div", {});
+	dom.votesNote = el("span", { class: "panel-note" });
 
 	dom.tabs = el("div", { class: "tablist", role: "tablist", "aria-label": t("collab.title") });
 	dom.tabButtons = {};
@@ -223,6 +228,24 @@ function buildShell() {
 		dom.tabs.append(button);
 	}
 
+	dom.voteTabs = el("div", { class: "vote-tablist", role: "tablist", "aria-label": t("votes.title") });
+	dom.voteTabButtons = {};
+	for (const tab of ["live", "recent"]) {
+		const button = el("button", {
+			class: "tab",
+			type: "button",
+			role: "tab",
+			id: `vote-tab-${tab}`,
+			"aria-controls": "panel-votes",
+			"aria-selected": state.activeVoteTab === tab ? "true" : "false",
+			tabindex: state.activeVoteTab === tab ? "0" : "-1",
+			onclick: () => selectVoteTab(tab),
+			onkeydown: (event) => onVoteTabKey(event, tab),
+		}, t(`votes.tab.${tab}`));
+		dom.voteTabButtons[tab] = button;
+		dom.voteTabs.append(button);
+	}
+
 	const main = el(
 		"main",
 		{ id: "main" },
@@ -230,6 +253,7 @@ function buildShell() {
 		panel(t("progress.title"), null, dom.progressBody),
 		panel(t("agents.title"), dom.agentsNote, dom.agentsBody),
 		panel(t("tasks.title"), null, dom.tasksBody, dom.reservations),
+		panel(t("votes.title"), dom.votesNote, dom.voteTabs, dom.votesBody),
 		panel(t("collab.title"), null, dom.tabs, dom.feedBody),
 		el("p", { class: "footer-note", text: t("app.subtitle") }),
 	);
@@ -274,6 +298,30 @@ function onTabKey(event, tab) {
 	dom.tabButtons[next].focus();
 }
 
+function selectVoteTab(tab) {
+	state.activeVoteTab = tab;
+	state.showAllVotes = false;
+	for (const [name, button] of Object.entries(dom.voteTabButtons)) {
+		button.setAttribute("aria-selected", name === tab ? "true" : "false");
+		button.setAttribute("tabindex", name === tab ? "0" : "-1");
+	}
+	renderVotes(state.snapshot);
+}
+
+function onVoteTabKey(event, tab) {
+	const order = ["live", "recent"];
+	const index = order.indexOf(tab);
+	let next = null;
+	if (event.key === "ArrowRight") next = order[(index + 1) % order.length];
+	else if (event.key === "ArrowLeft") next = order[(index - 1 + order.length) % order.length];
+	else if (event.key === "Home") next = order[0];
+	else if (event.key === "End") next = order[order.length - 1];
+	if (!next) return;
+	event.preventDefault();
+	selectVoteTab(next);
+	dom.voteTabButtons[next].focus();
+}
+
 /* --------------------------------------------------------------- render */
 
 function render(snapshot) {
@@ -289,6 +337,7 @@ function render(snapshot) {
 	renderAgents(snapshot);
 	renderTasks(snapshot);
 	renderReservations(snapshot);
+	renderVotes(snapshot);
 	renderFeeds(snapshot);
 	if (focusedId) document.getElementById(focusedId)?.focus();
 }
@@ -575,6 +624,166 @@ function renderReservations(snapshot) {
 	);
 }
 
+/* --------------------------------------------------------------- votes */
+
+/** The kind label, or the raw kind when the page has no translation for it (never a blank). */
+function voteKindLabel(kind) {
+	if (kind === null || kind === "") return t("value.none");
+	const key = `votes.kind.${kind}`;
+	const label = t(key);
+	return label === key ? kind : label;
+}
+
+/** One tally row: the count and the names behind it. A zero row prints the count, never a fake name. */
+function tallyRow(label, ids, note) {
+	const names = ids.length > 0 ? ids.join(", ") : note;
+	return el(
+		"span",
+		{},
+		el("span", { class: "n", text: String(ids.length) }),
+		label,
+		el("span", { class: "who" }, names),
+	);
+}
+
+function voteRound(round, snapshotNow) {
+	const statusClass = `status-${round.status}`;
+	const meta = [];
+	meta.push(el("span", {}, el("b", { text: `${t("votes.roundKind")}:` }), voteKindLabel(round.kind)));
+	if (round.id !== null) meta.push(el("span", { class: "mono", text: round.id }));
+	if (round.openedBy !== null) meta.push(el("span", {}, el("b", { text: `${t("votes.roundOpenedBy")}:` }), round.openedBy));
+	meta.push(el("span", {}, el("b", { text: `${t("votes.roundOpenedAt")}:` }), timeAgo(Math.max(0, (snapshotNow ?? 0) - round.openedAtMs))));
+	// The deadline is the round's own `openedAt + timeoutMs`: a published `timeoutMs` yields a real
+	// countdown, and an unpublished one prints "not published" — never a guessed time.
+	if (round.deadlineMs === null) {
+		meta.push(el("span", {}, el("b", { text: `${t("votes.roundDeadline")}:` }), t("votes.roundDeadlineUnknown")));
+	} else {
+		meta.push(el("span", {}, el("b", { text: `${t("votes.roundDeadline")}:` }), timeUntil(round.deadlineMs, snapshotNow ?? 0)));
+	}
+
+	const parts = [
+		el(
+			"div",
+			{ class: "vote-line" },
+			badge(t(`votes.status.${round.status}`), statusClass),
+			el("span", { class: "vote-question", text: round.question === "" ? t("value.none") : round.question }),
+		),
+		el("div", { class: "vote-meta" }, meta),
+	];
+
+	if (round.status === "pending") {
+		// An open round's ballots are NOT on this read-only path: `castBallot` writes the voter into the
+		// event row's `agent_id`, and the frozen v1 snapshot contract ships only `{createdAtMs, type,
+		// content}`. The panel says so instead of inventing a voter, a count or a "still missing" list.
+		parts.push(el("p", { class: "vote-gap" }, el("b", { text: `${t("votes.ballots")}: ` }), t("votes.ballotsUnavailable")));
+		parts.push(
+			el(
+				"div",
+				{ class: "vote-meta" },
+				el("span", { class: "muted", text: round.threshold === null ? t("votes.neededUnknown") : t("votes.thresholdNote", { value: round.threshold }) }),
+			),
+		);
+		return el("article", { class: `vote-round ${statusClass}`, "aria-label": `${t(`votes.status.${round.status}`)}: ${round.question}` }, parts);
+	}
+
+	// A SETTLED round publishes its whole tally inside its terminal event: who voted which way, who was
+	// absent, and the one-line reason. Those are read verbatim, so the panel shows the same numbers the
+	// board entry and the event log carry — nothing recomputed, nothing extrapolated.
+	const tally = el(
+		"div",
+		{ class: "vote-tally" },
+		tallyRow(t("votes.for"), round.for, t("value.none")),
+		tallyRow(t("votes.against"), round.against, t("value.none")),
+		tallyRow(t("votes.absent"), round.absent, t("value.none")),
+		round.offline.length > 0 ? tallyRow(t("votes.offline"), round.offline, t("value.none")) : null,
+	);
+	const required =
+		round.base !== null && round.needed !== null
+			? el("span", { class: "muted", text: t("votes.needed", { need: round.needed, base: round.base }) })
+			: el("span", { class: "muted", text: t("votes.neededUnknown") });
+	parts.push(tally, el("div", { class: "vote-meta" }, required));
+	if (round.reason !== null && round.reason !== "") {
+		parts.push(el("p", { class: "reason" }, el("b", { text: `${t("votes.reason")}: ` }), round.reason));
+	}
+	if (round.boardId !== null) parts.push(el("p", { class: "group-note", text: t("votes.boardRef", { id: round.boardId }) }));
+
+	return el("article", { class: `vote-round ${statusClass}`, "aria-label": `${t(`votes.status.${round.status}`)}: ${round.question}` }, parts);
+}
+
+function renderVotes(snapshot) {
+	clear(dom.votesBody);
+	if (snapshot === null) return;
+	const now = snapshot.now ?? 0;
+	const rounds = votesFromSnapshot(snapshot);
+	const boardIds = voteBoardIds(snapshot);
+	for (const round of rounds) {
+		if (round.id !== null && boardIds.has(round.id)) round.boardId = boardIds.get(round.id) ?? null;
+	}
+	const open = rounds.filter((round) => round.status === "pending");
+	const settled = rounds.filter((round) => round.status !== "pending");
+	dom.votesNote.textContent = t("votes.note", { open: open.length, settled: settled.length });
+
+	if (rounds.length === 0) {
+		dom.votesBody.append(el("p", { class: "empty", text: t("votes.empty.all") }));
+		return;
+	}
+
+	const shown = state.showAllVotes ? rounds : rounds.slice(0, FEED_ROW_CAP);
+	const more =
+		rounds.length > FEED_ROW_CAP && !state.showAllVotes
+			? el("button", {
+					class: "show-more",
+					id: "more-votes",
+					type: "button",
+					text: t("votes.showMore", { n: rounds.length - FEED_ROW_CAP }),
+					onclick: () => {
+						state.showAllVotes = true;
+						renderVotes(state.snapshot);
+					},
+				})
+			: null;
+	const less =
+		state.showAllVotes && rounds.length > FEED_ROW_CAP
+			? el("button", {
+					class: "show-more",
+					id: "less-votes",
+					type: "button",
+					text: t("votes.showLess"),
+					onclick: () => {
+						state.showAllVotes = false;
+						renderVotes(state.snapshot);
+					},
+				})
+			: null;
+
+	const liveRows = shown.filter((round) => round.status === "pending").map((round) => voteRound(round, now));
+	const recentRows = shown.filter((round) => round.status !== "pending").map((round) => voteRound(round, now));
+	if (state.activeVoteTab === "live") {
+		dom.votesBody.setAttribute("id", "panel-votes");
+		dom.votesBody.setAttribute("role", "tabpanel");
+		dom.votesBody.setAttribute("aria-labelledby", "vote-tab-live");
+		dom.votesBody.setAttribute("tabindex", "0");
+		// The open tab shows the rounds still in progress; their countdowns are the live evidence.
+		if (open.length === 0) {
+			dom.votesBody.append(el("p", { class: "empty", text: t("votes.empty.live") }));
+			return;
+		}
+		dom.votesBody.append(...liveRows, more, less);
+		return;
+	}
+
+	dom.votesBody.setAttribute("id", "panel-votes");
+	dom.votesBody.setAttribute("role", "tabpanel");
+	dom.votesBody.setAttribute("aria-labelledby", "vote-tab-recent");
+	dom.votesBody.setAttribute("tabindex", "0");
+	// The settled tab shows only finished rounds: the published tally and its reason, newest first.
+	if (settled.length === 0) {
+		dom.votesBody.append(el("p", { class: "empty", text: t("votes.empty.recent") }));
+		return;
+	}
+	dom.votesBody.append(...recentRows, more, less);
+}
+
 function feedList(items, renderItem, tab) {
 	const showAll = state.showAll[tab] === true;
 	const shown = showAll ? items : items.slice(0, FEED_ROW_CAP);
@@ -729,6 +938,11 @@ function signature(snapshot) {
 		(snapshot.messages ?? []).map((message) => [message.id, message.read]),
 		(snapshot.events ?? []).map((event) => [event.createdAtMs, event.type]),
 		(snapshot.reservations ?? []).map((reservation) => [reservation.path, reservation.agentId, reservation.leaseUntilMs]),
+		// The vote rounds are derived from the events feed, so a new ballot must repaint the panel: the
+		// countdowns and the "still missing" list move with every one.
+		(snapshot.events ?? [])
+			.filter((event) => typeof event.type === "string" && event.type.startsWith("vote."))
+			.map((event) => [event.createdAtMs, event.type, event.content]),
 	]);
 }
 
