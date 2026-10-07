@@ -324,7 +324,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 | `swarm_renew` | 延长你持有的租约 |
 | `swarm_release` | 带原因把工作交回（绝不静默停摆） |
 | `swarm_complete` | 带摘要/commit/files 完成 → `review` 或 `done` |
-| `swarm_fail` | 带原因失败；会自动写入一条 FAIL board 记录。也会关闭无人持有、且其依赖永不可能到达 `done` 的任务 —— 这是永久残留唯一的出口 |
+| `swarm_fail` | 带原因失败；会自动写入一条 FAIL board 记录。也会关闭无人持有的任务，两种情形：其依赖永不可能到达 `done`（永久残留）；或它已停置十分钟、依赖全部满足、而**没有任何在线 agent** 持有它声明的能力 —— 一行谁也认领不了的任务 |
 | `swarm_task_create` | 添加你发现的工作或依赖；会拒绝未知、自指或闭环的依赖 |
 | `swarm_goal` | 开一个目标的规划轮：你只选它需要多少个 agent（`agents`），永远不写任务清单 —— 拆分由 worker 自己做 |
 | `swarm_propose` | 把你**自己**的拆分发布到一个 open 目标上（打 `proposal` 标签、限定在该目标下），交给 scribe 合并 |
@@ -350,7 +350,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 **任务图。** 依赖在创建事务内检查（`store.ts:createTask` →
 `#assertDependencies`），在任何行被写入之前：未知 id 被拒绝为
 `unknown dependency: task-99`，自指边被拒绝为 `dependency_self: task-2 depends on itself`，而会闭环的边被拒绝为
-`dependency_cycle: task-2 -> task-1 -> task-2` —— 什么都不插入。`blockedReason()` 会解释任何仍处于 blocked 的行 —— 依赖 id 已不存在时是 `missing: <ids>`，永不可能到达 `done` 的图是 `cycle: <path>`，否则是 `waiting` —— `swarm_status` 会把这个原因打印在任务旁边。`failed` 任务不再是死路：`swarm_task_retry`（`store.ts:retryTask`）把它以全新尝试放回池子并置为 `ready`，随后常规的 `sweep()` 会在它完成时提升其依赖项。镜像的情形是残留：依赖永不可能到达 `done` 的任务（`store.ts:deadDependencies` —— 依赖为 `failed`、缺失或成环）同样永远无法被认领，所以只要没有任何 agent 持有它，`fail()` 也能由非持有者关闭它。这是永久阻塞的行唯一的出口：没有删除，也没有归档。
+`dependency_cycle: task-2 -> task-1 -> task-2` —— 什么都不插入。`blockedReason()` 会解释任何仍处于 blocked 的行 —— 依赖 id 已不存在时是 `missing: <ids>`，永不可能到达 `done` 的图是 `cycle: <path>`，否则是 `waiting` —— `swarm_status` 会把这个原因打印在任务旁边。`failed` 任务不再是死路：`swarm_task_retry`（`store.ts:retryTask`）把它以全新尝试放回池子并置为 `ready`，随后常规的 `sweep()` 会在它完成时提升其依赖项。镜像的情形是残留：依赖永不可能到达 `done` 的任务（`store.ts:deadDependencies` —— 依赖为 `failed`、缺失或成环）同样永远无法被认领，所以只要没有任何 agent 持有它，`fail()` 也能由非持有者关闭它。一行也可能以另一种方式不可行：依赖全部满足，却没有任何**在线** agent 持有它声明的能力 —— 这类行停置 `UNROUTABLE_GRACE_MS`（10 分钟）之后同样可由 `fail()` 关闭，而只要有在线 agent 还能认领它就会被拒绝。没有删除，也没有归档，所以这两条就是不可认领的行仅有的出口。
 
 **租约 + 心跳。** 每次认领都会写入 `claimed_by`/`lease_until`。任何工具调用以及 driver 的心跳都会续租。清扫器（`sweep()`）在每次认领内部以及每个心跳上运行：租约过期的任务回到 `ready` 并产生一个 `task.reclaim` 事件，由租约支撑的文件预留也随之过期。因此崩溃的 agent 无法卡住池子，而存活的租约永远不会被抢。
 

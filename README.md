@@ -521,7 +521,7 @@ Honest limits, because a held port is easy to forget about:
 | `swarm_renew` | extend leases you hold |
 | `swarm_release` | give work back with a reason (never stall silently) |
 | `swarm_complete` | finish with summary/commit/files → `review` or `done` |
-| `swarm_fail` | fail with a reason; a FAIL board entry is written automatically. Also closes a task nobody holds whose dependency can never reach `done` — the only exit permanent residue has |
+| `swarm_fail` | fail with a reason; a FAIL board entry is written automatically. Also closes a task nobody holds, on two grounds: its dependency can never reach `done` (permanent residue), or it has sat there for ten minutes with every dependency satisfied and NO online agent holding the capabilities it declares — a row nothing could ever claim |
 | `swarm_task_create` | add work or a dependency you discovered; refuses an unknown, self- or cycle-closing dependency |
 | `swarm_goal` | open a goal's planning round: you choose only HOW MANY agents it needs (`agents`), never the task list — the workers split it themselves |
 | `swarm_propose` | post YOUR OWN split of an open goal onto the board (tagged `proposal`, scoped to the goal) for the scribe to merge |
@@ -557,8 +557,11 @@ longer a dead end: `swarm_task_retry` (`store.ts:retryTask`) returns it to the p
 fresh attempt, and the usual `sweep()` promotes its dependents once it completes. The mirror case is
 residue: a task whose dependency can never reach `done` (`store.ts:deadDependencies` — a `failed`,
 missing or cyclic dependency) can never be claimed either, so `fail()` closes it even for an agent
-that does not hold it, as long as no agent does. That is the only exit a permanently-blocked row has:
-there is no delete or archive.
+that does not hold it, as long as no agent does. A row can be impossible the other way too — every
+dependency satisfied, and yet no ONLINE agent holds the capabilities it declares — so `fail()` closes
+that as well once it has sat that way for `UNROUTABLE_GRACE_MS` (10 minutes), and still refuses while
+any online agent could claim it. There is no delete and no archive, so those two are the only exits an
+unclaimable row has.
 
 **Lease + heartbeat.** Every claim writes `claimed_by`/`lease_until`. Any tool call and the driver's
 heartbeat renew leases. A sweeper (`sweep()`) runs inside every claim and on each heartbeat: tasks
