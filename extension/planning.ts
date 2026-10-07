@@ -119,6 +119,21 @@ export function deliverableKey(title: string): string {
 export type DeliverableIntent = "write" | "verify" | "fix" | "document" | "remove" | "refactor" | "other";
 
 /**
+ * The kinds whose work CHANGES the artifact. Two of them on one artifact are one deliverable, whatever
+ * their kinds are — an artifact has one owner. `verify` and `document` are deliberately absent: a
+ * verification of a thing is not the thing, and two of them on one artifact are not one owner.
+ */
+const MUTATING_KINDS: Record<DeliverableIntent, boolean> = {
+	write: true,
+	fix: true,
+	remove: true,
+	refactor: true,
+	verify: false,
+	document: false,
+	other: false,
+};
+
+/**
  * How a deliverable is recognised across phrasings: its kind, its target artifacts, the significant
  * words of its wording, and whether it names a PART of the artifact rather than the whole of it.
  */
@@ -130,9 +145,14 @@ export interface DeliverableShape {
 }
 
 /**
- * The verb families a title can open with, most specific first. The FIRST token of a title that
- * matches any family decides the kind, so "Write tests for x" is `write` (the object, not the verb
- * family of "tests"), while "Verify x" is `verify`.
+ * The verb families a title can open with, most specific first. The title's LEADING token decides the
+ * kind, and only it: a title states its kind in its first word ("Fix …", "Verify …", "Document …",
+ * "Remove …"), while anything matched later in the line is describing the OBJECT. Reading every token
+ * let a noun or an incidental verb decide the kind instead, which is how the goal-9 round was merged:
+ * "Non-author adversarial re-verification …" read as `write` off the noun `author`, "Wire every
+ * remaining decision point … and check identity …" read as `verify` off `check`, and "Plan … the split
+ * proposals …" read as `refactor` off the noun `split`. A title whose leading word states no kind
+ * states none, and `other` contradicts nothing.
  */
 const INTENT_VERBS: ReadonlyArray<readonly [DeliverableIntent, readonly string[]]> = [
 	["verify", ["verify", "verifies", "validate", "validates", "check", "checks", "confirm", "confirms", "audit", "review", "assert", "ensure", "inspect"]],
@@ -337,6 +357,59 @@ function namesShareAToken(left: string, right: string): boolean {
 	return rest[0].some((word) => rest[1].some((other) => relatedNameTokens(word, other)));
 }
 
+/**
+ * Words that say a path is EVIDENCE WORKSPACE - a scratch tree or a verification directory that HOLDS
+ * the proof about a deliverable - rather than the deliverable itself: `scratch/goal9-verify/tool-layer/`.
+ */
+const EVIDENCE_WORKSPACE_WORDS: Record<string, true> = {
+	scratch: true,
+	tmp: true,
+	temp: true,
+	verify: true,
+	verification: true,
+	evidence: true,
+};
+
+/**
+ * Whether an artifact lives in evidence space. Only a DIRECTORY segment states it: `src/verify.ts` is a
+ * file whose name happens to say verify, while `scratch/goal9-verify/tool-layer/` is a tree that holds
+ * evidence about something else. A marker in the path's final segment counts only when that segment is a
+ * container, because a container IS the directory it names.
+ */
+function isEvidenceWorkspace(path: string): boolean {
+	const segments = artifactSegments(path);
+	const last = segments.length - 1;
+	return segments.some(
+		(segment, at) => (at !== last || isContainerArtifact(path)) && words(segment).some((word) => EVIDENCE_WORKSPACE_WORDS[word] === true),
+	);
+}
+
+/**
+ * Two artifacts on OPPOSITE sides of the evidence boundary are never ONE ARTIFACT by name. Evidence
+ * space carries a deliverable's names inside it without being that deliverable (`tool-layer` beside
+ * `tools.ts`), and pairing the two off a shared generic word is what let a verification absorb the very
+ * deliverable it was verifying — the wiring row vanished into "Verify goal-9 A" and the verifier's files
+ * grew to include the source it must stay independent of (D2). An identical path, or one being the tail
+ * of the other, is untouched: only the NAME route crosses that boundary.
+ */
+function crossesEvidenceBoundary(left: string, right: string): boolean {
+	return isEvidenceWorkspace(left) !== isEvidenceWorkspace(right);
+}
+
+/**
+ * The first artifact two sets share as a FILE - the same path, the same path seen from two roots
+ * (`omp-swarm/src/a.ts` and `src/a.ts`), or an absolute and a bare path naming it. Deliberately NOT the
+ * name route: two rows that would edit one FILE collide, while two names that merely sound alike do not.
+ */
+function sharedArtifact(left: string[], right: string[]): string | undefined {
+	for (const a of left) {
+		for (const b of right) {
+			if (sameArtifact(a, b)) return a === b ? a : `${a} ~ ${b}`;
+		}
+	}
+	return undefined;
+}
+
 /** How two artifact SETS matched: the paths that line up, and what that match is worth as evidence. */
 interface ArtifactMatch {
 	/** The matched paths, `written ~ spelled` when the two sides named one artifact differently. */
@@ -366,7 +439,9 @@ function artifactsRelation(left: string[], right: string[]): ArtifactMatch | und
 	let written = false;
 	for (const path of fewer) {
 		const at = pool.findIndex(
-			(candidate) => sameArtifact(path, candidate) || (artifactName(path) !== artifactName(candidate) && namesShareAToken(path, candidate)),
+			(candidate) =>
+				sameArtifact(path, candidate) ||
+				(artifactName(path) !== artifactName(candidate) && !crossesEvidenceBoundary(path, candidate) && namesShareAToken(path, candidate)),
 		);
 		if (at < 0) return undefined;
 		const hit = pool[at] as string;
@@ -378,7 +453,7 @@ function artifactsRelation(left: string[], right: string[]): ArtifactMatch | und
 		}
 		pool.splice(at, 1);
 	}
-	const spelled = written || left.some((a) => right.some((b) => artifactName(a) !== artifactName(b) && namesShareAToken(a, b)));
+	const spelled = written || left.some((a) => right.some((b) => artifactName(a) !== artifactName(b) && !crossesEvidenceBoundary(a, b) && namesShareAToken(a, b)));
 	return {
 		detail: pool.length > 0 ? `${matched.join(", ")} (+${pool.join(", ")})` : matched.join(", "),
 		spelled,
@@ -411,15 +486,11 @@ const percent = (value: number): string => `${Math.round(value * 100)}%`;
  */
 export function describeDeliverable(title: string, files: string[] = [], deliverable = ""): DeliverableShape {
 	const tokens = words(`${title} ${deliverable}`);
-	let intent: DeliverableIntent = "other";
-	for (const token of words(title)) {
-		const family = INTENT_VERBS.find(([, verbs]) => verbs.includes(token));
-		if (family !== undefined) {
-			intent = family[0];
-			break;
-		}
-	}
-	if (intent === "other") intent = chineseIntent(title) ?? "other";
+	// The kind comes from the title's leading token, and only from it (see INTENT_VERBS). A title that
+	// opens with no known verb is `other`: the merge rules then treat it as contradicting nothing.
+	const leading = words(title)[0];
+	const family = leading === undefined ? undefined : INTENT_VERBS.find(([, verbs]) => verbs.includes(leading));
+	const intent: DeliverableIntent = family?.[0] ?? chineseIntent(title) ?? "other";
 	const declared = files.map(canonicalArtifact).filter((path) => path !== "");
 	const fromTitle = (title.match(ARTIFACT_IN_TITLE) ?? []).filter(looksLikeFileName);
 	const artifacts = [...new Set((declared.length > 0 ? declared : fromTitle.map(canonicalArtifact)).filter((path) => path !== ""))].sort();
@@ -445,8 +516,21 @@ export function describeDeliverable(title: string, files: string[] = [], deliver
 export function sameDeliverableReason(left: DeliverableShape, right: DeliverableShape): string | undefined {
 	// Two KNOWN kinds that differ are two deliverables; an unknown kind contradicts nothing.
 	if (left.intent !== right.intent && left.intent !== "other" && right.intent !== "other") return undefined;
+	// ONE ARTIFACT HAS ONE OWNER, and the test is INTERSECTION: two rows that would both MUTATE one file
+	// are one deliverable, whatever their kinds are and whatever else each of them declares. Both editing
+	// that file is the collision the rule exists to prevent, and the extra files are not lost - the union
+	// keeps every one and the fold is recorded with its reason. Firing on the literal `write` alone, and
+	// only on the coverage relation below (which demands that every file of the smaller side match), is why
+	// the goal-9 round still minted THREE writers on extension/store.ts: those rows share that one file and
+	// nothing else (D1).
+	if (MUTATING_KINDS[left.intent] && MUTATING_KINDS[right.intent]) {
+		const shared = sharedArtifact(left.artifacts, right.artifacts);
+		if (shared !== undefined) return `one artifact has one owner: ${shared}`;
+	}
 	const artifact = artifactsRelation(left.artifacts, right.artifacts);
 	if (artifact !== undefined) {
+		// A `write` still claims the artifact from an unknown-kind twin, which is what pairs a Chinese row
+		// with its English one; everything else on one artifact is decided by the evidence below.
 		if (left.intent === "write" || right.intent === "write") return `one artifact has one owner: ${artifact.detail}`;
 		// The two sides named one artifact under two spellings (`advisory-wakeups` and
 		// `advisory-burn/wake-sources.md` share the compound `wake`): that correspondence is the

@@ -20,6 +20,7 @@ import {
 	parseProposedTask,
 	peakParallelism,
 	planningTaskBrief,
+	sameDeliverableReason,
 	scribeVerdict,
 	type Proposal,
 } from "../../extension/planning";
@@ -363,12 +364,20 @@ describe("the deliverable key: a rephrasing is the same task, a different delive
 		expect(merged.tasks.length).toBe(1);
 	});
 
-	test("the same file with genuinely different work stays two deliverables", () => {
+	test("two writers on one file are ONE deliverable even when each names different work", () => {
+		// Inverted by task-212 against DEDUPE_KEY_TEXT, which is the authority this rule is published under:
+		// "two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner)". Both rows
+		// would edit src/client.ts, and that shared file IS the collision the clause prevents; the previous
+		// expectation (two rows) is what let the real goal-9 round mint THREE writers on
+		// extension/store.ts (D1). Nothing is lost from the survivor: files, capabilities and dependencies
+		// are unioned and the fold is recorded with its reason for the plan's DECISION to print.
 		const merged = mergeProposals([
 			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix the retry storm in src/client.ts", files: ["src/client.ts"] }] }, 1),
 			proposal("B", { goal: "goal-1", tasks: [{ title: "Fix the timeout default in src/client.ts", files: ["src/client.ts"] }] }, 2),
 		]);
-		expect(merged.tasks.length).toBe(2);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.folds.map((fold) => fold.reason)).toEqual(["one artifact has one owner: src/client.ts"]);
+		expect(merged.tasks[0]?.agents).toEqual(["A", "B"]);
 	});
 
 	test("different artifacts never collapse", () => {
@@ -629,15 +638,18 @@ describe("a merged row's union shape, and what must still not fold into it", () 
 		expect(checked).toBe(16); // every folded row of the five-entry round
 	});
 
-	test("two different deliverables whose file lists NEST stay two rows", () => {
-		// The spelling evidence now reaches across both lists, so the guard has to hold: `parser` and
-		// `lexer` share no compound, and a narrower file list is not a respelling of a wider one.
+	test("two writers whose file lists NEST fold on the file they share", () => {
+		// Inverted by task-212, same clause as the case above: the shared src/parser.ts makes these two rows
+		// one owner. The evidence the old expectation protected is still evidence — `parser` and `lexer` share
+		// no compound, so a narrower file list is not a RESPELLING of a wider one — but a respelling is not
+		// what makes two writers one deliverable; the artifact they both edit is. The union keeps lexer.ts.
 		const merged = mergeProposals([
 			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix the parser crash", files: ["src/parser.ts", "src/lexer.ts"] }] }, 1),
 			proposal("B", { goal: "goal-1", tasks: [{ title: "Fix the timeout", files: ["src/parser.ts"] }] }, 2),
 		]);
-		expect(merged.tasks.length).toBe(2);
-		expect(merged.folded).toEqual([]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.tasks[0]?.files).toEqual(["src/parser.ts", "src/lexer.ts"]);
+		expect(merged.folds.map((fold) => fold.reason)).toEqual(["one artifact has one owner: src/parser.ts"]);
 	});
 });
 
@@ -682,5 +694,111 @@ describe("scribeVerdict: a stalled round is re-offered, then closed with a reaso
 
 	test("a fresh round nobody has ever claimed is the bound's business: the watchdog leaves it alone", () => {
 		expect(scribeVerdict({ ...round, heldBy: undefined, attempts: 0, now: 1_000_000 + SCRIBE_STALL_MS * 10 })).toEqual({ action: "ok" });
+	});
+});
+
+/**
+ * task-212 — the merge's own two defects, measured on the REAL goal-9 round (board FAIL #780, repro
+ * `bun run scratch/goal9-merge/merge-defects.ts`). The rows below are that round's, recorded verbatim
+ * from the plan (DECISION #763 / the tasks table); the partition into the three proposals does not
+ * affect a merge that folds by deliverable, so they travel as one round here.
+ */
+describe("task-212: one artifact has one owner, and a writer never folds into a verifier", () => {
+	const GOAL9_ROUND: Array<[string, string[]]> = [
+		[
+			"Fix goal-9: payload-bound one-shot vote tickets + identity-checked, gated roster growth (SINGLE WRITER)",
+			["omp-swarm/extension/store.ts", "omp-swarm/extension/tools.ts", "omp-swarm/extension/auto.ts", "omp-swarm/extension/planning.ts", "omp-swarm/tests/unit/vote-store.test.ts", "omp-swarm/tests/unit/vote-gate.test.ts"],
+		],
+		[
+			"Fix vote tickets: bind each round to the payload it voted on and consume it inside the action's own transaction (extension/store.ts)",
+			["omp-swarm/extension/store.ts", "omp-swarm/tests/unit/vote-store.test.ts", "omp-swarm/extension/db.ts"],
+		],
+		[
+			"Fix: a passed vote is bound to its payload and consumed once (kill ticket replay)",
+			["omp-swarm/extension/store.ts", "omp-swarm/extension/tools.ts", "omp-swarm/tests/unit/vote-store.test.ts", "omp-swarm/tests/unit/tools.test.ts"],
+		],
+		[
+			"Fix: the tally is visible on the normal read path, and an offline voter is named, not silently dropped",
+			["omp-swarm/extension/store.ts", "omp-swarm/extension/voting.ts", "omp-swarm/tests/unit/store.test.ts", "omp-swarm/tests/unit/voting.test.ts"],
+		],
+		[
+			"Wire every remaining decision point to the round: gate the ticket in tools.ts, gate spawn/stop + the goal agents budget, and check identity on swarm_goal (extension/tools.ts + auto.ts + driver.ts)",
+			["omp-swarm/extension/tools.ts", "omp-swarm/extension/auto.ts", "omp-swarm/extension/driver.ts", "omp-swarm/tests/unit/tools.test.ts", "omp-swarm/tests/unit/auto.test.ts"],
+		],
+		[
+			"Fix: roster growth and the goal size budget must pass a vote; swarm_goal checks identity",
+			["omp-swarm/extension/auto.ts", "omp-swarm/extension/tools.ts", "omp-swarm/tests/unit/auto.test.ts", "omp-swarm/tests/unit/tools.test.ts"],
+		],
+		["Verify goal-9 A: non-author adversarial re-attempt at the tool layer (replay / payload-swap / TOCTOU concurrency)", ["scratch/goal9-verify/tool-layer/"]],
+		["Verify goal-9 B: roster growth + vote-wait liveness in a REAL controller process", ["scratch/goal9-verify/roster/"]],
+		[
+			"Non-author adversarial re-verification of the fixed tree: replay, payload swap, concurrent consume, identity paths, and the roster claim driven for real",
+			["omp-swarm/scratch/goal9-verify/VERDICT.md", "omp-swarm/scratch/goal9-verify/adversarial.ts"],
+		],
+		[
+			"Verify (non-author): drive the REAL AutoController process - roster growth and zero model calls during a wait",
+			["omp-swarm/scratch/goal9-wiring/EVIDENCE.md", "omp-swarm/scratch/goal9-wiring/drive-roster.ts", "omp-swarm/scratch/goal9-wiring/run-output.json"],
+		],
+		[
+			"Verify (non-author): adversarial re-attack on the fixed tree - replay, race, identity",
+			["omp-swarm/scratch/goal9-verify/VERDICT.md", "omp-swarm/scratch/goal9-verify/adversarial.ts", "omp-swarm/scratch/goal9-verify/run-output.json"],
+		],
+		["Docs goal-9: ask the coordinator for the README write domain, then document the operator-visible rule change", ["omp-swarm/README.md"]],
+		["Document the operator-visible boundary change: one decision = one one-shot round, spawn/stop included (README parity)", ["omp-swarm/README.md", "omp-swarm/extension/README.md"]],
+	];
+
+	test("the owner clause covers the whole mutating family, not only the literal `write` (D1)", () => {
+		// The repro's own control pair: two `fix` rows, one file, wording that shares nothing. Only the
+		// first clause covered `write`, so this stayed two rows and every `fix` row in a round was free to
+		// claim an artifact another row was already editing.
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix alpha crash in src/a.ts", files: ["src/a.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Resolve bravo timeout in src/a.ts", files: ["src/a.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.folds.map((fold) => fold.reason)).toEqual(["one artifact has one owner: src/a.ts"]);
+	});
+
+	test("a writer never folds into the verifier of its own artifact (D2)", () => {
+		// The wiring row read as `verify` off the incidental "check" in its second half, and its artifacts
+		// then "spelled" the verifier's scratch directory through the shared word `tool` — so the deliverable
+		// disappeared into the verification of itself, and the verifier inherited the source files it must
+		// stay independent of.
+		const writer = describeDeliverable(
+			"Wire every remaining decision point to the round: gate the ticket in tools.ts, gate spawn/stop + the goal agents budget, and check identity on swarm_goal (extension/tools.ts + auto.ts + driver.ts)",
+			["omp-swarm/extension/tools.ts", "omp-swarm/extension/auto.ts", "omp-swarm/extension/driver.ts"],
+		);
+		const verifier = describeDeliverable(
+			"Verify goal-9 A: non-author adversarial re-attempt at the tool layer (replay / payload-swap / TOCTOU concurrency)",
+			["scratch/goal9-verify/tool-layer/"],
+		);
+		// The kind comes from the LEADING word, so a noun or a later verb cannot state it: `wire` states no
+		// kind, and neither `author` nor `check` gets to decide one.
+		expect(writer.intent).toBe("other");
+		expect(verifier.intent).toBe("verify");
+		expect(describeDeliverable("Non-author adversarial re-verification of the fixed tree", ["scratch/v/VERDICT.md"]).intent).toBe("other");
+		expect(describeDeliverable("Plan goal-9: merge the split proposals into the task graph").intent).toBe("other");
+		expect(sameDeliverableReason(verifier, writer)).toBeUndefined();
+		expect(isSameDeliverable(verifier, writer)).toBe(false);
+	});
+
+	test("the recorded goal-9 round merges to exactly ONE writer row on extension/store.ts (D1)", () => {
+		const merged = mergeProposals([proposal("scribe", { goal: "goal-9", tasks: GOAL9_ROUND.map(([title, files]) => ({ title, files })) }, 1)]);
+		const owners = merged.tasks.filter((task) => task.files.includes("omp-swarm/extension/store.ts"));
+		expect(owners.length).toBe(1);
+		expect(describeDeliverable(owners[0]?.title ?? "", owners[0]?.files ?? []).intent).toBe("fix");
+		// Every file the folded rows declared survives in the union, and every fold carries its reason.
+		expect(owners[0]?.files).toContain("omp-swarm/extension/db.ts");
+		expect(owners[0]?.files).toContain("omp-swarm/extension/voting.ts");
+		expect(merged.folds.length).toBeGreaterThanOrEqual(3);
+		// The other half of the acceptance: no verification row may inherit a source file. A verification of
+		// the tree is not the tree, and a verifier that owns the files it audits is no longer independent.
+		const verifiers = merged.tasks.filter((task) => /^(Verify|Non-author)/.test(task.title));
+		// Three, not five: the two rows that both write scratch/goal9-verify/VERDICT.md are one verification
+		// deliverable and fold with each other, which is intended — it is folding into a WRITER that loses work.
+		expect(verifiers.length).toBe(3);
+		for (const verifier of verifiers) {
+			expect(verifier.files.filter((file) => file.startsWith("omp-swarm/extension/"))).toEqual([]);
+		}
 	});
 });
