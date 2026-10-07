@@ -69,17 +69,27 @@ extension/
   color.ts     the reminder palette: per-agent and per-status colours, host-parity visible width, control-byte sanitization
   agentnav.ts  the agent-list selection model: main-first entries, cursor movement with wrap, the marker column, row rendering
   types.ts     domain types
+  web.ts       `/swarm web`: the dashboard's child process, its argument parsing and the free-port scan
+web/
+  server.ts    the dashboard's transport: read-only HTTP + SSE over `.swarm/swarm.db`, 127.0.0.1 only
+  snapshot.ts  the pure reader: one `swarm.db` -> the frozen Snapshot JSON
+  lib/         the read-only DB handle, asset path resolution and the row types
+  assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            44 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        21 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
-  unit/scaling.test.ts         14 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/auto.test.ts            50 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        35 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
   unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
   unit/agentnav.test.ts        23 unit tests of the selection model: main-first entries, cursor wrap and clamping, the marker column and row rendering
+  unit/web-command-parsing.test.ts 17 unit tests of `/swarm web`'s pure surface: argument parsing, port validation, the free-port scan and the URL
+  unit/web-server.test.ts      10 unit tests of the dashboard's HTTP surface: the frozen contract, the error surface, SSE change detection, read-only
+  unit/web-snapshot.test.ts    11 unit tests of the snapshot reader: counts, blockedReason, the newest-first feeds and the task-size cap
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
@@ -202,6 +212,7 @@ Any other value falls back to `"swarm"`.
 /swarm message <agent|all> <text>   # operator → worker(s), delivered as a prompt
 /swarm approve <id> [notes] | /swarm reject <id> <notes>
 /swarm config | /swarm roles
+/swarm web            # dashboard on 127.0.0.1:8787: starts it, prints the URL; /swarm web stop ends it
 /swarm stop           # workers release their work, post final notes, sessions disposed
 ```
 
@@ -455,6 +466,41 @@ rather than a target. A resize is rate-limited instead of instant — two resize
 apart and an ask expires after 60 s — so a wrong `N` is corrected within a tick or two, and never
 beyond `config.workers`.
 
+### Web dashboard (`/swarm web`)
+
+The TUI reads badly at speed, so the swarm also has a page — one command starts it and prints the URL
+it actually bound:
+
+```
+/swarm web                  # start (127.0.0.1:8787 by default) and print the URL
+/swarm web --port 9100      # start from a specific port instead
+/swarm web status           # is it running, on which port, as which pid
+/swarm web stop             # stop it and free the port
+```
+
+It runs as a **separate child process** (`bun web/server.ts`), never inside the TUI's own process, so
+a slow or broken page cannot block the editor or the swarm. The page shows what the pool looks like
+from the outside — the agents and what each holds, the task pool by status, the collaboration feed
+(board entries, agent-to-agent messages, raw events) and the progress split — read out of the same
+`.swarm/swarm.db` the swarm writes.
+
+Local and read-only by construction: it binds `127.0.0.1` only (never a network interface), opens the
+database with SQLite's read-only flag, and answers every non-GET request with 405. The command itself
+changes nothing: it does not switch multi-agent mode on, does not write the database, and needs no
+config key.
+
+Honest limits, because a held port is easy to forget about:
+
+- If the default port is taken, the next free one is used and the URL printed — never a silent
+  failure. An explicit `--port` that is taken is **refused**, naming the free alternative, rather than
+  quietly swapped for a port you did not ask for.
+- One dashboard per swarm root: a second `/swarm web` in the same root reports the running one instead
+  of starting another. Two roots can each have their own, on different ports.
+- It is a reader: it renders a snapshot and cannot run, claim or change anything.
+- Stop it when you are done. `/swarm web stop`, `/swarm stop` and quitting omp all kill the child —
+  measured on Windows, even a hard kill of omp takes it down and leaves the port free. While it runs it
+  holds one port and one read-only database handle.
+
 ## Tools (available to workers and to the main session)
 
 | Tool | Purpose |
@@ -530,7 +576,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 312 unit tests in the 14 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 365 unit tests in the 16 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

@@ -26,6 +26,7 @@ import {
 import { SwarmStore } from "./store";
 import { buildSwarmTools, isBoardType, isTaskStatus, type SwarmIdentity } from "./tools";
 import { DEFAULT_CONFIG, type SwarmConfig } from "./types";
+import { parseWebArgs, WebDashboard } from "./web";
 
 /** The main session's id in BOTH namespaces: the swarm's events and `agentnav`'s main row. */
 const MAIN_AGENT_ID = MAIN_ID;
@@ -162,6 +163,8 @@ interface Runtime {
 	nav: NavState;
 	/** Set while `/swarm nav`'s overlay owns the keyboard, so a second one cannot mount on top. */
 	navDismiss?: () => void;
+	/** `/swarm web`'s child process. Owned here so shutdown can always kill it. */
+	web?: WebDashboard;
 }
 
 /**
@@ -223,6 +226,8 @@ class SwarmRuntimes {
 
 	async stopAll(): Promise<void> {
 		for (const runtime of this.#runtimes.values()) {
+			// The dashboard is a child process holding a port: an omp restart must not orphan it.
+			runtime.web?.stop();
 			await runtime.driver?.stop("session shutting down");
 			runtime.store.close();
 		}
@@ -621,7 +626,7 @@ export default function swarm(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("swarm", {
-		description: "Decentralized agent swarm: /swarm [status|on|off|start [n]|stop|agents|nav|tasks [status]|board [type]|task <title>|message <agent> <text>|approve <id> [notes]|reject <id> <notes>|config|roles]",
+		description: "Decentralized agent swarm: /swarm [status|on|off|start [n]|stop|agents|nav|tasks [status]|board [type]|task <title>|message <agent> <text>|approve <id> [notes]|reject <id> <notes>|config|roles|web [start|stop|status] [--port N]]",
 		handler: async (args, ctx: ExtensionCommandContext) => {
 			const runtime = runtimes.for(ctx.cwd);
 			const [sub = "status", ...rest] = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -682,13 +687,14 @@ export default function swarm(pi: ExtensionAPI): void {
 					return;
 				}
 				case "stop": {
+					const webWasRunning = runtime.web?.stop() ?? false;
 					if (!runtime.driver?.running) {
-						ctx.ui.notify("swarm is not running", "warning");
+						ctx.ui.notify(webWasRunning ? "swarm is not running; the dashboard was stopped" : "swarm is not running", "warning");
 						return;
 					}
 					await runtime.driver.stop("swarm stopped by the operator");
 					refreshPanel(ctx, runtime);
-					ctx.ui.notify("swarm stopped; tasks were released back to the pool", "info");
+					ctx.ui.notify(`swarm stopped; tasks were released back to the pool${webWasRunning ? ", and the dashboard was stopped" : ""}`, "info");
 					return;
 				}
 				case "agents": {
@@ -759,6 +765,32 @@ export default function swarm(pi: ExtensionAPI): void {
 				}
 				case "roles": {
 					ctx.ui.notify(expandWorkers(runtime.config).map((w) => `${w.name} ${w.role} [${w.capabilities.join(",")}]`).join("\n"), "info");
+					return;
+				}
+				case "web": {
+					const parsed = parseWebArgs(rest);
+					if (!parsed.ok) {
+						ctx.ui.notify(parsed.error, "warning");
+						return;
+					}
+					// The server ships beside the extension and takes the root as its cwd, so it reads the
+					// same `.swarm/swarm.db` the swarm does — read-only, in its own process.
+					const dashboard = (runtime.web ??= new WebDashboard(runtime.root, join(import.meta.dir, "..", "web", "server.ts")));
+					if (parsed.options.action === "start") {
+						const started = await dashboard.start(parsed.options.port);
+						ctx.ui.notify(
+							started.ok
+								? `dashboard: ${started.state.url} (pid ${started.state.pid}) — read-only, ${started.state.port} is bound to 127.0.0.1 only\n/swarm web stop when you are done`
+								: `could not start the dashboard: ${started.error}`,
+							started.ok ? "info" : "error",
+						);
+						return;
+					}
+					if (parsed.options.action === "stop") {
+						ctx.ui.notify(dashboard.stop() ? "dashboard stopped; its port is free again" : "dashboard is not running", "info");
+						return;
+					}
+					ctx.ui.notify(dashboard.statusLine(), "info");
 					return;
 				}
 				default:

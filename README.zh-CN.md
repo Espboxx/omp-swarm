@@ -60,17 +60,27 @@ extension/
   color.ts     the reminder palette: per-agent and per-status colours, host-parity visible width, control-byte sanitization
   agentnav.ts  the agent-list selection model: main-first entries, cursor movement with wrap, the marker column, row rendering
   types.ts     domain types
+  web.ts       `/swarm web`: the dashboard's child process, its argument parsing and the free-port scan
+web/
+  server.ts    the dashboard's transport: read-only HTTP + SSE over `.swarm/swarm.db`, 127.0.0.1 only
+  snapshot.ts  the pure reader: one `swarm.db` -> the frozen Snapshot JSON
+  lib/         the read-only DB handle, asset path resolution and the row types
+  assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            44 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        21 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
-  unit/scaling.test.ts         14 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/auto.test.ts            50 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        35 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
   unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
   unit/agentnav.test.ts        23 unit tests of the selection model: main-first entries, cursor wrap and clamping, the marker column and row rendering
+  unit/web-command-parsing.test.ts 17 unit tests of `/swarm web`'s pure surface: argument parsing, port validation, the free-port scan and the URL
+  unit/web-server.test.ts      10 unit tests of the dashboard's HTTP surface: the frozen contract, the error surface, SSE change detection, read-only
+  unit/web-snapshot.test.ts    11 unit tests of the snapshot reader: counts, blockedReason, the newest-first feeds and the task-size cap
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
@@ -177,6 +187,7 @@ extensions:
 /swarm message <agent|all> <text>   # operator → worker(s), delivered as a prompt
 /swarm approve <id> [notes] | /swarm reject <id> <notes>
 /swarm config | /swarm roles
+/swarm web            # dashboard on 127.0.0.1:8787: starts it, prints the URL; /swarm web stop ends it
 /swarm stop           # workers release their work, post final notes, sessions disposed
 ```
 
@@ -280,6 +291,28 @@ swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
 
 代价：把池子撑大是真的开新会话、花真实的 token，所以上限是限制，不是目标。改尺寸是限速的，不是即时的 —— 两次改尺寸之间至少隔 30 秒，请求 60 秒后过期 —— 所以错的 `N` 会在一两个 tick 内被纠正，但绝不会越过 `config.workers`。
 
+### Web 看板（`/swarm web`）
+
+TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —— 一条命令启动它，并打印它真正绑定的 URL：
+
+```
+/swarm web                  # 启动（默认 127.0.0.1:8787）并打印 URL
+/swarm web --port 9100      # 从指定端口开始
+/swarm web status           # 是否在跑、哪个端口、哪个 pid
+/swarm web stop             # 停掉它并释放端口
+```
+
+它作为**独立的子进程**运行（`bun web/server.ts`），绝不在 TUI 自己的进程里，所以一个缓慢或坏掉的页面无法阻塞编辑器或集群。页面呈现的是从外部看到的池子：每个 agent 以及它手上握着什么、按状态分组的任务池、协作信息流（board 条目、agent 之间的消息、原始事件）以及进度拆分 —— 数据全部读自集群自己写的同一个 `.swarm/swarm.db`。
+
+从构造上就是本地且只读：只绑定 `127.0.0.1`（不使用任何网络接口），以 SQLite 的只读标志打开数据库，并让每一个非 GET 请求得到 405。命令本身什么都不改：不会打开多 agent 模式，不会写数据库，也不需要任何配置键。
+
+诚实的限制 —— 被占住的端口很容易被忘掉：
+
+- 默认端口被占用时，会用下一个空闲端口并把 URL 打印出来 —— 绝不静默失败。而显式指定的 `--port` 若被占用则会被**拒绝**，并指出可用的替代端口，而不是偷偷换成你没要求的端口。
+- 每个集群根目录一个看板：在同一个根目录里第二次 `/swarm web` 只会报告正在运行的那个，不会另起一个。两个不同的根目录可以各有一个，跑在不同端口上。
+- 它是读者：只渲染快照，不能运行、认领或改变任何东西。
+- 用完请停掉。`/swarm web stop`、`/swarm stop` 和退出 omp 都会杀掉这个子进程 —— 在 Windows 上实测过，即使对 omp 硬杀，子进程也会随之消失，端口随后空闲。运行期间它会占用一个端口和一个只读数据库句柄。
+
 ## 工具（worker 与主会话都可用）
 
 | 工具 | 用途 |
@@ -333,7 +366,7 @@ swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 312 unit tests in the 14 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 365 unit tests in the 16 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
