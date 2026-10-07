@@ -161,6 +161,7 @@ export function workerSystemPrompt(spec: WorkerSpec, config: SwarmConfig, root: 
 		"- Post a FAIL entry every time an approach fails; that is the cheapest gift you can give the swarm.",
 		"- Two agents must not edit the same file: reservations expire with your lease, so renew them while you work.",
 		"- Review tasks in `review` status are not yours to approve if you wrote them; swarm_review refuses that.",
+		"- You are a host subagent only for the terminal's agent list; there is no parent agent to hand work to and you have no `yield` tool. The host's subagent note that verification belongs to a main agent does NOT apply to you: finish the task in your own turn, and verifying your own change is YOUR job.",
 		"",
 		`Your capabilities: ${spec.capabilities.join(", ")}. Lease: ${config.leaseSeconds}s, renewed by any tool call and by heartbeat.`,
 	].join("\n");
@@ -204,6 +205,13 @@ export class SwarmDriver {
 	#startedAt = 0;
 	/** Branch per git cwd, re-read at most every `BRANCH_TTL_MS`; the spawn is the expensive part. */
 	readonly #branches = new Map<string, { at: number; value: string | undefined }>();
+	/**
+	 * Host-registry subscription ({@link #watchHostRoster}): the Agent Hub can release a worker through
+	 * `AgentLifecycleManager.release`, which disposes its session without asking the driver first.
+	 */
+	#hostRefUnsubscribe: (() => void) | undefined;
+	/** Names THIS driver is disposing: their registry events must not be read as a hub release. */
+	readonly #selfTearing = new Set<string>();
 
 	constructor(deps: SwarmDriverDeps) {
 		this.#deps = deps;
@@ -239,6 +247,7 @@ export class SwarmDriver {
 		if (this.#running) throw new Error("swarm is already running");
 		const specs = expandWorkers(this.#deps.config, count, roles);
 		this.#running = true;
+		this.#watchHostRoster();
 		this.#openBatch();
 		this.#started = [];
 		this.#slots = roleSlots(specs);
@@ -300,6 +309,36 @@ export class SwarmDriver {
 		return this.#started;
 	}
 
+	/**
+	 * Keep the pool in step with the host's agent registry.
+	 *
+	 * Workers are created as host subagents in `AgentRegistry.global()` (`#spawn`), which is what lets the
+	 * Agent Hub list them - and act on them: `x` in the Hub calls
+	 * `AgentLifecycleManager.release(id, ref, { tombstone: true })`, which detaches the ref and disposes the
+	 * session without asking the driver. The registry event is the only notice the pool gets, so the worker
+	 * is dropped here rather than being prompted later on a disposed session. A release by the driver
+	 * itself (`simulateCrash`, `stop`) is announced through `#selfTearing` and ignored.
+	 */
+	#watchHostRoster(): void {
+		const registry = this.#deps.sdk.AgentRegistry?.global?.();
+		if (registry === undefined) return; // a host without the registry surface keeps the previous behaviour
+		this.#hostRefUnsubscribe?.();
+		this.#hostRefUnsubscribe = registry.onChange((event) => {
+			if (event.type !== "status_changed" && event.type !== "removed") return;
+			const name = event.ref.id;
+			if (this.#workers.get(name) === undefined || this.#selfTearing.has(name)) return;
+			if (event.type === "status_changed" && event.ref.status !== "aborted") return;
+			this.#workers.delete(name);
+			this.#deps.store.setAgentStatus(name, "offline");
+			this.#deps.notify(
+				`worker ${name} was released from the Agent Hub; its claim survives until the lease expires`,
+				"warning",
+			);
+			this.#trace(`host release ${name}: session disposed outside the driver`);
+			this.#deps.onPanel();
+		});
+	}
+
 	async #spawn(spec: WorkerSpec): Promise<void> {
 		const { sdk, store, config, root, z } = this.#deps;
 		this.#trace(`spawn ${spec.name}: start (worktrees=${config.worktrees})`);
@@ -326,7 +365,22 @@ export class SwarmDriver {
 		const { session, modelFallbackMessage } = await sdk.createAgentSession({
 			cwd: worktree,
 			sessionManager: sdk.SessionManager.create(worktree, sessionDir),
-			agentRegistry: new sdk.AgentRegistry(),
+			// Host-visible identity. A worker must be a `sub` of the main session in
+			// `AgentRegistry.global()` so the host's Agent Hub (`Alt+A`) lists it and `Enter` there can
+			// focus its live session. Three options carry that, and none is optional:
+			// - `agentId` gives the worker its own registry id. Without it the SDK resolves the id to
+			//   `MAIN_AGENT_ID` (`sdk.ts:2135`) and the second worker would collide with the operator's
+			//   own session ref.
+			// - `taskDepth: 1` is what makes the SDK treat the session as a subagent (`sdk.ts:2034`);
+			//   a `main`-kind session tears down the PROCESS-GLOBAL agent lifecycle when it disposes
+			//   (`sdk.ts:4902`), so a worker must never be one.
+			// - omitting `agentRegistry` targets `AgentRegistry.global()` (`sdk.ts:2134`) - the very
+			//   registry the Hub reads (`modes/agent-hub-runtime.ts:49`). The old private
+			//   `new sdk.AgentRegistry()` here is exactly why the Hub showed nobody (task-81, FACT #292).
+			agentId: spec.name,
+			agentDisplayName: spec.name,
+			taskDepth: 1,
+			parentAgentId: sdk.MAIN_AGENT_ID,
 			modelPattern: config.model,
 			thinkingLevel,
 			appendSystemPrompt: workerSystemPrompt(spec, config, root),
@@ -688,6 +742,7 @@ export class SwarmDriver {
 		const worker = this.#workers.get(name);
 		if (!worker) return false;
 		this.#workers.delete(name);
+		this.#selfTearing.add(name);
 		try {
 			worker.session.abort();
 		} catch {
@@ -697,6 +752,8 @@ export class SwarmDriver {
 			await worker.session.dispose();
 		} catch {
 			// disposal failures must not stop the simulation
+		} finally {
+			this.#selfTearing.delete(name);
 		}
 		this.#deps.store.setAgentStatus(name, "offline");
 		this.#trace(`crash ${name}: session disposed, held work left to expire`);
@@ -725,14 +782,19 @@ export class SwarmDriver {
 		}
 		for (const worker of this.#workers.values()) {
 			this.#deps.store.unregisterAgent(worker.spec.name);
+			this.#selfTearing.add(worker.spec.name);
 			try {
 				await worker.session.dispose();
 			} catch (error) {
 				this.#deps.notify(`dispose of ${worker.spec.name} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			} finally {
+				this.#selfTearing.delete(worker.spec.name);
 			}
 		}
 		this.#workers.clear();
 		this.#slots = [];
+		this.#hostRefUnsubscribe?.();
+		this.#hostRefUnsubscribe = undefined;
 		this.#deps.onPanel();
 	}
 }

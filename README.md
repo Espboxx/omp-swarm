@@ -255,11 +255,15 @@ board tally are untouched, and the `SWARM n/m done` status line plus `/swarm sta
 the progress itself. The persistent batch summary shrinks by the same line when the roster is large;
 the status-line headline and the transcript copy are unaffected.
 
-**What `Enter` does, exactly:** it marks the target. It does **not** switch the session pane, because
-no extension-facing API can do that and the host's own Agent Hub (`Alt+A`) lists only host subagents
-— swarm workers are created with a private agent registry and `hasUI: false`, so they never appear
-there. `/swarm message <id> <text>` (or the `swarm_message` tool) stays the way to reach the agent you
-marked.
+**What `Enter` does, exactly:** it marks the target in the swarm's own list. It does **not** switch the
+session pane by itself — that is the host's surface. `Alt+A` opens the host Agent Hub, which now lists
+every live worker (each is created as a host subagent in `AgentRegistry.global()`,
+`extension/driver.ts`), `Enter` on a worker row attaches that worker's live session to the main pane
+(`Viewing agent <id>`), and `Esc` on an empty editor or a double-`←` returns to main (`Returned to main
+session`). `x` in the Hub releases a worker: the driver sees it through the agent registry, drops it
+from the pool and marks it `offline`, so its claim survives only until the lease expires. `/swarm
+message <id> <text>` (or the `swarm_message` tool) still reaches the agent you marked without leaving
+this pane.
 
 ### Batch completion alert
 

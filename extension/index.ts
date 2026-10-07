@@ -417,10 +417,11 @@ export default function swarm(pi: ExtensionAPI): void {
 	 * `Enter` in the picker: the row becomes the current target, which is what the widget's `*` marks
 	 * and what the status line keeps in step.
 	 *
-	 * It does NOT switch the session pane, and the wording says so instead of implying it: swarm
-	 * workers are created with a private `AgentRegistry` and `hasUI: false` (`extension/driver.ts`),
-	 * so the host's Agent Hub - the only surface that can focus another session, `Alt+A` - never lists
-	 * them, and no extension-facing API can request that focus (`omp://agent-hub.md`).
+	 * It does NOT switch the session pane, and the wording says so instead of implying it: this picker
+	 * only moves the swarm's own marker. Switching the pane is the HOST's surface - `Alt+A` (Agent Hub)
+	 * then `Enter` on a worker - and that works because workers are created as host subagents in
+	 * `AgentRegistry.global()` (`extension/driver.ts`, task-83): the Hub lists them and its `Enter` calls
+	 * `SessionFocusController.focusAgent(id)`, which attaches the worker's live session to the main pane.
 	 */
 	const commitNavTarget = (ctx: ExtensionContext, runtime: Runtime, entry: NavEntry): void => {
 		runtime.nav.targetId = entry.id;
@@ -428,7 +429,7 @@ export default function swarm(pi: ExtensionAPI): void {
 		ctx.ui.notify(
 			entry.isMain
 				? "current target: the main session (this terminal)"
-				: `current target: ${entry.id} - /swarm message ${entry.id} <text> reaches it. The host cannot focus a worker's session in the main pane (its Agent Hub lists only host subagents); see README "Agent list navigation".`,
+				: `current target: ${entry.id} - /swarm message ${entry.id} <text> reaches it. To READ and steer it in the main pane use Alt+A, then Enter on its row (Esc or double-left-arrow returns); see README "Agent list navigation".`,
 			"info",
 		);
 	};
