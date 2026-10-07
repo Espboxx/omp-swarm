@@ -790,6 +790,34 @@ export class SwarmStore {
 		});
 	}
 
+	/**
+	 * Hand a STALLED hold back to the pool. Same state transition as a lease expiry (the row becomes
+	 * claimable, the holder loses it) but a different cause, a different event (`task.takeover`) and a
+	 * reason the board can read: the holder was alive but the work stopped moving.
+	 *
+	 * Only ever called by the round watchdog, which has already decided the silence is past the limit -
+	 * a task with a producing holder is never taken. Returns the agent it was taken from so the caller
+	 * can say so out loud, and refuses (ok: false) when the row is no longer held, so a race with the
+	 * holder's own release or completion is a no-op rather than a second takeover.
+	 */
+	reclaimStalled(taskId: string, reason: string): { ok: boolean; previous?: string } {
+		const now = Date.now();
+		return this.#db.transaction(() => {
+			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
+			if (row === null || row.status !== "claimed") return { ok: false };
+			const changed = this.#db.run(
+				"UPDATE tasks SET status='ready', claimed_by=NULL, claimed_at=NULL, lease_until=NULL, updated_at=? WHERE id=? AND status='claimed'",
+				now,
+				taskId,
+			);
+			if (changed.changes !== 1) return { ok: false };
+			const previous = row.claimed_by ?? undefined;
+			this.#log("task.takeover", previous, taskId, { reason });
+			if (previous !== undefined) this.#settleAgent(previous, now);
+			return { ok: true, previous };
+		});
+	}
+
 	complete(
 		taskId: string,
 		agentId: string,
@@ -1173,6 +1201,46 @@ export class SwarmStore {
 			this.postBoard({ type: "FAIL", agentId: goal.createdBy, taskId: goal.planningTask, content: reason, tags: ["failure", goalTag(goal.id)] });
 		}
 		return closed.map((entry) => entry.goal);
+	}
+
+	/**
+	 * The round's OTHER hard exit, for a round whose scribes are gone rather than slow: the watchdog
+	 * has already taken the planning task {@link MAX_SCRIBE_ATTEMPTS} times, so the round is closed
+	 * `failed` with a reason that says so - explicitly, minutes before the bound would have done it
+	 * silently, and with the same FAIL on the board the bound posts. A stuck round therefore never
+	 * spins: it either gets a plan or it gets a reason.
+	 *
+	 * The planning row is closed in the SAME transaction whatever it is doing (unlike the bound, which
+	 * leaves a claimed row to its holder): the holder is, by the watchdog's own finding, not producing,
+	 * and leaving it claimed would keep the round unrunnable with the goal already failed.
+	 */
+	closeStalledGoal(goalId: string, reason: string): SwarmGoal | undefined {
+		const closed = this.#db.transaction((): SwarmGoal | undefined => {
+			const now = Date.now();
+			const changed = this.#db.run("UPDATE goals SET status='failed', result=?, updated_at=? WHERE id=? AND status='open'", reason, now, goalId);
+			if (changed.changes !== 1) return undefined;
+			this.#db.run(
+				`UPDATE tasks SET status='failed', result=?, claimed_by=NULL, claimed_at=NULL, lease_until=NULL, updated_at=?
+				 WHERE id=? AND status IN ('ready','blocked','claimed')`,
+				reason,
+				now,
+				this.getGoal(goalId)?.planningTask ?? "",
+			);
+			const goal = this.getGoal(goalId);
+			if (goal === undefined) return undefined;
+			this.#log("goal.fail", goal.createdBy, goal.planningTask, { goal: goalId, reason });
+			return goal;
+		});
+		if (closed !== undefined) {
+			this.postBoard({
+				type: "FAIL",
+				agentId: closed.createdBy,
+				taskId: closed.planningTask,
+				content: closed.result ?? reason,
+				tags: ["failure", goalTag(closed.id)],
+			});
+		}
+		return closed;
 	}
 
 	// --------------------------------------------------------------- scaling

@@ -5,6 +5,7 @@ import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgentInfoRows, sortAgentInfo, type AgentInfo } from "./agentinfo";
 import { MAIN_ID, moveSelection, navEntries, renderNavLines } from "./agentnav";
 import { expandWorkers, type WorkerSpec } from "./config";
+import { goalTag, scribeVerdict } from "./planning";
 import { renderPanel, type DrainSummary } from "./render";
 import { canStop } from "./scaling";
 import type { SwarmStore } from "./store";
@@ -282,6 +283,79 @@ export function workerBootstrap(spec: WorkerSpec, config: SwarmConfig): string {
 			? "If a task you own is in review status and you are not its author, you may swarm_review it."
 			: "Review is disabled for this swarm; complete tasks directly.",
 	].join("\n");
+}
+
+/** What the caller wants to hear about a round the watchdog acted on. */
+export interface RoundWatchHooks {
+	/** One line per decision, for the driver's trace. */
+	trace?(line: string): void;
+	/**
+	 * The operator-facing half. A round closed by the watchdog must be announced the way the bound's
+	 * closures are (auto.ts's `goalBoundNotice`): the FAIL is on the board, but a round that dies
+	 * outside its bound is exactly the case nobody expects, so it cannot be silent.
+	 */
+	closed?(goal: SwarmGoal, reason: string): void;
+}
+
+/**
+ * The round watchdog: a live goal whose scribe stopped producing must not be able to hold the round
+ * until the bound.
+ *
+ * The rule is pure ({@link scribeVerdict}); this function only feeds it the round's own facts and
+ * applies the verdict - exported, so the ladder can be driven against a real store (isolated root,
+ * fresh processes) without standing up a pool.
+ *
+ * The facts are the ones the store already keeps, so nothing new has to be written to decide: the
+ * hold (`claimedBy`), how many times the round has been taken (`attempts`) and the last moment it
+ * moved - a claim, an explicit `swarm_renew` or a new proposal. The driver's own beat is deliberately
+ * NOT progress: it renews the lease of a session that may be hung, which is exactly the state goal-6
+ * died in (claimed at +64s, silent from +363s, the bound at +601s; FACT #728).
+ *
+ * A `reclaim` hands the row back as `ready` (event `task.takeover`, a reason on the board), and the
+ * tick's worker loop reads the workers' state AFTER this call, so the pool is woken in the same pass;
+ * a `fail` closes the round with a reason minutes before the bound would have closed it silently.
+ * Returns the goals that are still live.
+ */
+export function watchRounds(store: SwarmStore, goals: SwarmGoal[], now: number, hooks: RoundWatchHooks = {}): SwarmGoal[] {
+	const live: SwarmGoal[] = [];
+	for (const goal of goals) {
+		const task = store.getTask(goal.planningTask);
+		if (task === undefined) {
+			live.push(goal);
+			continue;
+		}
+		const lastProgressAt = Math.max(task.claimedAt ?? 0, task.updatedAt, ...store.listProposals(goal).map((proposal) => proposal.createdAt));
+		const verdict = scribeVerdict({
+			planningTask: task.id,
+			heldBy: task.status === "claimed" ? task.claimedBy : undefined,
+			attempts: task.attempts,
+			lastProgressAt,
+			now,
+		});
+		if (verdict.action === "ok") {
+			live.push(goal);
+			continue;
+		}
+		hooks.trace?.(`round ${goal.id}: ${verdict.reason}`);
+		if (verdict.action === "fail") {
+			const closed = store.closeStalledGoal(goal.id, verdict.reason);
+			if (closed !== undefined) hooks.closed?.(closed, verdict.reason);
+			continue;
+		}
+		if (!store.reclaimStalled(task.id, verdict.reason).ok) {
+			live.push(goal);
+			continue;
+		}
+		store.postBoard({
+			type: "OBSERVATION",
+			agentId: goal.createdBy,
+			taskId: task.id,
+			content: verdict.reason,
+			tags: ["planning", goalTag(goal.id)],
+		});
+		live.push(goal);
+	}
+	return live;
 }
 
 export class SwarmDriver {
@@ -645,8 +719,19 @@ export class SwarmDriver {
 		if (!this.#running) return;
 		const { store, config } = this.#deps;
 		// The round a worker can join right now: a live goal is what the pool converges on before it
-		// has any real task to claim.
-		const goals = store.liveGoals();
+		// has any real task to claim. The watchdog runs FIRST, so a round it re-offers this tick is
+		// already `ready` when the loop below reads the workers' state: the same pass moves the idle
+		// signature and prompts the pool, instead of the wake arriving one tick later.
+		const goals = watchRounds(store, store.liveGoals(), this.#deps.now?.() ?? Date.now(), {
+			trace: (line) => this.#trace(line),
+			closed: (goal, reason) => {
+				// The same shape auto.ts uses for the bound's closures: the FAIL is on the board, and the
+				// operator is told why the round died BEFORE its bound - never silent.
+				const notice = `[swarm] the planning round for ${goal.id} was closed without a plan: ${reason}. Post a new goal, or create the tasks directly with swarm_task_create.`;
+				this.#deps.notify(notice, "warning");
+				this.#deps.deliverToMain?.(notice, true);
+			},
+		});
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
 			const now = this.#deps.now?.() ?? Date.now();

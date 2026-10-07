@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { openDatabase, swarmPaths, type SwarmPaths } from "../../extension/db";
-import { deliverableKey } from "../../extension/planning";
+import { watchRounds } from "../../extension/driver";
+import { MAX_SCRIBE_ATTEMPTS, SCRIBE_STALL_MS, deliverableKey } from "../../extension/planning";
 import { SwarmStore } from "../../extension/store";
 import type { SwarmTask } from "../../extension/types";
 
@@ -318,6 +319,139 @@ describe("the round's bound", () => {
 		expect(store.closeExpiredGoals(Date.now() + 60_000)).toEqual([]);
 		expect(store.getGoal(opened.goal.id)?.status).toBe("planned");
 		expect(store.searchBoard({ type: "FAIL" })).toEqual([]);
+		store.close();
+	});
+});
+
+/**
+ * The round watchdog: the defect FACT #728 re-derived from goal-6 — the planning hold was EXCLUSIVE,
+ * UN-SUPERSEDABLE and silently renewed by the driver's own beat, so a scribe that stopped producing
+ * blocked every peer until the bound closed the round with `planner=null`. These tests drive the real
+ * rule over a real store (isolated root, fresh processes for the takeover), never a fixture of it.
+ */
+describe("the round watchdog: a stalled scribe is superseded, not waited out", () => {
+	/** Hold the round, propose a split, then move the round's OWN clock one silent window into the past. */
+	function stalled(): { store: SwarmStore; paths: SwarmPaths; goalId: string; planning: string } {
+		const { store, paths } = makeRoot();
+		const opened = round(store);
+		expect(store.claim(opened.planningTask.id, "A", 300, ["general"]).ok).toBe(true);
+		silence(paths, opened.planningTask.id);
+		return { store, paths, goalId: opened.goal.id, planning: opened.planningTask.id };
+	}
+
+	/** A claim, a renew and a proposal are the round moving; the clock the watchdog reads is those stamps. */
+	function silence(paths: SwarmPaths, planning: string): void {
+		const raw = openDatabase(paths);
+		const since = Date.now() - SCRIBE_STALL_MS - 1000;
+		raw.run("UPDATE tasks SET claimed_at=?, updated_at=? WHERE id=?", since, since, planning);
+		raw.run("UPDATE board SET created_at=? WHERE task_id=?", since, planning);
+		raw.close();
+	}
+
+	test("a silent hold returns the row to ready, logs task.takeover and says why on the board", () => {
+		const { store, planning } = stalled();
+		const live = watchRounds(store, store.liveGoals(), Date.now());
+		expect(live.map((goal) => goal.id)).toEqual(["goal-1"]); // the round is still open, now claimable
+		const row = store.getTask(planning);
+		expect(row?.status).toBe("ready");
+		expect(row?.claimedBy).toBeUndefined();
+		expect(row?.leaseUntil).toBeUndefined();
+		expect(store.recentEvents(20).some((event) => event.type === "task.takeover" && event.taskId === planning)).toBe(true);
+		const notice = store.searchBoard({ tags: ["planning"] })[0]?.content ?? "";
+		expect(notice).toContain("A held");
+		expect(notice).toContain("without progress for");
+		expect(store.getAgent("A")?.currentTask).toBeUndefined(); // the holder's row is settled, not left working
+		store.close();
+	});
+
+	test("the driver's own heartbeat is liveness, not progress: the silent hold is still superseded", () => {
+		const { store, planning } = stalled();
+		store.heartbeat("A", undefined, undefined, 300); // exactly what #beat does every 20s for a roster worker
+		expect(store.getTask(planning)?.status).toBe("claimed");
+		expect(store.getTask(planning)?.leaseUntil).toBeGreaterThan(Date.now());
+		watchRounds(store, store.liveGoals(), Date.now());
+		// The lease is healthy, which is precisely why goal-6's hold never lapsed while the round starved.
+		expect(store.getTask(planning)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("an explicitly renewed round is left alone: swarm_renew IS progress, the heartbeat is not", () => {
+		const { store, planning } = stalled();
+		expect(store.renew(planning, "A", 300)).toBe(true);
+		const live = watchRounds(store, store.liveGoals(), Date.now());
+		expect(live.map((goal) => goal.id)).toEqual(["goal-1"]);
+		expect(store.getTask(planning)?.status).toBe("claimed");
+		expect(store.searchBoard({ tags: ["planning"] })).toEqual([]);
+		store.close();
+	});
+
+	test("the round survives exactly MAX_SCRIBE_ATTEMPTS scribes, then is closed with its reason", () => {
+		const { store, paths, goalId, planning } = stalled();
+		expect(watchRounds(store, store.liveGoals(), Date.now()).length).toBe(1); // takeover 1 offered
+		expect(store.claim(planning, "B", 300, ["general"]).ok).toBe(true);
+		silence(paths, planning);
+		expect(watchRounds(store, store.liveGoals(), Date.now()).length).toBe(1); // takeover 2 offered
+		expect(store.claim(planning, "C", 300, ["general"]).ok).toBe(true);
+		silence(paths, planning);
+		expect(watchRounds(store, store.liveGoals(), Date.now())).toEqual([]); // the ladder is exhausted
+
+		const goal = store.getGoal(goalId);
+		expect(goal?.status).toBe("failed");
+		expect(goal?.result).toContain(`taken ${MAX_SCRIBE_ATTEMPTS} time(s)`);
+		expect(goal?.result).toContain("closed explicitly instead of waiting for the bound");
+		expect(store.getTask(planning)?.status).toBe("failed"); // the row cannot be left claimable under a failed goal
+		const fails = store.searchBoard({ type: "FAIL" });
+		expect(fails.length).toBe(1);
+		expect(fails[0]?.tags).toContain("goal:goal-1");
+		expect(fails[0]?.content).toContain("closed explicitly");
+		expect(store.liveGoals()).toEqual([]);
+		store.close();
+	});
+
+	test("a round re-offered and left sitting is closed with a reason instead of spinning to the bound", () => {
+		const { store, paths, goalId, planning } = stalled();
+		watchRounds(store, store.liveGoals(), Date.now()); // re-offered: the row is ready
+		expect(store.getTask(planning)?.status).toBe("ready");
+		silence(paths, planning); // nobody picks it up, and the window passes again
+		expect(watchRounds(store, store.liveGoals(), Date.now())).toEqual([]);
+		expect(store.getGoal(goalId)?.result).toContain("has been claimable for");
+		expect(store.getTask(planning)?.status).toBe("failed");
+		store.close();
+	});
+
+	test("a fresh round nobody has claimed is left to the bound: the watchdog is not a starter pistol", () => {
+		const { store, paths } = makeRoot();
+		const opened = round(store);
+		silence(paths, opened.planningTask.id);
+		expect(store.getTask(opened.planningTask.id)?.attempts).toBe(0);
+		expect(watchRounds(store, store.liveGoals(), Date.now()).length).toBe(1);
+		expect(store.getTask(opened.planningTask.id)?.status).toBe("ready");
+		expect(store.getGoal(opened.goal.id)?.status).toBe("open");
+		store.close();
+	});
+
+	test("a lost scribe is taken over by a FRESH PROCESS, which really produces the plan", async () => {
+		const { store, paths, goalId, planning } = stalled();
+		expect(store.listTasks({ status: "ready", limit: 10 })).toEqual([]); // nothing for a peer to take yet
+
+		const offeredAt = Date.now();
+		watchRounds(store, store.liveGoals(), offeredAt);
+
+		// A different agent in a different OS process claims the free round and merges it.
+		const taken = await runChild(["--root", paths.root, "--goal", goalId, "--agent", "w2"]);
+		const recoveredMs = Date.now() - offeredAt;
+		expect(taken.claimed).toBe(true);
+		expect(taken.planned).toBe(true);
+		expect(taken.created).toBe(1);
+		expect(store.getGoal(goalId)?.status).toBe("planned");
+		expect(store.getGoal(goalId)?.planner).toBe("w2");
+		// The child drives the store directly (the swarm_plan TOOL is what completes the row), so the
+		// round is closed by the goal's own state: planned, with exactly one plan on the board.
+		expect(store.getTask(planning)?.claimedBy).toBe("w2");
+		expect(store.listTasks({ limit: 20 }).filter((task) => task.title === "The deliverable").length).toBe(1);
+		expect(store.searchBoard({ type: "DECISION" }).length).toBe(1);
+		// The recovery costs process startup, never another stall window: the offer is what unblocked it.
+		expect(recoveredMs).toBeLessThan(10_000);
 		store.close();
 	});
 });

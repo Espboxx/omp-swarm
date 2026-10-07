@@ -12,8 +12,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { openInMemoryDatabase, swarmPaths } from "../../extension/db";
+import { openInMemoryDatabase, swarmPaths, type Db } from "../../extension/db";
 import { IDLE_PARK_AFTER, SwarmDriver, idleWake, stalledWake, type IdleWakeState, type TimerApi } from "../../extension/driver";
+import { SCRIBE_STALL_MS } from "../../extension/planning";
 import { SwarmStore } from "../../extension/store";
 import { DEFAULT_CONFIG, type SwarmConfig } from "../../extension/types";
 
@@ -60,19 +61,27 @@ async function until(predicate: () => boolean, turns = 512): Promise<void> {
 
 interface Harness {
 	store: SwarmStore;
+	/** The raw handle, so a test can move the ROUND's own stamps (the watchdog's clock) without a sleep. */
+	db: Db;
 	/** Every prompt the driver issued, in order: the model calls this fix is measured in. */
 	prompts: { agent: string; text: string }[];
+	/** Every operator-facing notice, so a round the driver closes can be shown to be announced. */
+	notices: string[];
 	start(count?: number): Promise<void>;
 	/** One full driver tick (the captured interval callback), awaited to completion. */
 	tick(): Promise<void>;
+	/** One heartbeat/beat pass: the sweep that reclaims lapsed leases (the driver's second timer). */
+	beat(): void;
 }
 
 function harness(overrides: Partial<SwarmConfig> = {}, now?: () => number): Harness {
 	const root = mkdtempSync(join(tmpdir(), "swarm-driver-unit-"));
 	tempDirs.push(root);
-	const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(root));
+	const db = openInMemoryDatabase();
+	const store = new SwarmStore(db, swarmPaths(root));
 	const config: SwarmConfig = { ...DEFAULT_CONFIG, ...overrides };
 	const prompts: { agent: string; text: string }[] = [];
+	const notices: string[] = [];
 	const intervals: Array<() => void> = [];
 
 	const sdk = {
@@ -116,14 +125,18 @@ function harness(overrides: Partial<SwarmConfig> = {}, now?: () => number): Harn
 		z: zodStub as never,
 		timers,
 		exec: async () => ({ code: 1, stdout: "", stderr: "not a git repository" }),
-		notify: () => {},
+		notify: (text: string) => {
+			notices.push(text);
+		},
 		onPanel: () => {},
 		now,
 	});
 
 	return {
 		store,
+		db,
 		prompts,
+		notices,
 		async start(count = 1) {
 			await driver.start(count);
 			await until(() => store.listAgents().length >= count);
@@ -136,6 +149,11 @@ function harness(overrides: Partial<SwarmConfig> = {}, now?: () => number): Harn
 			if (callback === undefined) throw new Error("the driver is not running");
 			callback();
 			await drain();
+		},
+		beat() {
+			const callback = intervals[1];
+			if (callback === undefined) throw new Error("the driver is not running");
+			callback();
 		},
 	};
 }
@@ -345,5 +363,86 @@ describe("a worker that HOLDS work is still driven", () => {
 		await h.tick();
 		expect(h.prompts.length).toBe(afterClaim + 3);
 		expect(h.prompts.at(-1)?.text).toContain("hold");
+	});
+});
+
+describe("the round watchdog in the tick: a superseded round wakes the pool, then holds still", () => {
+	/**
+	 * The two sides the goal demands, measured together on the real tick: a planning hold that stops
+	 * producing is re-offered INSIDE the tick that notices it (so the woken worker is told to take the
+	 * round over), the round that nobody takes is closed explicitly, and every unchanged tick between
+	 * those two edges costs ZERO model calls — task-170/171's win is not traded away for the wake.
+	 *
+	 * The round's own stamps are moved a window into the past instead of sleeping two minutes: the
+	 * watchdog reads the silence from them, and this file's harness already owns the tick.
+	 */
+	test("one wake when the round is re-offered, one when it is closed, and nothing in between", async () => {
+		const h = harness();
+		await h.start();
+		const opened = h.store.createGoal({ goal: "split the work", agents: 2, createdBy: "main" });
+		h.store.postProposal(opened.goal, "peer", [{ title: "The deliverable" }]);
+		expect(h.store.claim(opened.planningTask.id, "peer", 300, ["general"]).ok).toBe(true);
+
+		/** Move the round's OWN stamps a silent window into the past — the silence the watchdog reads. */
+		const silence = () => {
+			const since = Date.now() - SCRIBE_STALL_MS - 1000;
+			h.db.run("UPDATE tasks SET claimed_at=?, updated_at=? WHERE id=?", since, since, opened.planningTask.id);
+			h.db.run("UPDATE board SET created_at=? WHERE task_id=?", since, opened.planningTask.id);
+		};
+
+		// The goal appearing is one change, so the worker is told about the round once.
+		await h.tick();
+		const announced = h.prompts.length;
+		expect(h.prompts.at(-1)?.text).toContain("OPEN GOAL goal-1");
+
+		// Its scribe goes silent: the driver's beat keeps the lease healthy (the state goal-6 died in),
+		// and the tick re-offers the round in the same pass that notices it.
+		h.store.heartbeat("peer", undefined, undefined, 300);
+		silence();
+		await h.tick();
+		expect(h.prompts.length).toBe(announced + 1);
+		expect(h.store.getTask(opened.planningTask.id)?.status).toBe("ready");
+		expect(h.prompts.at(-1)?.text).toContain(`claim the planning task ${opened.planningTask.id}`);
+		expect(h.prompts.at(-1)?.text).toContain("the first claimer is the scribe");
+
+		// Unchanged state: the re-offered round costs nothing while the pool decides.
+		for (let i = 0; i < 5; i++) await h.tick();
+		expect(h.prompts.length).toBe(announced + 1);
+
+		// Nobody takes it, and the second silent window closes the round explicitly — one more model
+		// call, then the pool is quiet again (no polling, no spin to the goal's bound).
+		silence();
+		await h.tick();
+		expect(h.prompts.length).toBe(announced + 2);
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("failed");
+		expect(h.store.getGoal(opened.goal.id)?.result).toContain("has been claimable for");
+		expect(h.store.getTask(opened.planningTask.id)?.status).toBe("failed");
+		expect(h.store.searchBoard({ type: "FAIL" }).length).toBe(1);
+		// A round that dies outside its bound is announced, exactly like the bound's own closures.
+		expect(h.notices.some((notice) => notice.includes("was closed without a plan"))).toBe(true);
+		for (let i = 0; i < 5; i++) await h.tick();
+		expect(h.prompts.length).toBe(announced + 2);
+	});
+
+	test("a lapsed lease returning a row to ready is the same wake: the pool is told, once", async () => {
+		const h = harness();
+		await h.start();
+		const task = h.store.createTask({ title: "held by a peer", createdBy: "main" });
+		expect(h.store.claim(task.id, "peer", 300, ["general"]).ok).toBe(true);
+		await h.tick();
+		const before = h.prompts.length;
+
+		// The lease lapses; the beat's sweep is what puts the row back in the pool (store.sweep).
+		h.db.run("UPDATE tasks SET lease_until=? WHERE id=?", Date.now() - 1000, task.id);
+		h.beat();
+		expect(h.store.getTask(task.id)?.status).toBe("ready");
+		await h.tick();
+		expect(h.prompts.length).toBe(before + 1);
+		expect(h.prompts.at(-1)?.text).toContain("claimable task(s)");
+
+		// The row is where it was: no second call, and no model call after the edge is consumed.
+		await h.tick();
+		await h.tick();
+		expect(h.prompts.length).toBe(before + 1);
 	});
 });

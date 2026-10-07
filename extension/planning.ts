@@ -18,6 +18,81 @@ export const MIN_PROPOSALS = 1;
 /** The board tag every proposal carries. */
 export const PROPOSAL_TAG = "proposal";
 
+/**
+ * How long a CLAIMED planning round may make no progress before the pool may take it over.
+ *
+ * A scribe's turn can outlive its hold: the driver's beat renews every held task's lease, so the
+ * lease never expires while the session lives, and a session that stops producing (a hung turn, a
+ * disposed session, a scribe lost mid-merge — goal-6, replays in `.swarm` event `task.claim` at +64s
+ * then NOTHING until the bound at +601s) keeps the round unrunnable by anybody else. Two silent
+ * minutes hand the round to the next claimer, which is why the bound is no longer the only exit.
+ */
+export const SCRIBE_STALL_MS = 120_000;
+/**
+ * How many scribes one round may burn before it is closed with an explicit FAIL: the original claim
+ * (attempt 1) plus two takeovers. A round nobody can carry must die loudly, not spin to the bound.
+ */
+export const MAX_SCRIBE_ATTEMPTS = 3;
+
+/** What the watchdog needs to know about one open round. All of it is on the goal's planning row. */
+export interface ScribeWatchInput {
+	/** The goal's planning task id, for the message the pool reads. */
+	planningTask: string;
+	/** The agent holding the round right now; `undefined` when the row is already claimable. */
+	heldBy?: string;
+	/** Claims the round has taken so far: 1 = the original scribe, each takeover adds one. */
+	attempts: number;
+	/** The last moment the ROUND did something deliberate: a claim, a `swarm_renew`, a new proposal. */
+	lastProgressAt: number;
+	/** The caller's clock. */
+	now: number;
+}
+
+/** What the pool should do about an open round. Pure, so the ladder is testable without a swarm. */
+export type ScribeVerdict = { action: "ok" } | { action: "reclaim"; reason: string } | { action: "fail"; reason: string };
+
+/**
+ * The scribe-lost ladder, as a pure function.
+ *
+ * A held round younger than {@link SCRIBE_STALL_MS} of silence is `ok`: the scribe is working, and
+ * taking a round off a live worker is the one thing this rule must never do. So is a round NOBODY has
+ * ever claimed (`attempts === 0`): the pool has not started it yet and the bound owns that case.
+ *
+ * Past a silent window the round is re-offered (`reclaim`) while it has attempts left, and closed with
+ * an explicit FAIL once it has none. The FAIL also covers the round that was re-offered and then left
+ * sitting: once a scribe has existed (`attempts >= 1`), a claimable round that stays claimable for a
+ * whole window is a round nobody is coming back to, so it ends with a reason instead of spinning
+ * silently to the bound. Both reasons are written for the board - they name the holder, the attempts
+ * and the silent seconds.
+ */
+export function scribeVerdict(input: ScribeWatchInput): ScribeVerdict {
+	const silentMs = input.now - input.lastProgressAt;
+	if (silentMs < SCRIBE_STALL_MS) return { action: "ok" };
+	const silentSeconds = Math.round(silentMs / 1000);
+	const stall = Math.round(SCRIBE_STALL_MS / 1000);
+	const exhausted = input.attempts >= MAX_SCRIBE_ATTEMPTS;
+	if (input.heldBy === undefined) {
+		// Nothing to take off anybody: either the pool has not started the round (its own clock is the
+		// bound), or a round was re-offered and nobody picked it up - which is the silent spin the
+		// operator named, so it is closed with a reason.
+		if (input.attempts === 0) return { action: "ok" };
+		return {
+			action: "fail",
+			reason: `${input.planningTask} has been claimable for ${silentSeconds}s (stall limit ${stall}s) after ${input.attempts} claim(s); the round is closed explicitly rather than left spinning to the bound`,
+		};
+	}
+	if (exhausted) {
+		return {
+			action: "fail",
+			reason: `the planning round for ${input.planningTask} has been taken ${input.attempts} time(s) and ${input.heldBy} made no progress for ${silentSeconds}s (stall limit ${stall}s); closed explicitly instead of waiting for the bound`,
+		};
+	}
+	return {
+		action: "reclaim",
+		reason: `${input.heldBy} held ${input.planningTask} without progress for ${silentSeconds}s (stall limit ${stall}s): the round is re-offered to the pool (attempt ${input.attempts} of ${MAX_SCRIBE_ATTEMPTS})`,
+	};
+}
+
 /** The tag that scopes a proposal (and any goal board entry) to one goal. Exact-match on the tag list. */
 export function goalTag(goalId: string): string {
 	return `goal:${goalId}`;
@@ -440,6 +515,11 @@ export interface Proposal {
 	agentId: string;
 	goalId: string;
 	tasks: ProposedTask[];
+	/**
+	 * When the proposal landed. The round watchdog reads it as PROGRESS: a new split is the round
+	 * moving, so it resets the stall clock exactly the way a `swarm_renew` does.
+	 */
+	createdAt: number;
 }
 
 /** A deduped deliverable, ready to become a task row. `deps` are keys of other merged tasks. */
@@ -523,7 +603,7 @@ export function parseProposal(entry: BlackboardEntry): Proposal | undefined {
 	if (tasks.length === 0) return undefined;
 	const fromJson = record !== undefined && typeof record.goal === "string" ? record.goal.trim() : "";
 	const goalId = fromJson !== "" ? fromJson : (entry.tags.find((tag) => tag.startsWith("goal:"))?.slice(5) ?? "");
-	return { entryId: entry.id, agentId: entry.agentId, goalId, tasks };
+	return { entryId: entry.id, agentId: entry.agentId, goalId, tasks, createdAt: entry.createdAt };
 }
 
 /**

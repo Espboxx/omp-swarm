@@ -66,6 +66,7 @@ describe("goal-5's dependency residue", () => {
 				agentId: "A",
 				goalId: "goal-1",
 				tasks: [{ title: "Only task", dependsOn: ["Never proposed anywhere"] }],
+				createdAt: 1,
 			},
 		]);
 		expect(only.tasks.length).toBe(1);

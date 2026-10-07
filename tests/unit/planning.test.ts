@@ -7,7 +7,9 @@ import { describe, expect, test } from "bun:test";
 import {
 	DEDUPE_KEY_TEXT,
 	GOAL_DEADLINE_MS,
+	MAX_SCRIBE_ATTEMPTS,
 	PROPOSAL_TAG,
+	SCRIBE_STALL_MS,
 	deliverableKey,
 	describeDeliverable,
 	goalTag,
@@ -18,6 +20,7 @@ import {
 	parseProposedTask,
 	peakParallelism,
 	planningTaskBrief,
+	scribeVerdict,
 	type Proposal,
 } from "../../extension/planning";
 import type { BlackboardEntry } from "../../extension/types";
@@ -157,8 +160,8 @@ describe("mergeProposals", () => {
 
 	test("a round whose proposals carry no task is reported as empty, not as a plan", () => {
 		const merged = mergeProposals([
-			{ entryId: 1, agentId: "A", goalId: "goal-1", tasks: [] },
-			{ entryId: 2, agentId: "B", goalId: "goal-1", tasks: [{ title: " " }] },
+			{ entryId: 1, agentId: "A", goalId: "goal-1", tasks: [], createdAt: 1 },
+			{ entryId: 2, agentId: "B", goalId: "goal-1", tasks: [{ title: " " }], createdAt: 2 },
 		]);
 		expect(merged.tasks).toEqual([]);
 		expect(merged.empty).toBe(2);
@@ -635,5 +638,49 @@ describe("a merged row's union shape, and what must still not fold into it", () 
 		]);
 		expect(merged.tasks.length).toBe(2);
 		expect(merged.folded).toEqual([]);
+	});
+});
+
+/**
+ * The scribe-lost ladder, decided by the round's own data. This rule is what turns "the round died at
+ * its bound with planner=null" (goal-6, re-derived in board FACT #728: held continuously, silent from
+ * +363s, bound at +601s) into a round that either gets a plan or gets a reason: a silent holder is
+ * re-offered, a re-offered round nobody takes is closed, and a round that burns MAX_SCRIBE_ATTEMPTS of
+ * scribes ends explicitly instead of spinning.
+ */
+describe("scribeVerdict: a stalled round is re-offered, then closed with a reason", () => {
+	const round = { planningTask: "task-1", heldBy: "A", attempts: 1, lastProgressAt: 1_000_000 };
+
+	test("a producing scribe is never taken off the round, right up to the stall limit", () => {
+		expect(scribeVerdict({ ...round, now: 1_000_000 + SCRIBE_STALL_MS - 1 })).toEqual({ action: "ok" });
+	});
+
+	test("one silent window hands the round back to the pool, naming the holder and the seconds", () => {
+		const verdict = scribeVerdict({ ...round, now: 1_000_000 + SCRIBE_STALL_MS });
+		expect(verdict.action).toBe("reclaim");
+		if (verdict.action !== "reclaim") throw new Error("expected a reclaim");
+		expect(verdict.reason).toContain("A held task-1");
+		expect(verdict.reason).toContain("120s");
+		expect(verdict.reason).toContain(`attempt 1 of ${MAX_SCRIBE_ATTEMPTS}`);
+	});
+
+	test("the ladder is bounded: a takeover is allowed up to the cap, and the cap closes the round", () => {
+		expect(scribeVerdict({ ...round, attempts: 2, now: 1_000_000 + SCRIBE_STALL_MS }).action).toBe("reclaim");
+		const last = scribeVerdict({ ...round, attempts: MAX_SCRIBE_ATTEMPTS, now: 1_000_000 + SCRIBE_STALL_MS });
+		expect(last.action).toBe("fail");
+		if (last.action !== "fail") throw new Error("expected a fail");
+		expect(last.reason).toContain(`taken ${MAX_SCRIBE_ATTEMPTS} time(s)`);
+	});
+
+	test("a round that was re-offered and left sitting is closed, not spun to the bound", () => {
+		const verdict = scribeVerdict({ ...round, heldBy: undefined, now: 1_000_000 + SCRIBE_STALL_MS });
+		expect(verdict.action).toBe("fail");
+		if (verdict.action !== "fail") throw new Error("expected a fail");
+		expect(verdict.reason).toContain("claimable for 120s");
+		expect(verdict.reason).toContain("1 claim(s)");
+	});
+
+	test("a fresh round nobody has ever claimed is the bound's business: the watchdog leaves it alone", () => {
+		expect(scribeVerdict({ ...round, heldBy: undefined, attempts: 0, now: 1_000_000 + SCRIBE_STALL_MS * 10 })).toEqual({ action: "ok" });
 	});
 });
