@@ -85,7 +85,7 @@ tests/
   unit/coordinator-guard.test.ts 17 unit tests of the coordinator-edit guard: when a main session may be told it is doing the workers' job, when silence is the right answer, and which bash commands count as writes
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
   unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
-  unit/tools.test.ts           10 unit tests of the worker's two contracts: swarm_wait's timeout must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`) while the constitution/bootstrap states the same rule and still refuses to stop with work in flight, and a lifecycle call (renew/complete/release/fail) must drop only its OWN task's file holds instead of every reservation the caller holds
+  unit/tools.test.ts           13 unit tests of the worker's three contracts: swarm_wait's timeout must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`) while the constitution/bootstrap states the same rule and still refuses to stop with work in flight; a lifecycle call (renew/complete/release/fail) must drop only its OWN task's file holds instead of every reservation the caller holds; and swarm_wait must report only rows this agent could actually claim, so a row whose declared files another agent holds is NOT reported as work available
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -609,7 +609,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 448 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 451 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
