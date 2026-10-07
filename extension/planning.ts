@@ -725,6 +725,50 @@ export interface MergeDep {
 	dep: string;
 }
 
+/**
+ * A merged row whose capability label no configured role can reach, with the actionable reason.
+ *
+ * This is goal-14's first clause as data: the mint sites must refuse such a row instead of creating
+ * it and waiting two hours for someone to notice. Measured cause (this pool, twice): `required_capabilities`
+ * is written by every creation path with no reachability check at all, which is how task-221/222/223
+ * were minted as caps=["reviewer"] against six agents that all carry ["general"].
+ */
+export interface UnclaimableRow {
+	/** The merged deliverable's key. */
+	task: string;
+	title: string;
+	/** The capability no configured role can reach. */
+	capability: string;
+	/** What the pool CAN hold, so the proposer can route to it instead. */
+	reachable: string[];
+}
+
+/**
+ * The capability guard: which capabilities the pool's roster can actually hold.
+ *
+ * The derivation is the roster's own — `expandWorkers` over the configured roles — so a capability
+ * no role can carry is unclaimable in principle. The one thing this may NOT do is reject a goal that
+ * legitimately NAMES a capability the config does not yet have a role for: `planRoster` synthesizes
+ * a role from demand (auto.ts:112-113), so "a row asks for reviewer" and "reviewer is unreachable"
+ * are different statements. Measured on the live shape, those two differ exactly on the rows that
+ * strand: `expandWorkers` says ["general"] while `planRoster` synthesizes the reviewer it needs.
+ * The caller therefore decides what "unreachable" means; this only answers what the CONFIG can give
+ * an agent today, which is the thing an operator can change.
+ */
+export function unreachableCapabilities(requiredCapabilities: string[], reachable: Set<string>): string[] {
+	return requiredCapabilities.filter((cap) => !reachable.has(cap));
+}
+
+/**
+ * The refusal text for one unclaimable row, in the goal's own terms: tell the proposer which
+ * capability to use instead, and that adding a role is the operator's decision to make.
+ */
+export function unclaimableReason(row: UnclaimableRow): string {
+	const alternative = row.reachable.length > 0 ? row.reachable.join(", ") : "none (the roster provides no capability at all)";
+	return `"${row.title}" requires ${row.capability}, which no configured role can reach; the pool can hold ${alternative}. ` +
+		`Either name one of those capabilities, or ask the operator to add a role that carries ${row.capability} (config.roles - the operator's decision, not a worker's).`;
+}
+
 export interface MergeResult {
 	tasks: MergedTask[];
 	proposals: number;
@@ -734,6 +778,8 @@ export interface MergeResult {
 	folds: MergeFold[];
 	/** Dependency references that could not be resolved and were dropped (self/unknown title). */
 	unresolved: MergeDep[];
+	/** Rows the capability guard refuses, with the reason. Empty when the round is clean. */
+	unclaimable: UnclaimableRow[];
 	/** Proposals that carried no usable task at all. */
 	empty: number;
 }
@@ -817,8 +863,14 @@ function matchingSpelling(spellings: DeliverableShape[] | undefined, shape: Deli
  * against the same spellings, so an agent may depend on a deliverable another agent proposed under
  * different wording; a reference to an unknown or to the task's own title is dropped and reported,
  * never turned into a row of its own.
+ *
+ * `reachable` is the set of capabilities the roster can hand to an agent. When it is supplied, the
+ * merge runs goal-14's mint-time guard: every merged row whose required capability is not in that
+ * set is reported in `unclaimable` with the reason, so the caller refuses to mint it. When it is
+ * omitted the guard is off and the result is exactly what it was before — an existing caller (the
+ * store's planGoal, tests, a takeover replay) never changes behaviour by accident.
  */
-export function mergeProposals(proposals: Proposal[]): MergeResult {
+export function mergeProposals(proposals: Proposal[], reachable?: Set<string>): MergeResult {
 	const order: string[] = [];
 	const byKey = new Map<string, MergedTask>();
 	const spellingsByKey = new Map<string, DeliverableShape[]>();
@@ -828,6 +880,7 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 	const rawDeps = new Map<string, string[]>();
 	const folds: MergeFold[] = [];
 	const unresolved: MergeDep[] = [];
+	const unclaimable: UnclaimableRow[] = [];
 	let empty = 0;
 	for (const proposal of proposals) {
 		if (proposal.tasks.length === 0) {
@@ -911,12 +964,24 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 		}
 		(byKey.get(key) as MergedTask).dependsOn = deps;
 	}
+	if (reachable !== undefined) {
+		// goal-14's clause 1, at the mint site: a row the roster cannot claim is REFUSED, not minted.
+		// The row is kept in the result (so the caller can print it) and named in `unclaimable`, so
+		// the refusal is a report the proposer can act on rather than a silent drop.
+		for (const key of order) {
+			const merged = byKey.get(key) as MergedTask;
+			for (const capability of unreachableCapabilities(merged.capabilities, reachable)) {
+				unclaimable.push({ task: key, title: merged.title, capability, reachable: [...reachable] });
+			}
+		}
+	}
 	return {
 		tasks: order.map((key) => byKey.get(key) as MergedTask),
 		proposals: proposals.length,
 		folded: [...new Set(folds.map((fold) => fold.into))],
 		folds,
 		unresolved,
+		unclaimable,
 		empty,
 	};
 }

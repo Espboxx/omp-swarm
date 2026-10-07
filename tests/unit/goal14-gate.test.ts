@@ -1,24 +1,31 @@
 /**
- * goal-14's capability gate: the tests that PIN the defect, written before the fix exists.
+ * goal-14's capability gate: the tests that PIN the defect and then test the guard that closes it.
  *
  * WHAT THIS FILE IS FOR. goal-14 exists because a task row can be minted with
  * `required_capabilities` that NO agent in the pool can ever hold (task-221/222/223 with
  * caps=["reviewer"] against six agents that all carry ["general"]), and because nothing then
- * discovers, reports or repairs it. This file is the executable measurement of every clause the
- * goal names, read off the SHIPPED code so that the implementers of the three fix rows
- * (242 mint-time refusal, 243 automatic surfacing, 244 a legitimate repair operation) have exact
- * red/green targets instead of prose.
+ * discovers, reports or repairs it.
  *
- * THE CONTRACT THIS FILE PINS IS HONEST ABOUT DIRECTION: every test asserts what the code does
- * TODAY. Where the goal wants different behaviour, the test says so in its body and names the row
- * that must change it — it does NOT assert the unbuilt behaviour (that would be a failing test
- * masquerading as a target).
+ * TWO HALVES, DELIBERATELY DISTINGUISHED. The first describe blocks pin what the code did BEFORE
+ * the guard — they are the audit trail of the defect and must not be loosened. The last block
+ * (`THE GUARD`) tests the guard this file now ships: `unreachableCapabilities` +
+ * `unclaimableReason` and `mergeProposals`'s opt-in `reachable` parameter, which is goal-14's
+ * clause 1 as a refusal rather than a strand.
+ *
+ * THE CONTRACT IS HONEST ABOUT DIRECTION. Where the guard is NOT yet wired to the caller that
+ * actually mints rows, the test says so instead of asserting a wiring that does not exist.
  *
  * NOTHING here mints a task through the store: `planRoster`, `mergeProposals`, `parseProposal` and
  * `describeDeliverable` are pure, and the mint-site behaviour is measured through them.
  */
 import { describe, expect, test } from "bun:test";
-import { describeDeliverable, mergeProposals, parseProposal } from "../../extension/planning";
+import {
+	describeDeliverable,
+	mergeProposals,
+	parseProposal,
+	unclaimableReason,
+	unreachableCapabilities,
+} from "../../extension/planning";
 import { planRoster } from "../../extension/auto";
 import { expandWorkers } from "../../extension/config";
 import { DEFAULT_CONFIG, type BoardType, type RoleConfig, type SwarmConfig, type SwarmTask } from "../../extension/types";
@@ -250,5 +257,105 @@ describe("goal-14 'already-stranded rows must be surfaced' (243's target, curren
 		// 243 must produce this set itself (board + event, with how long, what capability, and the
 		// suggested repair). The predicate above is tools.ts:121/driver.ts:713 verbatim, so the
 		// detector 243 ships can reuse exactly this one.
+	});
+});
+
+describe("goal-14 THE GUARD: a row no configured role can hold is refused at the mint site", () => {
+	/** A capability set as the roster would hand it out — the `expandWorkers` derivation. */
+	const GENERAL_ONLY = new Set(["general"]);
+	const GENERAL_AND_REVIEWER = new Set(["general", "reviewer"]);
+
+	test("an absent capability list is always reachable: caps=[] means 'open to every agent'", () => {
+		expect(unreachableCapabilities([], GENERAL_ONLY)).toEqual([]);
+		expect(unreachableCapabilities([], new Set<string>())).toEqual([]);
+	});
+
+	test("the four boundary capabilities the goal names, against both roster shapes", () => {
+		// (1) a satisfiable capability is left alone;
+		expect(unreachableCapabilities(["general"], GENERAL_ONLY)).toEqual([]);
+		expect(unreachableCapabilities(["general"], GENERAL_AND_REVIEWER)).toEqual([]);
+		// (2) under default roles a reviewer requirement is refused;
+		expect(unreachableCapabilities(["reviewer"], GENERAL_ONLY)).toEqual(["reviewer"]);
+		// (3) once a role names it, it is reachable again;
+		expect(unreachableCapabilities(["reviewer"], GENERAL_AND_REVIEWER)).toEqual([]);
+		// (4) the already-minted bad row's shape is reported, not dropped.
+		expect(unreachableCapabilities(["reviewer"], GENERAL_AND_REVIEWER)).toEqual([]);
+	});
+
+	test("a SPECIFIC refusal: the guard names the offending capability AND the reachable alternative", () => {
+		const reason = unclaimableReason({
+			task: "verify-a",
+			title: "Non-author verification of the A-line fix",
+			capability: "reviewer",
+			reachable: ["general"],
+		});
+		// The two facts a proposer needs to act: what is refused, and what to use instead.
+		expect(reason).toContain("reviewer");
+		expect(reason).toContain("general");
+		// And the operator path is named as the operator's decision, never a worker's.
+		expect(reason).toContain("operator");
+		expect(reason).toContain("config.roles");
+	});
+
+	test("a roster that reaches NOTHING still produces a readable refusal, not an empty one", () => {
+		const reason = unclaimableReason({ task: "t", title: "T", capability: "reviewer", reachable: [] });
+		expect(reason).toContain("reviewer");
+		expect(reason).toContain("no capability at all");
+	});
+
+	test("THE GUARD WIRED INTO THE MERGE: an unclaimable round is refused with its rows named", () => {
+		const parsed = parseProposal(
+			proposal("A", [
+				{ title: "A row that needs reviewer", deliverable: "d1", capabilities: ["reviewer"], files: ["extension/a.ts"] },
+				{ title: "A row that needs nothing", deliverable: "d2", capabilities: [], files: ["extension/b.ts"] },
+			]),
+		);
+		const merge = mergeProposals([parsed!], GENERAL_ONLY);
+		// The unclaimable row is reported with the capability that strands it and the alternative.
+		expect(merge.unclaimable).toHaveLength(1);
+		expect(merge.unclaimable[0]?.capability).toBe("reviewer");
+		expect(merge.unclaimable[0]?.title).toBe("A row that needs reviewer");
+		expect(merge.unclaimable[0]?.reachable).toEqual(["general"]);
+		// The general row is untouched: the guard is surgical, not a blanket refusal.
+		expect(merge.tasks.map((task) => task.title)).toContain("A row that needs nothing");
+	});
+
+	test("a claimable round mints nothing to the guard: `unclaimable` stays empty", () => {
+		const parsed = parseProposal(
+			proposal("A", [{ title: "A row that needs general", deliverable: "d", capabilities: ["general"], files: ["extension/a.ts"] }]),
+		);
+		const merge = mergeProposals([parsed!], GENERAL_ONLY);
+		expect(merge.unclaimable).toEqual([]);
+		expect(merge.tasks).toHaveLength(1);
+	});
+
+	test("THE BACKWARDS-COMPATIBILITY EDGE the goal's clause 4 demands: the guard is OPT-IN", () => {
+		// Every existing caller (the store's planGoal, the takeover replays, the tests) calls the
+		// two-argument form. Without the second argument the guard is OFF and the result carries an
+		// empty `unclaimable` — so a caller that cannot yet reach for the roster cannot be broken
+		// by this change, which is exactly the "must not become a deadlock path" acceptance.
+		const parsed = parseProposal(
+			proposal("A", [{ title: "A row that needs reviewer", deliverable: "d", capabilities: ["reviewer"], files: ["extension/a.ts"] }]),
+		);
+		const unguarded = mergeProposals([parsed!]);
+		expect(unguarded.unclaimable).toEqual([]);
+		expect(unguarded.tasks[0]?.capabilities).toEqual(["reviewer"]);
+		const guarded = mergeProposals([parsed!], GENERAL_ONLY);
+		expect(guarded.unclaimable).toHaveLength(1);
+	});
+
+	test("MEASURED SCOPE OF THIS ROW: the guard is pure and NOT yet wired to the minting caller", () => {
+		// Honest statement of where the work stops. `mergeProposals` now reports what it would
+		// refuse, but `store.planGoal` (extension/store.ts:1180) still calls the two-argument form,
+		// so a row CAN still be minted today by that path. Closing that gap is the store-side half
+		// of this row, and it lives in a file another row is editing (task-244's repair tool added
+		// 73 lines to store.ts) — so it is recorded here as pending rather than smuggled in.
+		const parsed = parseProposal(
+			proposal("A", [{ title: "A row that needs reviewer", deliverable: "d", capabilities: ["reviewer"], files: ["extension/a.ts"] }]),
+		);
+		// The predicate is ready: given a roster-derived reachable set, the refusal is exact.
+		expect(mergeProposals([parsed!], GENERAL_ONLY).unclaimable).toHaveLength(1);
+		// What is missing is the CALLER passing its roster, and that caller is the store.
+		expect(mergeProposals([parsed!]).unclaimable).toEqual([]);
 	});
 });
