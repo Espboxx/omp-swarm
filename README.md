@@ -28,7 +28,7 @@ and ownership conflicts are settled by the database, never by agent etiquette.
 |---|---|---|
 | Agent runtime | `pi.pi.createAgentSession` (SDK) | each worker is a real OMP `AgentSession` in-process, own model, own session file, own `AgentRegistry` |
 | Sessions | `SessionManager.create(cwd, dir)` | per-worker transcripts under `.swarm/sessions/<name>/` |
-| Tool API | `CustomTool` / `createAgentSession({ customTools })` | the 22 swarm tools are injected into worker sessions |
+| Tool API | `CustomTool` / `createAgentSession({ customTools })` | the 23 swarm tools are injected into worker sessions |
 | Restricted tool sets | `toolNames` + `restrictToolNames` + `allowRestrictedCustomTools` | workers get coding tools + swarm tools, nothing else |
 | System prompt layering | `appendSystemPrompt` | the worker constitution is appended, not replacing OMP's prompt |
 | Subagent observability | `session.subscribe()` (`agent_start` / `agent_end.isTerminal`) | idle detection for tick delivery |
