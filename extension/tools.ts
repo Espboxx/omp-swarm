@@ -2,6 +2,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import type * as zod from "@oh-my-pi/omptype/zod";
+import { boardDuplicateVerdict, type BoardDuplicateVerdict } from "./board";
 import { renderAgents, renderBoard, renderInbox, renderTaskDetail, renderTasks } from "./render";
 import { poolFloor } from "./scaling";
 import { patternsConflict, type SwarmStore } from "./store";
@@ -676,6 +677,20 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
+/**
+ * The line appended to a successful post when its failure class is already on the board.
+ *
+ * `""` for a first report — the common case, and the text must stay exactly what it was so an
+ * unremarkable post is unremarkable. A repeat is named with its own history, and an ANSWERED repeat
+ * is told apart from an open one, because "already reported 3x and a DECISION answered it" and
+ * "already reported 3x and nothing has" are different findings. It is a NOTICE and never a refusal:
+ * the entry is posted either way, because the board is append-only.
+ */
+function duplicateWarning(verdict: BoardDuplicateVerdict): string {
+	if (!verdict.known) return "";
+	return `\nDUPLICATE CLASS: ${verdict.reason}`;
+}
+
 	const postSchema = z.object({
 		type: z.string(),
 		content: z.string(),
@@ -693,6 +708,12 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		async execute(_id, params) {
 			touch();
 			if (!isBoardType(params.type)) return ok(`unknown board type ${params.type}; expected FACT|FAIL|OBSERVATION|CLAIM|RESULT|QUESTION|REVIEW|DECISION`);
+			// goal-15's R1: the board now REMEMBERS. Before the write, ask the class index whether this
+			// failure class is already on the board and whether a DECISION has answered it. The entry is
+			// posted either way — the board is append-only and silently dropping an entry would be a
+			// worse defect than a repeat — but the poster is TOLD, on the path every agent already
+			// takes, so "the same failure a third time" stops being invisible to the person making it.
+			const prior = boardDuplicateVerdict(store.searchBoard({ type: undefined, limit: 10_000 }), { tags: params.tags });
 			const entry = store.postBoard({
 				type: params.type,
 				agentId: identity.id,
@@ -701,7 +722,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 				tags: params.tags,
 				files: params.files,
 			});
-			return ok(`posted #${entry.id} ${entry.type}`, { id: entry.id, type: entry.type });
+			return ok(`posted #${entry.id} ${entry.type}${duplicateWarning(prior)}`, { id: entry.id, type: entry.type, duplicate: prior });
 		},
 	};
 

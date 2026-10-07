@@ -172,15 +172,18 @@ export function boardDuplicateVerdict(
 		};
 	}
 	const remedy = prior.find((entry) => entry.type === "DECISION");
+	// Oldest first: `searchBoard` returns newest-first, and a history reads forward. A notice that
+	// said "reported 2x (#2, #1)" would read as a countdown to nothing.
+	const ordered = [...prior].sort((a, b) => a.id - b.id);
 	return {
 		key,
 		known: true,
 		priorCount: prior.length,
-		priorEntryIds: prior.map((entry) => entry.id),
+		priorEntryIds: ordered.map((entry) => entry.id),
 		remedied: remedy !== undefined,
 		reason:
 			remedy === undefined
-				? `class "${key}" is already reported ${prior.length}x (#${prior.map((entry) => entry.id).join(", #")}) and is NOT yet answered by a DECISION`
-				: `class "${key}" is already reported ${prior.length}x (#${prior.map((entry) => entry.id).join(", #")}) and answered by DECISION #${remedy.id}`,
+				? `class "${key}" is already reported ${prior.length}x (#${ordered.map((entry) => entry.id).join(", #")}) and is NOT yet answered by a DECISION`
+				: `class "${key}" is already reported ${prior.length}x (#${ordered.map((entry) => entry.id).join(", #")}) and answered by DECISION #${remedy.id}`,
 	};
 }
