@@ -246,7 +246,8 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 	const failTool: CustomTool<typeof failSchema> = {
 		name: "swarm_fail",
 		label: "Fail Task",
-		description: "Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end.",
+		description:
+			"Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end. Also closes a task you do NOT hold when nobody holds it and a dependency of it can never reach done (a `failed`/missing/cyclic dependency) — permanently-blocked residue has no other exit, since the pool has no delete or archive.",
 		parameters: failSchema,
 		approval: "write",
 		async execute(_id, params) {
@@ -347,7 +348,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_task_retry",
 		label: "Retry Task",
 		description:
-			"Revive a `failed` or `blocked` task back into the pool as ready (fresh attempt, claim cleared) so its dependents can be promoted once it completes. Refuses a task that is claimed, in review, or done.",
+			"Revive a `failed` or `blocked` task (fresh attempt, claim cleared) so its dependents can be promoted once it completes. A task whose own dependencies are unresolved stays `blocked` — it is never left in `ready` where `claim()` would refuse it forever. Refuses a task that is claimed, in review, or done.",
 		parameters: retrySchema,
 		approval: "write",
 		async execute(_id, params) {
@@ -356,9 +357,15 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			onChange?.();
 			if (!result.ok) return err(`retry refused: ${result.reason}`, { retried: false });
 			const pending = store.unresolvedDependencies(params.task_id);
+			const dead = store.deadDependencies(params.task_id);
 			const note =
-				pending.length > 0 ? `; still waiting on ${pending.join(", ")} — a claim will be refused until they are done` : "";
-			return ok(`${params.task_id} -> ready (attempt ${result.task?.attempts ?? 0})${note}`, { retried: true, task: result.task });
+				pending.length === 0
+					? ""
+					: dead.length > 0
+						? `; still blocked: ${dead.join(", ")} can never reach done, so a claim will always be refused — close it with swarm_fail if it is superseded`
+						: `; still blocked by ${pending.join(", ")} — a claim is refused until they are done`;
+			const state = result.task?.status ?? "ready";
+			return ok(`${params.task_id} -> ${state} (attempt ${result.task?.attempts ?? 0})${note}`, { retried: true, task: result.task });
 		},
 	};
 

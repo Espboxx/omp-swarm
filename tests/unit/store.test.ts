@@ -255,18 +255,110 @@ describe("dependencies", () => {
 		store.close();
 	});
 
-	test("retryTask revives a blocked task and refuses a task that is neither failed nor blocked", () => {
+	test("retryTask revives a blocked task only when it becomes claimable, and refuses a task that is neither failed nor blocked", () => {
 		const { store } = makeRoot();
 		const a = store.createTask({ title: "A", createdBy: "boot" });
 		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		// `a` is merely unfinished, so reviving `b` must not manufacture a `ready` row nobody can claim
 		const revived = store.retryTask(b.id, "dependency was a mistake");
 		expect(revived.ok).toBe(true);
-		expect(revived.task?.status).toBe("ready");
+		expect(revived.task?.status).toBe("blocked");
+		expect(store.claim(b.id, "B", 300).ok).toBe(false);
+
+		// the block is not a dead end: the sweep promotes `b` the moment `a` completes
+		store.claim(a.id, "A", 300);
+		store.complete(a.id, "A", { summary: "done" });
+		expect(store.getTask(b.id)?.status).toBe("ready");
 
 		const refused = store.retryTask(a.id, "not broken");
 		expect(refused.ok).toBe(false);
 		expect(refused.reason).toContain("not failed or blocked");
 		expect(store.retryTask("task-99").reason).toContain("unknown task");
+		store.close();
+	});
+});
+
+describe("closing dead residue", () => {
+	test("an unowned task whose dependency was closed as failed can be closed by a non-holder", () => {
+		const { store } = makeRoot();
+		const a = store.createTask({ title: "A", createdBy: "boot" });
+		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		store.claim(a.id, "A", 300);
+		store.fail(a.id, "A", "superseded by a rollback");
+		// b can never be claimed, so nobody can ever hold it; B is not its owner either
+		expect(store.claim(b.id, "B", 300).reason).toContain(`dependencies: ${a.id}`);
+
+		const closed = store.fail(b.id, "B", "CLOSED AS SUPERSEDED - panel-era residue; no work executed");
+		expect(closed.ok).toBe(true);
+		expect(store.getTask(b.id)?.status).toBe("failed");
+		expect(store.getTask(b.id)?.claimedBy).toBeUndefined();
+		const entry = store.searchBoard({ type: "FAIL", taskId: b.id })[0];
+		expect(entry?.agentId).toBe("B");
+		expect(entry?.content).toContain("no work executed");
+		store.close();
+	});
+
+	test("a legacy ready row nobody can claim can be closed", () => {
+		const { store, paths } = makeRoot();
+		const a = store.createTask({ title: "A", createdBy: "boot" });
+		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		store.claim(a.id, "A", 300);
+		store.fail(a.id, "A", "superseded by a rollback");
+		// what the old retryTask left behind, and what task-23 carries in the live pool:
+		// ready, unowned, and refused by claim() forever
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET status='ready' WHERE id=?", b.id);
+		raw.close();
+		expect(store.claim(b.id, "B", 300).reason).toContain(`dependencies: ${a.id}`);
+
+		expect(store.fail(b.id, "B", "CLOSED AS SUPERSEDED").ok).toBe(true);
+		expect(store.getTask(b.id)?.status).toBe("failed");
+		store.close();
+	});
+
+	test("a dependency that is merely unfinished, or already done, never makes the dependent closable", () => {
+		const { store } = makeRoot();
+		const a = store.createTask({ title: "A", createdBy: "boot" });
+		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		const stillOpen = store.fail(b.id, "B", "nope");
+		expect(stillOpen.ok).toBe(false);
+		expect(stillOpen.reason).toContain("is blocked");
+
+		// in flight is no better: `a` may still finish, so `b` is not residue
+		store.claim(a.id, "A", 300);
+		expect(store.fail(b.id, "B", "nope").ok).toBe(false);
+
+		store.complete(a.id, "A", { summary: "done" });
+		expect(store.getTask(b.id)?.status).toBe("ready");
+		expect(store.fail(b.id, "B", "nope").ok).toBe(false);
+		expect(store.getTask(b.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a resumable block is not residue: an unfinished dependency keeps it out of reach of fail", () => {
+		const { store } = makeRoot();
+		const blocked = store.createTask({ title: "resumable", createdBy: "boot" });
+		const dependent = store.createTask({ title: "later", createdBy: "boot", dependencies: [blocked.id] });
+		expect(store.blockedReason(dependent.id)).toBe("waiting");
+		expect(store.deadDependencies(dependent.id)).toEqual([]);
+
+		store.claim(blocked.id, "A", 300);
+		expect(store.deadDependencies(dependent.id)).toEqual([]);
+		store.close();
+	});
+
+	test("closing a residue row leaves the caller's own held work alone", () => {
+		const { store } = makeRoot();
+		const a = store.createTask({ title: "A", createdBy: "boot" });
+		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		store.claim(a.id, "A", 300);
+		store.fail(a.id, "A", "superseded by a rollback");
+
+		const mine = store.createTask({ title: "mine", createdBy: "boot" });
+		store.claim(mine.id, "B", 300);
+		expect(store.fail(b.id, "B", "CLOSED AS SUPERSEDED").ok).toBe(true);
+		expect(store.getTask(mine.id)?.status).toBe("claimed");
+		expect(store.getTask(mine.id)?.claimedBy).toBe("B");
 		store.close();
 	});
 });

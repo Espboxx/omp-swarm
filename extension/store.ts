@@ -418,6 +418,22 @@ export class SwarmStore {
 	}
 
 	/**
+	 * Dependencies of `id` that can never reach `done`, so no `sweep()` will ever promote it:
+	 * an id that does not exist (legacy row), a dependency closed as `failed`, or one caught in
+	 * a dependency cycle. Strictly stronger than `unresolvedDependencies`, which also counts a
+	 * dependency that is merely still running — that one may still finish, these cannot, so a
+	 * task carrying one is permanently unclaimable and `fail()` may close it.
+	 */
+	deadDependencies(id: string): string[] {
+		const edges = this.#edges();
+		return this.#deps(id).filter((dep) => {
+			const row = this.#db.get<{ status: TaskStatus }>("SELECT status FROM tasks WHERE id=?", dep);
+			if (row === null || row.status === "failed") return true;
+			return findCycle(edges, dep) !== undefined;
+		});
+	}
+
+	/**
 	 * Open tasks (ready/claimed/blocked/review) whose `files` list shares a path with the given
 	 * one. Exact path matching only: this exists to expose a possible second writer at publish
 	 * time, not to judge whether two tasks are the same work.
@@ -633,7 +649,15 @@ export class SwarmStore {
 		const result = this.#db.transaction(() => {
 			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
 			if (row === null) return { ok: false, reason: `unknown task ${taskId}` };
-			if (row.status !== "claimed" || row.claimed_by !== agentId) {
+			const held = row.status === "claimed" && row.claimed_by === agentId;
+			// A task nobody holds and that sits outside every route to `done` may still be closed:
+			// that is the only exit the pool offers for permanently-blocked residue (there is no
+			// delete or archive), and a `retryTask` on such a row can leave it unclaimable in `ready`.
+			// Everything else belongs to its holder.
+			const dead = this.deadDependencies(taskId);
+			const closable =
+				row.claimed_by === null && (row.status === "blocked" || row.status === "ready") && dead.length > 0;
+			if (!held && !closable) {
 				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}` };
 			}
 			this.#db.run(
@@ -642,8 +666,10 @@ export class SwarmStore {
 				now,
 				taskId,
 			);
-			this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
-			this.#log("task.fail", agentId, taskId, { reason });
+			// Only the holder goes idle: closing someone else's dead residue must not clear the
+			// caller's own current_task.
+			if (held) this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
+			this.#log("task.fail", agentId, taskId, { reason, closed: !held, deadDependencies: dead });
 			return { ok: true, task: this.getTask(taskId) };
 		});
 		if (result.ok) this.postBoard({ type: "FAIL", agentId, taskId, content: reason, tags: ["failure"] });
@@ -651,10 +677,13 @@ export class SwarmStore {
 	}
 
 	/**
-	 * Revive a `failed` or `blocked` task: it returns to the pool as `ready` with a
-	 * fresh attempt recorded, so a dead end is not permanent — dependents of a failed
-	 * task are promoted by the usual `sweep()` once it completes. Refuses any other
-	 * status (a claimed/done task is owned by someone, or already finished).
+	 * Revive a `failed` or `blocked` task: the failed status is cleared and a fresh attempt
+	 * recorded, so a dead end is not permanent — dependents of a failed task are promoted by
+	 * the usual `sweep()` once it completes. A task whose own dependencies are still unresolved
+	 * stays `blocked`: a `ready` row nobody can claim is worse than an honest `blocked` one —
+	 * it counts as actionable (so it hides the stall notice and grows the roster) while `claim()`
+	 * refuses it forever when the dependency is `failed`. Refuses any other status (a claimed/done
+	 * task is owned by someone, or already finished).
 	 */
 	retryTask(taskId: string, reason?: string, agentId?: string): { ok: boolean; task?: SwarmTask; reason?: string } {
 		const now = Date.now();
@@ -664,14 +693,16 @@ export class SwarmStore {
 			if (row.status !== "failed" && row.status !== "blocked") {
 				return { ok: false, reason: `task ${taskId} is ${row.status}, not failed or blocked` };
 			}
+			const claimable = this.unresolvedDependencies(taskId).length === 0;
 			this.#db.run(
-				`UPDATE tasks SET status='ready', claimed_by=NULL, claimed_at=NULL, lease_until=NULL,
+				`UPDATE tasks SET status=?, claimed_by=NULL, claimed_at=NULL, lease_until=NULL,
 				   attempts=attempts+1, updated_at=?
 				 WHERE id=?`,
+				claimable ? "ready" : "blocked",
 				now,
 				taskId,
 			);
-			this.#log("task.retry", agentId, taskId, { from: row.status, reason });
+			this.#log("task.retry", agentId, taskId, { from: row.status, reason, claimable });
 			return { ok: true, task: this.getTask(taskId) };
 		});
 	}
