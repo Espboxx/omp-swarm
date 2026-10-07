@@ -90,8 +90,13 @@ const STOPWORDS: Record<string, true> = {
 	out: true, about: true, per: true, via: true,
 };
 
-/** A file-name-ish token inside a title, used only when a proposal declares no `files`. */
-const ARTIFACT_IN_TITLE = /[A-Za-z0-9_@][A-Za-z0-9_@./\\-]*\.[A-Za-z0-9]{1,8}/g;
+/**
+ * A file-name-ish token inside a title, used only when a proposal declares no `files`. The final
+ * segment must look like an EXTENSION (letters first), which is what stops a version or a dotted
+ * number (`1.2.3`, `v2.0.0`) from being read as an artifact - two write-intent proposals sharing one
+ * of those would otherwise merge and silently swallow a deliverable.
+ */
+const ARTIFACT_IN_TITLE = /[A-Za-z0-9_@][A-Za-z0-9_@./\\-]*\.[A-Za-z][A-Za-z0-9]{0,7}/g;
 
 /** How close two non-writer wordings of one artifact must be to count as the same deliverable. */
 export const SAME_DELIVERABLE_SIMILARITY = 0.6;

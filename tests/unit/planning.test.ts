@@ -376,4 +376,21 @@ describe("the deliverable key: a rephrasing is the same task, a different delive
 		expect(merged.tasks[0]?.title).toBe("Write NOTES.md");
 		expect(merged.tasks[0]?.agents).toEqual(["A", "B"]);
 	});
+
+	test("a dotted version token is not an artifact, so two release-shaped deliverables never merge", () => {
+		expect(describeDeliverable("Add support for 1.2.3").artifacts).toEqual([]);
+		expect(describeDeliverable("Implement v2.0.0 upgrade guide").artifacts).toEqual([]);
+		expect(isSameDeliverable(describeDeliverable("Add support for 1.2.3"), describeDeliverable("Create notes for 1.2.3"))).toBe(false);
+		expect(
+			isSameDeliverable(describeDeliverable("Implement v2.0.0 upgrade guide"), describeDeliverable("Write the v2.0.0 changelog")),
+		).toBe(false);
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Add support for 1.2.3" }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Create notes for 1.2.3" }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+		// …while a real file name in the same position is still an artifact.
+		expect(describeDeliverable("Add support for NOTES.md").artifacts).toEqual(["notes.md"]);
+		expect(describeDeliverable("Ship src/parser.ts").artifacts).toEqual(["src/parser.ts"]);
+	});
 });
