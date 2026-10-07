@@ -38,12 +38,44 @@ export function decideCoordinatorEdit(input: CoordinatorEditInput): CoordinatorE
 }
 
 /**
- * Whether a `bash` command can change the repository. Deliberately a CONSERVATIVE list of literal
- * mutations (redirection, in-place editors, file commands, package installs, git state changes) rather
- * than an attempt to parse shell: a missed case costs one notice, a false positive costs noise in a
- * session that was only reading, so the list errs towards silence.
+ * Whether a `bash` command can change the repository.
+ *
+ * A literal list of mutations, not a shell parser. Two rules keep it from firing on a session that is
+ * only READING: quoted literals are stripped first (a search that merely MENTIONS a verb — `rg -n "rm
+ * -rf" docs/` — is not a mutation), and the verb tests are anchored at a COMMAND POSITION (the start of
+ * the command, or of a `;`/`&&`/`||`/`|`/newline-separated segment), so `grep -n rm file` stays silent.
+ * A redirection is a write wherever it appears once quotes are gone (`echo hi > f`), while `2>&1`
+ * plumbing is not.
+ *
+ * The residual is deliberate and one-sided: a mutation hidden behind a string or a script
+ * (`sh -c "rm -rf x"`, `bash build.sh`) is NOT detected, so the bias is towards silence — a missed
+ * mutation costs one notice that never fires, a false positive costs noise in a session that was
+ * only reading.
  */
-const BASH_MUTATION = /(^|[^<])>{1,2}[^&|]|\btee\b|\bsed\s+-i\b|\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\btruncate\b|\bdd\b|\bchmod\b|\bSet-Content\b|\bOut-File\b|\bNew-Item\b|\bRemove-Item\b|\bCopy-Item\b|\bMove-Item\b|\bgit\s+(apply|checkout|commit|add|restore|reset|stash|clean|merge|rebase)\b|\b(npm|bun|yarn|pnpm)\s+(i|install|add|remove|uninstall)\b|\bpip\s+install\b/i;
+const BASH_SEPARATORS = /;|&&|\|\||\||\n/;
+/** Wrappers and leading `VAR=value` assignments that may precede the command word. */
+const BASH_LEADING = /^(?:(?:sudo|command|env|nohup|time)\s+|\w+=\S*\s+)+/i;
+const BASH_MUTATION_VERBS = /^(?:rm|rmdir|mv|cp|mkdir|touch|truncate|dd|chmod|chown|ln|tee|patch|rename|sed\s+-i|perl\s+-i)\b/i;
+const BASH_GIT = /^git\s+(?:apply|checkout|commit|add|restore|reset|stash|clean|merge|rebase|switch|rm|mv|init|pull)\b/i;
+const BASH_PACKAGES = /^(?:npm|bun|yarn|pnpm)\s+(?:i|install|add|remove|uninstall|upgrade|update)\b|^pip\s+install\b/i;
+const BASH_POWERSHELL = /^(?:set-content|out-file|new-item|remove-item|copy-item|move-item|rename-item|add-content|clear-content)\b/i;
+/** A real redirection: `>`/`>>` that is not the plumbing of `2>&1`-style redirection (quotes are gone). */
+const BASH_REDIRECT = /(^|[^<>&])>>?(?!&)/;
+
+/** Remove quoted literals so a search PATTERN cannot be read as a command or invent a separator. */
+function withoutQuotedLiterals(command: string): string {
+	return command.replace(/"[^"]*"|'[^']*'/g, '""');
+}
+
+/** Whether one command segment (already split and de-quoted) mutates files. */
+function segmentMutates(segment: string): boolean {
+	const clean = segment.replace(BASH_LEADING, "").trim();
+	if (clean === "") return false;
+	if (BASH_REDIRECT.test(clean)) return true;
+	return (
+		BASH_MUTATION_VERBS.test(clean) || BASH_GIT.test(clean) || BASH_PACKAGES.test(clean) || BASH_POWERSHELL.test(clean)
+	);
+}
 
 /** Tools that write by definition; everything else is judged by its arguments (only `bash` has any). */
 const WRITING_TOOLS: Record<string, true> = { edit: true, write: true, ast_edit: true };
@@ -53,7 +85,8 @@ export function mutatesFiles(toolName: string, args: unknown): boolean {
 	if (toolName !== "bash") return false;
 	if (args === null || typeof args !== "object" || !("command" in args)) return false;
 	const command = args.command;
-	return typeof command === "string" && BASH_MUTATION.test(command);
+	if (typeof command !== "string") return false;
+	return withoutQuotedLiterals(command).split(BASH_SEPARATORS).some(segmentMutates);
 }
 
 /** The reminder itself, on the surfaces the swarm already uses (`[swarm]` + a warning-level notice). */

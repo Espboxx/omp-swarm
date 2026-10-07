@@ -92,4 +92,50 @@ describe("mutatesFiles", () => {
 		expect(mutatesFiles("bash", {})).toBe(false);
 		expect(mutatesFiles("bash", { command: 42 })).toBe(false);
 	});
+
+	test("a READ-ONLY search that merely mentions a mutation verb stays silent", () => {
+		for (const command of [
+			'rg -n "rm -rf" docs/',
+			'grep -rn "mkdir" README.md',
+			"rg -n rm docs/",
+			'rg -n "Out-File" .',
+			'rg -n "git commit" scratch/',
+			"git log --grep=rm",
+		]) {
+			expect(`${command} -> ${mutatesFiles("bash", { command })}`).toBe(`${command} -> false`);
+		}
+	});
+
+	test("a mutation at a COMMAND POSITION still counts, even behind a wrapper or an assignment", () => {
+		for (const command of [
+			"rm -rf scratch/tmp",
+			"mkdir -p out",
+			"sudo rm -rf x",
+			"FOO=1 rm x",
+			"a && git commit -m x",
+			"rg -n foo src; mkdir out",
+			"echo done || touch marker",
+			"Remove-Item -Recurse -Force x",
+			"pip install requests",
+		]) {
+			expect(`${command} -> ${mutatesFiles("bash", { command })}`).toBe(`${command} -> true`);
+		}
+	});
+
+	test("redirection plumbing is not a write, a real redirection is", () => {
+		for (const command of ["some-cmd 2>&1", "rg -n foo src | head -5", "bun test 2>&1 | tail -3"]) {
+			expect(`${command} -> ${mutatesFiles("bash", { command })}`).toBe(`${command} -> false`);
+		}
+		for (const command of ["echo hi > out.txt", "cat a >> b", "printf x 2> /dev/null"]) {
+			expect(`${command} -> ${mutatesFiles("bash", { command })}`).toBe(`${command} -> true`);
+		}
+	});
+
+	test("the documented residual: a mutation hidden behind a shell string is not detected", () => {
+		// Deliberate, and stated in the code comment: the bias is towards silence, so this costs a
+		// notice that never fires rather than noise in a session that was only reading.
+		for (const command of ['sh -c "rm -rf x"', "bash build.sh"]) {
+			expect(`${command} -> ${mutatesFiles("bash", { command })}`).toBe(`${command} -> false`);
+		}
+	});
 });
