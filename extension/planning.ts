@@ -514,8 +514,6 @@ export function describeDeliverable(title: string, files: string[] = [], deliver
  * pair on evidence that is nearly unambiguous.
  */
 export function sameDeliverableReason(left: DeliverableShape, right: DeliverableShape): string | undefined {
-	// Two KNOWN kinds that differ are two deliverables; an unknown kind contradicts nothing.
-	if (left.intent !== right.intent && left.intent !== "other" && right.intent !== "other") return undefined;
 	// ONE ARTIFACT HAS ONE OWNER, and the test is INTERSECTION: two rows that would both MUTATE one file
 	// are one deliverable, whatever their kinds are and whatever else each of them declares. Both editing
 	// that file is the collision the rule exists to prevent, and the extra files are not lost - the union
@@ -523,12 +521,34 @@ export function sameDeliverableReason(left: DeliverableShape, right: Deliverable
 	// only on the coverage relation below (which demands that every file of the smaller side match), is why
 	// the goal-9 round still minted THREE writers on extension/store.ts: those rows share that one file and
 	// nothing else (D1).
+	//
+	// THIS CLAUSE SITS ABOVE THE KIND GUARD ON PURPOSE. The guard below refuses two KNOWN kinds that differ;
+	// a `fix` and a `refactor` on one file are exactly that, so with the guard first they never reached this
+	// clause and the round kept two writers for one artifact - the same defect one level up (task-212's own
+	// acceptance, measured: "the owner clause must cover every mutating kind").
 	if (MUTATING_KINDS[left.intent] && MUTATING_KINDS[right.intent]) {
 		const shared = sharedArtifact(left.artifacts, right.artifacts);
 		if (shared !== undefined) return `one artifact has one owner: ${shared}`;
 	}
+	// Two KNOWN kinds that differ are two deliverables; an unknown kind contradicts nothing.
+	if (left.intent !== right.intent && left.intent !== "other" && right.intent !== "other") return undefined;
 	const artifact = artifactsRelation(left.artifacts, right.artifacts);
 	if (artifact !== undefined) {
+		// An UNKNOWN kind never pairs with a VERIFICATION on a SOURCE artifact. The unknown side may be a
+		// writer whose verb the classifier does not know (`Wire ...` reads as `other`), and folding it into
+		// a verification - or the verification into it - is the one merge this rule must never make: a
+		// verifier that owns the source it verifies is no longer an independent verification (D2). The
+		// direction of doubt is the rule's usual one: a visible duplicate row beats a swallowed deliverable.
+		// EVIDENCE artifacts are exempt ON PURPOSE: two verifications of one deliverable declare their own
+		// reports, and a recognized one pairing with an unrecognized spelling of itself is exactly what the
+		// recorded goal-5 round needs to stay at five deliverables (pinned by that round's own tests).
+		const sharesSourceArtifact = left.artifacts.some((a) =>
+			right.artifacts.some((b) => sameArtifact(a, b) && !isEvidenceWorkspace(a) && !isEvidenceWorkspace(b)),
+		);
+		const otherVsVerification =
+			(left.intent === "other" && (right.intent === "verify" || right.intent === "document")) ||
+			(right.intent === "other" && (left.intent === "verify" || left.intent === "document"));
+		if (otherVsVerification && sharesSourceArtifact) return undefined;
 		// A `write` still claims the artifact from an unknown-kind twin, which is what pairs a Chinese row
 		// with its English one; everything else on one artifact is decided by the evidence below.
 		if (left.intent === "write" || right.intent === "write") return `one artifact has one owner: ${artifact.detail}`;

@@ -801,4 +801,48 @@ describe("task-212: one artifact has one owner, and a writer never folds into a 
 			expect(verifier.files.filter((file) => file.startsWith("omp-swarm/extension/"))).toEqual([]);
 		}
 	});
+
+	test("the owner clause folds two DIFFERENT mutating kinds on one artifact (fix vs refactor)", () => {
+		// The kind guard used to sit ABOVE the owner clause, so a `fix` and a `refactor` on one file — two
+		// KNOWN kinds that differ — answered "two deliverables" before the clause was ever consulted, and a
+		// round kept two writers for one artifact. The clause's own text says "whatever their kinds are",
+		// and DEDUPE_KEY_TEXT promises one owner; this is the same defect as the literal-`write` one, one
+		// level up (task-212's acceptance, measured by the reviewer).
+		const fixing = describeDeliverable("Fix the retry bug in src/limiter.ts", ["src/limiter.ts"]);
+		const refactoring = describeDeliverable("Refactor the token bucket in src/limiter.ts", ["src/limiter.ts"]);
+		expect([fixing.intent, refactoring.intent]).toEqual(["fix", "refactor"]);
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix the retry bug in src/limiter.ts", files: ["src/limiter.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Refactor the token bucket in src/limiter.ts", files: ["src/limiter.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.folds.map((fold) => fold.reason)).toEqual(["one artifact has one owner: src/limiter.ts"]);
+	});
+
+	test("an unknown-kind row never folds with a verification of the same artifact", () => {
+		// The second half of the reviewer's counterexample: `Wire ...` reads as `other`, and an unknown kind
+		// contradicts nothing, so the artifact route happily folded it into (or out of) a verification of the
+		// same file — the writer swallowed by a verifier, the one merge this rule must never make.
+		const writer = describeDeliverable("Wire the ticket gate into src/tools.ts", ["src/tools.ts"]);
+		const verifier = describeDeliverable("Verify the ticket gate in src/tools.ts", ["src/tools.ts"]);
+		expect([writer.intent, verifier.intent]).toEqual(["other", "verify"]);
+		expect(sameDeliverableReason(verifier, writer)).toBeUndefined();
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Wire the ticket gate into src/tools.ts", files: ["src/tools.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Verify the ticket gate in src/tools.ts", files: ["src/tools.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+	});
+
+	test("an unknown-kind row on a shared artifact still splits from a mutating row (deliberate)", () => {
+		// PINNED ON PURPOSE, so nobody "fixes" it later: the classifier cannot tell an unknown-kind WRITER
+		// from an unknown-kind verification, and folding them would swallow a deliverable whenever it
+		// guessed writer and meant verifier. The rule splits instead — one visible duplicate row, which is
+		// the direction it takes every time the evidence is ambiguous. Widening the verb families is the way
+		// to close this, not a blanket "other means writer".
+		const unknown = describeDeliverable("Wire the ticket gate into src/tools.ts", ["src/tools.ts"]);
+		const mutating = describeDeliverable("Fix the roster growth gate in src/tools.ts", ["src/tools.ts"]);
+		expect([unknown.intent, mutating.intent]).toEqual(["other", "fix"]);
+		expect(sameDeliverableReason(unknown, mutating)).toBeUndefined();
+	});
 });
