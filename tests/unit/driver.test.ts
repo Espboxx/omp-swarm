@@ -1,8 +1,9 @@
 /**
- * The idle edge of the driver: an agent with nothing claimable is woken by a CHANGE in the pool state,
- * never by the clock. The operator's report — "多代理已创建、后台代理没有任务时一直烧 token" — is one
- * full model call per idle window per worker, so "model calls" is what this file measures: the faked
- * session records every prompt the driver issues, and nothing is inferred.
+ * The two no-change wake edges of the driver: an agent is woken by a CHANGE in the pool state, never by
+ * the clock, and never twice for the same unchanged rows. The operator's report — "多代理已创建、后台代理
+ * 没有任务时一直烧 token" — is one full model call per idle window per worker, and the ready/review branch
+ * added a second one per turn, so "model calls" is what this file measures: the faked session records
+ * every prompt the driver issues, and nothing is inferred.
  *
  * No host, no real sessions, no wall clock: the timers are captured instead of scheduled and the tick is
  * invoked by hand, so a tick is a function call and the counters are exact.
@@ -12,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { openInMemoryDatabase, swarmPaths } from "../../extension/db";
-import { IDLE_PARK_AFTER, SwarmDriver, idleWake, type IdleWakeState, type TimerApi } from "../../extension/driver";
+import { IDLE_PARK_AFTER, SwarmDriver, idleWake, stalledWake, type IdleWakeState, type TimerApi } from "../../extension/driver";
 import { SwarmStore } from "../../extension/store";
 import { DEFAULT_CONFIG, type SwarmConfig } from "../../extension/types";
 
@@ -229,5 +230,79 @@ describe("idleWake: the edge itself", () => {
 		expect(woken.wake).toBe(true);
 		expect(woken.state.parked).toBe(false);
 		expect(woken.state.empty).toBe(0);
+	});
+});
+
+describe("ready/review edge: a row this worker does not take costs nothing", () => {
+	test("ten unchanged ticks over a claimable row cost ONE model call, not ten", async () => {
+		const h = harness();
+		await h.start();
+		h.store.createTask({ title: "the only row", createdBy: "main" });
+		await h.tick();
+		expect(h.prompts).toHaveLength(2);
+		expect(h.prompts[1]?.text).toContain("claimable task(s)");
+
+		for (let i = 0; i < 10; i++) await h.tick();
+		expect(h.prompts).toHaveLength(2);
+	});
+
+	test("a different row set wakes it on the very next tick, even at the same count", async () => {
+		const h = harness();
+		await h.start();
+		const first = h.store.createTask({ title: "row one", createdBy: "main" });
+		await h.tick();
+		expect(h.prompts).toHaveLength(2);
+		await h.tick();
+		expect(h.prompts).toHaveLength(2);
+
+		// Same count (one matching row), different ids: a peer takes row one and row two appears.
+		expect(h.store.claim(first.id, "peer-auditor", 300, ["general"]).ok).toBe(true);
+		h.store.createTask({ title: "row two", createdBy: "main" });
+		await h.tick();
+		expect(h.prompts).toHaveLength(3);
+	});
+
+	test("a review row wakes it once, then the unchanged queue stays silent", async () => {
+		const h = harness();
+		await h.start();
+		const task = h.store.createTask({ title: "needs a look", createdBy: "main" });
+		expect(h.store.claim(task.id, "peer-author", 300, ["general"]).ok).toBe(true);
+		await h.tick();
+		const before = h.prompts.length;
+
+		h.store.complete(task.id, "peer-author", { summary: "done", reviewRequired: true });
+		await h.tick();
+		expect(h.prompts).toHaveLength(before + 1);
+		expect(h.prompts[before]?.text).toContain("waiting for review");
+
+		await h.tick();
+		await h.tick();
+		expect(h.prompts).toHaveLength(before + 1);
+	});
+});
+
+describe("stalledWake: an obligation repeats on a bounded cadence and never parks", () => {
+	test("the first evaluation records the state, and an unelapsed window is silent", () => {
+		expect(stalledWake({ signature: undefined, empty: 0, parked: false, nextAt: 0 }, "u:1", 0, 15).wake).toBe(false);
+		expect(stalledWake({ signature: "u:1", empty: 0, parked: false, nextAt: 60_000 }, "u:1", 30_000, 15).wake).toBe(false);
+	});
+
+	test("each elapsed window nudges once, the cadence steps, and the worker is never parked out of its own work", () => {
+		let state: IdleWakeState = { signature: "t:task-1", empty: 0, parked: false, nextAt: 0 };
+		let now = 0;
+		let wakes = 0;
+		for (const step of [15_000, 15_000, 30_000, 60_000, 240_000, 600_000]) {
+			now += step;
+			const decision = stalledWake(state, "t:task-1", now, 15);
+			if (decision.wake) wakes++;
+			state = decision.state;
+			expect(state.parked).toBe(false);
+		}
+		// One nudge per elapsed window (never one per tick), with the window stepping to the 300s cap.
+		expect(wakes).toBe(6);
+
+		const moved = stalledWake(state, "t:task-1,t:task-2", now, 15);
+		expect(moved.wake).toBe(true);
+		expect(moved.state.empty).toBe(0);
 	});
 });

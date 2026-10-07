@@ -9,7 +9,7 @@ import { renderPanel, type DrainSummary } from "./render";
 import { canStop } from "./scaling";
 import type { SwarmStore } from "./store";
 import { buildSwarmTools, SWARM_TOOL_NAMES, type SwarmIdentity } from "./tools";
-import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
+import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmMessage, SwarmTask, TaskCounts } from "./types";
 
 type HostSdk = ExtensionAPI["pi"];
 type CreateOptions = NonNullable<Parameters<HostSdk["createAgentSession"]>[0]>;
@@ -114,23 +114,27 @@ export const IDLE_PARK_AFTER = 3;
 export const IDLE_BACKOFF_MAX_MS = 300_000;
 
 /**
- * The idle branch's edge, as a pure function so the contract is testable without a session: an idle
- * worker is woken by a CHANGE in agent-relevant state, never by the clock.
- *
- * The branch this replaces woke every idle worker every `idleTickSeconds` (15s by default) with the
- * same "no claimable work" prompt — a full model call per worker per window, forever, with nothing to
- * act on, which is exactly the operator's "空闲代理在后台白烧 token". Requirement (a) of the fix is
- * absolute: an unchanged pool must cost ZERO model calls, so no branch here ever wakes on time alone.
- * The branches ABOVE it (unread messages, held tasks, claimable ready work, a review waiting) are still
- * evaluated on every tick and still wake the worker the moment real work exists, so gating this one
- * cannot delay a wake-up.
- *
- * The clock keeps exactly one job — the empty streak. `idleTickSeconds` after the last wake-up the
- * streak advances (then 2x, 4x, … capped at {@link IDLE_BACKOFF_MAX_MS}), and after
- * {@link IDLE_PARK_AFTER} of those windows the worker is parked. A change wakes it at once, parked or
- * not: a real change is never dropped, only the no-op wake-up is gone.
+ * Everything a worker can be prompted FOR, as one signature over the ID SETS — a different row set is a
+ * change even when the counts hold still. One signature for all four reasons is what makes the tick's
+ * wake decision single: an unchanged row set costs zero model calls, whichever branch would have fired.
  */
-export function idleWake(state: IdleWakeState, signature: string, now: number, idleTickSeconds: number): IdleWakeDecision {
+export function promptSignature(goals: SwarmGoal[], messages: SwarmMessage[], mine: SwarmTask[], ready: SwarmTask[], reviews: SwarmTask[]): string {
+	const ids = (rows: readonly { id: string | number }[]) => rows.map((row) => String(row.id)).sort().join(",");
+	const round = goals.map((goal) => `${goal.id}:${goal.planningTask}:${goal.status}`).join(",");
+	return [`g:${round}`, `u:${ids(messages)}`, `t:${ids(mine)}`, `r:${ids(ready)}`, `v:${ids(reviews)}`].join("|");
+}
+
+/**
+ * The shared edge behind {@link idleWake} and {@link stalledWake}.
+ *
+ * `repeat` false — a pure change edge. Time is never a reason to run a model call: an unchanged
+ * signature is answered with bookkeeping only (the empty streak, the stepped window, the park).
+ * `repeat` true — the state is addressed TO this worker (a task it holds, an unread message) and nothing
+ * else reclaims it, so an elapsed window nudges it again, bounded by the same stepping and still woken
+ * the moment the signature moves. It never parks: `#beat` renews every held task's lease
+ * (store.ts `heartbeat`), so a parked worker would strand its task with no timeout left to free it.
+ */
+function edgeWake(state: IdleWakeState, signature: string, now: number, idleTickSeconds: number, repeat: boolean): IdleWakeDecision {
 	const gap = Math.max(1, idleTickSeconds) * 1000;
 	if (state.signature === undefined) {
 		// First evaluation: record the state the worker's own bootstrap already described, do not wake.
@@ -141,14 +145,32 @@ export function idleWake(state: IdleWakeState, signature: string, now: number, i
 		// and give the empty streak a clean slate.
 		return { wake: true, state: { signature, empty: 0, parked: false, nextAt: now + gap } };
 	}
-	// Nothing changed. `(a)` of the fix is absolute: an unchanged pool DOES NOT cost a model call, so
-	// this branch never wakes. What the clock still drives is the empty-streak bookkeeping — the window
-	// (idleTickSeconds, then stepped 1x/2x/4x …, capped) and the park after IDLE_PARK_AFTER of them,
-	// which is the state an operator can read instead of a silent burn.
 	if (now < state.nextAt) return { wake: false, state };
 	const empty = state.empty + 1;
 	const backoff = Math.min(gap * 2 ** (empty - 1), IDLE_BACKOFF_MAX_MS);
-	return { wake: false, state: { ...state, empty, parked: empty >= IDLE_PARK_AFTER, nextAt: now + backoff } };
+	const parked = !repeat && empty >= IDLE_PARK_AFTER;
+	return { wake: repeat, state: { ...state, empty, parked, nextAt: now + backoff } };
+}
+
+/**
+ * The idle edge, as a pure function so the contract is testable without a session: an idle worker is
+ * woken by a CHANGE in agent-relevant state, never by the clock.
+ *
+ * The branch this replaced woke every idle worker every `idleTickSeconds` (15s by default) with the same
+ * "no claimable work" prompt — a full model call per worker per window, forever, with nothing to act on,
+ * which is exactly the operator's "空闲代理在后台白烧 token". An unchanged pool must cost ZERO model
+ * calls, so this edge never wakes on time alone; the clock's only job is the empty streak
+ * ({@link idleTickSeconds} after the last wake-up it advances, then 2x, 4x, … capped at
+ * {@link IDLE_BACKOFF_MAX_MS}, and parks the worker after {@link IDLE_PARK_AFTER} of them). A change
+ * wakes it at once, parked or not: a real change is never dropped, only the no-op wake-up is gone.
+ */
+export function idleWake(state: IdleWakeState, signature: string, now: number, idleTickSeconds: number): IdleWakeDecision {
+	return edgeWake(state, signature, now, idleTickSeconds, false);
+}
+
+/** The obligation variant of {@link idleWake}: bounded cadence, no park. See {@link edgeWake}. */
+export function stalledWake(state: IdleWakeState, signature: string, now: number, idleTickSeconds: number): IdleWakeDecision {
+	return edgeWake(state, signature, now, idleTickSeconds, true);
 }
 
 const TICK_INTERVAL_MS = 3000;
@@ -525,6 +547,10 @@ export class SwarmDriver {
 		if (modelFallbackMessage) this.#deps.notify(`worker ${spec.name}: ${modelFallbackMessage}`, "warning");
 		this.#trace(`spawn ${spec.name}: session ready id=${session.sessionId}`);
 
+		// Seed the edge with the state the bootstrap prompt is about to describe (it is issued right after
+		// this returns), so the worker's FIRST tick is a real comparison: a row that appears between the
+		// spawn and that tick still wakes it. Leaving the signature unset would swallow exactly that wake.
+		const seed = this.#workerState(store.liveGoals(), spec.name, spec.capabilities);
 		const runtime: WorkerRuntime = {
 			spec,
 			session,
@@ -532,7 +558,12 @@ export class SwarmDriver {
 			worktree,
 			turns: 0,
 			lastTickAt: 0,
-			idle: { signature: undefined, empty: 0, parked: false, nextAt: 0 },
+			idle: {
+				signature: promptSignature(seed.goals, seed.messages, seed.mine, seed.ready, seed.reviews),
+				empty: 0,
+				parked: false,
+				nextAt: Date.now() + Math.max(1, config.idleTickSeconds) * 1000,
+			},
 		};
 		this.#workers.set(spec.name, runtime);
 		session.subscribe((event) => {
@@ -582,45 +613,53 @@ export class SwarmDriver {
 		store.sweep(config.offlineAfterSeconds);
 	}
 
+	/**
+	 * The state one worker can be prompted FOR, read exactly the way the tick reads it. One helper so the
+	 * spawn-time seed and the tick can never disagree about what "a change" means.
+	 */
+	#workerState(
+		goals: SwarmGoal[],
+		name: string,
+		capabilities: string[],
+	): { goals: SwarmGoal[]; messages: SwarmMessage[]; mine: SwarmTask[]; ready: SwarmTask[]; reviews: SwarmTask[] } {
+		const { store, config } = this.#deps;
+		const messages = store.inbox(name, 5);
+		const mine = store.listTasks({ status: "claimed", agent: name, limit: 5 });
+		const ready = store
+			.listTasks({ status: "ready", limit: 50 })
+			.filter((t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => capabilities.includes(cap)));
+		const reviews = config.review ? store.listTasks({ status: "review", limit: 20 }).filter((t) => t.claimedBy !== name) : [];
+		return { goals, messages, mine, ready, reviews };
+	}
+
 	async #tick(): Promise<void> {
 		if (!this.#running) return;
 		const { store, config } = this.#deps;
 		// The round a worker can join right now: a live goal is what the pool converges on before it
 		// has any real task to claim.
 		const goals = store.liveGoals();
-		// The state an idle worker can still be woken FOR: the other branches read their own per-worker
-		// slice of reality on every tick, so this is what is left over when they are all empty.
-		const idleSignature = this.#idleSignature(goals);
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
 			const now = Date.now();
-			const messages = store.inbox(worker.spec.name, 5);
-			const mine = store.listTasks({ status: "claimed", agent: worker.spec.name, limit: 5 });
+			const { messages, mine, ready, reviews } = this.#workerState(goals, worker.spec.name, worker.identity.capabilities);
 			const scribe = goals.find((goal) => mine.some((task) => task.id === goal.planningTask));
-			if (messages.length > 0 || mine.length > 0) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, messages.length, mine.length, 0, 0, scribe, scribe !== undefined));
-				worker.lastTickAt = now;
-				worker.idle = this.#idleState(idleSignature, now);
-				continue;
-			}
-			const ready = store
-				.listTasks({ status: "ready", limit: 50 })
-				.filter((t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => worker.identity.capabilities.includes(cap)));
-			const reviews = config.review ? store.listTasks({ status: "review", limit: 20 }).filter((t) => t.claimedBy !== worker.spec.name) : [];
-			if (ready.length > 0 || reviews.length > 0) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, ready.length, reviews.length, goals[0]));
-				worker.lastTickAt = now;
-				worker.idle = this.#idleState(idleSignature, now);
-				continue;
-			}
-			// Nothing actionable for this worker. The clock is NOT a reason to run a model call: the idle
-			// edge wakes it only when its signature moves, backs off, and parks it until it does.
+			// Everything this worker can be prompted FOR, as ONE signature over the ID SETS — a different row
+			// set is a change even when the counts hold still. It replaces the two state-blind branches that
+			// re-prompted on every turn: the idle clock (task-145) and this one, the ready/review branch.
+			const signature = promptSignature(goals, messages, mine, ready, reviews);
 			const previous = worker.idle;
-			const decision = idleWake(previous, idleSignature, now, config.idleTickSeconds);
+			// Work ADDRESSED to this worker (a task it holds, an unread message) is something it can stall
+			// on, and nothing else reclaims it — the heartbeat renews every held task's lease, so no timeout
+			// ever frees one — so it keeps a bounded stepped repeat. Claimable/review rows are shared
+			// opportunities, a race the worker is free to lose, so they wake on the edge alone.
+			const decision =
+				messages.length > 0 || mine.length > 0
+					? stalledWake(previous, signature, now, config.idleTickSeconds)
+					: idleWake(previous, signature, now, config.idleTickSeconds);
 			worker.idle = decision.state;
 			if (!previous.parked && decision.state.parked) this.#trace(`idle ${worker.spec.name}: parked until the pool state changes`);
 			if (!decision.wake) continue;
-			await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, 0, 0, goals[0]));
+			await this.#prompt(worker, this.#continuationPrompt(worker, messages.length, mine.length, ready.length, reviews.length, scribe ?? goals[0], scribe !== undefined));
 			worker.lastTickAt = now;
 		}
 		this.#checkDrained();
@@ -639,21 +678,6 @@ export class SwarmDriver {
 		this.#countsKey = "";
 		this.#countsAt = Date.now();
 		this.#startedAt = Date.now();
-	}
-
-	/**
-	 * What an idle worker can still be woken FOR. Everything else it could act on — an unread message, a
-	 * task it holds, claimable ready work, a review waiting for someone else — is read on every tick by
-	 * its own branch and wakes the worker directly, so a signature over the live goal round is exactly
-	 * the "agent-relevant state" the idle edge is allowed to fire on.
-	 */
-	#idleSignature(goals: SwarmGoal[]): string {
-		return goals.map((goal) => `${goal.id}:${goal.planningTask}:${goal.status}`).join(",") || "-";
-	}
-
-	/** A worker that has just been woken for real work: its empty-wake streak starts over. */
-	#idleState(signature: string, now: number): IdleWakeState {
-		return { signature, empty: 0, parked: false, nextAt: now + Math.max(1, this.#deps.config.idleTickSeconds) * 1000 };
 	}
 
 	/**
