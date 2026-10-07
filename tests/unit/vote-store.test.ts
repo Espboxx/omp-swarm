@@ -230,3 +230,82 @@ describe("the gate: cluster-level decisions need a passed round", () => {
 		store.close();
 	});
 });
+
+describe("the bound is enforced by the MECHANISM, not by an external tick (task-197)", () => {
+	// Regression for the defect SwiftTiger's non-author verification measured (RESULT ADDENDUM #755): a due
+	// round used to stay `open` until the driver's beat ran the sweep, so with no beat the `vote_failed` it
+	// promises never landed. The fix settles on READ; these tests never call the sweep.
+	test("a due round is denied the moment it is READ — no ballot, no sweep, no beat", async () => {
+		const store = makeStore();
+		roster(store, ["w1", "w2"]);
+		const w1 = toolkit(store, "w1", { voteTimeoutSeconds: 1 });
+		await w1.call("swarm_vote", { kind: "create-task", question: "denied on read", payload_json: JSON.stringify({ title: "never" }) });
+		const opened = store.getVote("vote-1");
+		expect(opened?.status).toBe("open");
+
+		// The tool's READ path calls this same tallyVote, and it is driven here on a clock past the bound.
+		const read = store.tallyVote("vote-1", DEFAULT_CONFIG.offlineAfterSeconds, (opened?.deadlineAt ?? 0) + 1);
+		expect(read?.vote.status).toBe("failed");
+		expect(read?.outcome.reason).toContain("timeout");
+		expect(store.listTasks({}).length).toBe(0);
+		expect(store.eventsOfType("vote.failed").length).toBe(1);
+		expect(store.searchBoard({ tags: ["vote_failed"] })[0]?.content).toContain("absent 2");
+		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
+		// ...and the gate cannot be fooled by the same round on a later pass.
+		expect(store.passedVote("create-task", "vote-1", DEFAULT_CONFIG.offlineAfterSeconds, (opened?.deadlineAt ?? 0) + 1)).toBeUndefined();
+		store.close();
+	});
+
+	test("a ballot cast after the bound is refused, and settles the round as denied", async () => {
+		const store = makeStore();
+		roster(store, ["w1", "w2"]);
+		const w1 = toolkit(store, "w1", { voteTimeoutSeconds: 1 });
+		await w1.call("swarm_vote", { kind: "create-task", question: "a late yes must not save it", payload_json: JSON.stringify({ title: "never" }) });
+		const opened = store.getVote("vote-1");
+		const late = store.castBallot("vote-1", "w2", true, DEFAULT_CONFIG.offlineAfterSeconds, (opened?.deadlineAt ?? 0) + 1);
+		expect(late.ok).toBe(false);
+		expect(late.reason).toContain("already failed");
+		expect(store.getVote("vote-1")?.result).toContain("timeout");
+		expect(store.listTasks({}).length).toBe(0);
+		store.close();
+	});
+
+	test("a plain LOOK at a due round denies it: getVote alone, no ballot, no tally, no sweep", async () => {
+		const store = makeStore();
+		roster(store, ["w1", "w2"]);
+		const w1 = toolkit(store, "w1", { voteTimeoutSeconds: 1 });
+		await w1.call("swarm_vote", { kind: "create-task", question: "denied by a look", payload_json: JSON.stringify({ title: "never" }) });
+		const bound = store.getVote("vote-1")?.deadlineAt ?? 0;
+
+		// Nothing but the read: the round is terminal the moment anybody looks at it, tick or no tick.
+		expect(store.getVote("vote-1", DEFAULT_CONFIG.offlineAfterSeconds, bound + 1)?.status).toBe("failed");
+		expect(store.listTasks({}).length).toBe(0);
+		expect(store.eventsOfType("vote.failed").length).toBe(1);
+		expect(store.searchBoard({ tags: ["vote_failed"] })[0]?.content).toContain("timeout");
+		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
+		// ...and the gate cannot be talked into it by the same round on a later pass.
+		expect(store.passedVote("create-task", "vote-1", DEFAULT_CONFIG.offlineAfterSeconds, bound + 1)).toBeUndefined();
+		store.close();
+	});
+
+	test("the sweep still REPORTS every round it finishes, and a later read does not double-settle it", async () => {
+		const store = makeStore();
+		roster(store, ["w1", "w2"]);
+		const w1 = toolkit(store, "w1", { voteTimeoutSeconds: 1 });
+		await w1.call("swarm_vote", { kind: "create-task", question: "mop-up", payload_json: JSON.stringify({ title: "never" }) });
+		const bound = store.getVote("vote-1")?.deadlineAt ?? 0;
+
+		// The mop-up must hand back the rounds IT finished: the lazy read inside `tallyVote` used to finish
+		// the row first, so `sweep()`/`settleVotes()` reported nothing and the driver lost its settled list.
+		const settled = store.settleVotes(DEFAULT_CONFIG.offlineAfterSeconds, bound);
+		expect(settled.map((vote) => vote.id)).toEqual(["vote-1"]);
+		expect(settled[0]?.status).toBe("failed");
+		// Idempotent: the same clock again finishes nothing, and neither does a read on top of it.
+		expect(store.settleVotes(DEFAULT_CONFIG.offlineAfterSeconds, bound + 1000)).toEqual([]);
+		expect(store.getVote("vote-1", DEFAULT_CONFIG.offlineAfterSeconds, bound + 1000)?.status).toBe("failed");
+		expect(store.eventsOfType("vote.failed").length).toBe(1);
+		expect(store.searchBoard({ tags: ["vote_failed"] }).length).toBe(1);
+		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
+		store.close();
+	});
+});

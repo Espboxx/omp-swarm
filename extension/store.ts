@@ -1365,7 +1365,19 @@ export class SwarmStore {
 		});
 	}
 
-	getVote(id: string): SwarmVote | undefined {
+	/**
+	 * Read one round. A round past its own deadline is DENIED the moment anybody looks at it — tick or no
+	 * tick (task-197): the read finishes it through the same `#finishVote` path every other settling path
+	 * uses, so the `vote_failed` event, the board entry and the opener's inbox land even when no driver beat
+	 * ever runs the sweep.
+	 */
+	getVote(id: string, offlineAfterSeconds = 60, now = Date.now()): SwarmVote | undefined {
+		this.#settleIfDue(id, offlineAfterSeconds, now);
+		return this.#voteRow(id);
+	}
+
+	/** The raw row, with no due-check of its own: the read every settling path is built on (no recursion). */
+	#voteRow(id: string): SwarmVote | undefined {
 		const row = this.#db.get<VoteRow>("SELECT * FROM votes WHERE id=?", id);
 		return row === null ? undefined : this.#toVote(row);
 	}
@@ -1410,9 +1422,12 @@ export class SwarmStore {
 	 * Cast one ballot. One agent, one ballot is the table's primary key, so a repeat is neither a second
 	 * vote nor an exception: it is reported and ignored (rule 4).
 	 */
-	castBallot(decisionId: string, voter: string, approve: boolean): { ok: boolean; reason?: string } {
+	castBallot(decisionId: string, voter: string, approve: boolean, offlineAfterSeconds = 60, now = Date.now()): { ok: boolean; reason?: string } {
 		return this.#db.transaction(() => {
-			const vote = this.getVote(decisionId);
+			// A ballot that arrives AFTER the bound does not count: the round is denied at its own deadline
+			// first, so a late yes cannot pass a round that already timed out.
+			this.#settleIfDue(decisionId, offlineAfterSeconds, now);
+			const vote = this.#voteRow(decisionId);
 			if (vote === undefined) return { ok: false, reason: `unknown vote ${decisionId}` };
 			if (vote.status !== "open") return { ok: false, reason: `${decisionId} is already ${vote.status}` };
 			const inserted = this.#db.run(
@@ -1420,7 +1435,7 @@ export class SwarmStore {
 				decisionId,
 				voter,
 				approve ? 1 : 0,
-				Date.now(),
+				now,
 			);
 			if (inserted.changes !== 1) return { ok: false, reason: `${voter} already voted on ${decisionId}: one agent, one ballot` };
 			this.#log("vote.ballot", voter, undefined, { vote: decisionId, kind: vote.kind, approve });
@@ -1428,15 +1443,9 @@ export class SwarmStore {
 		});
 	}
 
-	/**
-	 * Tally a round against the policy frozen on its own row, using the SAME pure rule the unit tests pin
-	 * (extension/voting.ts): the store cannot drift from the arithmetic, and an offline voter drops out of
-	 * the base instead of vetoing forever.
-	 */
-	tallyVote(decisionId: string, offlineAfterSeconds: number, now = Date.now()): { vote: SwarmVote; outcome: VoteOutcome } | undefined {
-		const vote = this.getVote(decisionId);
-		if (vote === undefined) return undefined;
-		const outcome = decide({
+	/** The round's own arithmetic, from frozen policy + live roster + ballots. No clock of its own. */
+	#outcomeFor(vote: SwarmVote, offlineAfterSeconds: number, now: number): VoteOutcome {
+		return decide({
 			decision: {
 				id: vote.id,
 				kind: vote.kind,
@@ -1445,13 +1454,41 @@ export class SwarmStore {
 				openedAt: vote.openedAt,
 				seed: vote.status === "seeded",
 			},
-			votes: this.ballots(decisionId),
+			votes: this.ballots(vote.id),
 			agents: this.listAgents(),
 			now,
 			offlineAfterMs: offlineAfterSeconds * 1000,
 			policy: { threshold: vote.threshold, minBase: vote.minBase, timeoutMs: vote.deadlineAt - vote.openedAt },
 		});
-		return { vote, outcome };
+	}
+
+	/**
+	 * A round past its own deadline is DENIED the moment anybody looks at it — tick or no tick.
+	 *
+	 * `deadline_at` used to be consulted only by `settleVotes`, which the driver's beat drives, so with no
+	 * beat a due round stayed `open` and the `vote_failed` it promises never landed (measured on a 1s round
+	 * left alone: board RESULT ADDENDUM #755). Settling on READ keeps that promise inside the mechanism;
+	 * `settleVotes` stays as the mop-up for rounds nobody ever reads. Idempotent by construction:
+	 * `#finishVote` only transitions a row that is still `open`.
+	 */
+	#settleIfDue(decisionId: string, offlineAfterSeconds: number, now: number): SwarmVote | undefined {
+		const vote = this.#voteRow(decisionId);
+		if (vote === undefined || vote.status !== "open" || now < vote.deadlineAt) return undefined;
+		const outcome = this.#outcomeFor(vote, offlineAfterSeconds, now);
+		return outcome.settled ? this.#finishVote(vote, outcome, now) : undefined;
+	}
+
+	/**
+	 * Tally a round against the policy frozen on its own row, using the SAME pure rule the unit tests pin
+	 * (extension/voting.ts): the store cannot drift from the arithmetic, and an offline voter drops out of
+	 * the base instead of vetoing forever.
+	 */
+	tallyVote(decisionId: string, offlineAfterSeconds: number, now = Date.now()): { vote: SwarmVote; outcome: VoteOutcome } | undefined {
+		// Reading a round enforces its bound: a due round is denied HERE, so the promise holds with no beat.
+		this.#settleIfDue(decisionId, offlineAfterSeconds, now);
+		const vote = this.#voteRow(decisionId);
+		if (vote === undefined) return undefined;
+		return { vote, outcome: this.#outcomeFor(vote, offlineAfterSeconds, now) };
 	}
 
 	/**
@@ -1463,9 +1500,14 @@ export class SwarmStore {
 	settleVotes(offlineAfterSeconds: number, now = Date.now()): SwarmVote[] {
 		const settled: SwarmVote[] = [];
 		for (const row of this.#db.all<{ id: string }>("SELECT id FROM votes WHERE status='open' ORDER BY opened_at")) {
-			const tally = this.tallyVote(row.id, offlineAfterSeconds, now);
-			if (tally === undefined || !tally.outcome.settled) continue;
-			const finished = this.#finishVote(tally.vote, tally.outcome, now);
+			// Deliberately NOT `tallyVote`: this is the mop-up, and it must REPORT every round it finishes.
+			// The lazy read-settle inside `tallyVote` would finish the row first, leaving `#finishVote` with
+			// nothing to transition and the caller with an empty list (task-197's own regression).
+			const vote = this.#voteRow(row.id);
+			if (vote === undefined) continue;
+			const outcome = this.#outcomeFor(vote, offlineAfterSeconds, now);
+			if (!outcome.settled) continue;
+			const finished = this.#finishVote(vote, outcome, now);
 			if (finished !== undefined) settled.push(finished);
 		}
 		return settled;
@@ -1473,10 +1515,13 @@ export class SwarmStore {
 
 	/** Settle ONE round (the ballot path calls this) and execute it when it passed. */
 	settleVote(decisionId: string, offlineAfterSeconds: number, now = Date.now()): { vote: SwarmVote; outcome: VoteOutcome } | undefined {
-		const tally = this.tallyVote(decisionId, offlineAfterSeconds, now);
-		if (tally === undefined || !tally.outcome.settled) return tally;
-		const finished = this.#finishVote(tally.vote, tally.outcome, now);
-		return finished === undefined ? undefined : { vote: finished, outcome: tally.outcome };
+		// Raw row for the same reason `settleVotes` does: a settled round must be REPORTED, not swallowed.
+		const vote = this.#voteRow(decisionId);
+		if (vote === undefined) return undefined;
+		const outcome = this.#outcomeFor(vote, offlineAfterSeconds, now);
+		if (!outcome.settled) return { vote, outcome };
+		const finished = this.#finishVote(vote, outcome, now);
+		return finished === undefined ? undefined : { vote: finished, outcome };
 	}
 
 	/**
@@ -1547,9 +1592,12 @@ export class SwarmStore {
 	}
 
 	/** The passed round of `kind` a gated decision point may act on, or undefined. The gate's whole test. */
-	passedVote(kind: DecisionKind, voteId: string | undefined): SwarmVote | undefined {
+	passedVote(kind: DecisionKind, voteId: string | undefined, offlineAfterSeconds = 60, now = Date.now()): SwarmVote | undefined {
 		if (voteId === undefined) return undefined;
-		const vote = this.getVote(voteId);
+		// The gate reads through the same due-check, so a round that timed out is settled and can never be
+		// mistaken for a standing permission.
+		this.#settleIfDue(voteId, offlineAfterSeconds, now);
+		const vote = this.#voteRow(voteId);
 		return vote !== undefined && vote.status === "passed" && vote.kind === kind ? vote : undefined;
 	}
 

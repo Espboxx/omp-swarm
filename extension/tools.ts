@@ -808,7 +808,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 	 */
 	function voteGate(kind: DecisionKind, voteId: string | undefined): string | undefined {
 		if (!config.voteEnabled || identity.isMain) return undefined;
-		if (store.passedVote(kind, voteId) !== undefined) return undefined;
+		if (store.passedVote(kind, voteId, config.offlineAfterSeconds) !== undefined) return undefined;
 		return [
 			`this is a cluster-level decision (${kind}): the pool must pass a vote first.`,
 			`open one with swarm_vote({ kind: "${kind}", question: "...", payload_json: "..." }) and let the eligible agents ballot it (swarm_vote({ decision_id, approve })).`,
@@ -863,7 +863,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 					if (tally === undefined) return err(`unknown vote ${params.decision_id}`, { found: false });
 					return ok(renderVote(tally.vote, tally.outcome), { vote: tally.vote.id, status: tally.vote.status, settled: tally.outcome.settled });
 				}
-				const cast = store.castBallot(params.decision_id, identity.id, params.approve);
+				const cast = store.castBallot(params.decision_id, identity.id, params.approve, offlineAfterSeconds);
 				if (!cast.ok) return err(`ballot refused: ${cast.reason}`, { cast: false });
 				const settled = store.settleVote(params.decision_id, offlineAfterSeconds);
 				if (settled === undefined) return err(`${params.decision_id} vanished while settling`, { cast: true });
