@@ -28,7 +28,7 @@ and ownership conflicts are settled by the database, never by agent etiquette.
 |---|---|---|
 | Agent runtime | `pi.pi.createAgentSession` (SDK) | each worker is a real OMP `AgentSession` in-process, own model, own session file, own `AgentRegistry` |
 | Sessions | `SessionManager.create(cwd, dir)` | per-worker transcripts under `.swarm/sessions/<name>/` |
-| Tool API | `CustomTool` / `createAgentSession({ customTools })` | the 19 swarm tools are injected into worker sessions |
+| Tool API | `CustomTool` / `createAgentSession({ customTools })` | the 22 swarm tools are injected into worker sessions |
 | Restricted tool sets | `toolNames` + `restrictToolNames` + `allowRestrictedCustomTools` | workers get coding tools + swarm tools, nothing else |
 | System prompt layering | `appendSystemPrompt` | the worker constitution is appended, not replacing OMP's prompt |
 | Subagent observability | `session.subscribe()` (`agent_start` / `agent_end.isTerminal`) | idle detection for tick delivery |
@@ -56,10 +56,11 @@ into a peer happens through OMP's own prompt path. One transport, not two.
 ```
 extension/
   index.ts     extension entry: tool registration, /swarm commands, status panel, lazy runtimes
-  auto.ts      multi-agent mode: roster derivation, mid-run growth + the auto-assemble/self-stop state machine
+  auto.ts      multi-agent mode: roster derivation (incl. the goal budget), mid-run growth + the auto-assemble/self-stop state machine + the planning round's bound
   driver.ts    worker lifecycle: spawn sessions, add workers to a running pool, tick, heartbeat, wake, worktrees, shutdown
-  tools.ts     the 19 agent tools (shared by workers and the main session)
-  store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages
+  tools.ts     the 22 agent tools (shared by workers and the main session)
+  store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages, goals and the scribe's merge
+  planning.ts  the planning round's pure rules: proposal parsing, the dedupe key, the merge and the creation order
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
@@ -68,8 +69,11 @@ extension/
   agentnav.ts  the agent-list selection model: main-first entries, cursor movement with wrap, the marker column, row rendering
   types.ts     domain types
 tests/
-  unit/store.test.ts           32 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            28 unit tests of multi-agent mode: roster derivation, mid-run growth and the assemble/self-stop state machine
+  unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
+  unit/auto.test.ts            38 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        17 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/goals.test.ts           11 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
+  unit/goal-tools.test.ts       7 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -77,6 +81,7 @@ tests/
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
+  unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -165,6 +170,20 @@ values). A ready-to-copy template lives at `config.example.json` in this repo:
 
 `model` is optional — omit it and workers inherit the session/provider default. Role `count`s are
 expanded into callsigns (`SwiftTiger`, `CalmFalcon`, …); `capabilities` gate claim eligibility.
+
+`planning` decides who splits the work. It is the one key that changes the coordinator's whole
+behaviour, and it is the only one listed here that the shipped `config.example.json` predates —
+copying that template verbatim is still correct, because the default applies when the key is absent:
+
+- `"planning": "swarm"` — **the default**. The coordinator only decides HOW MANY agents the request
+  needs and opens a goal (`swarm_goal`); the workers post their own split proposals (`swarm_propose`),
+  the first of them to claim the goal's planning task (the *scribe*) merges and dedupes them into the
+  real task graph with `swarm_plan`, and everyone claims from that graph. See
+  [Multi-agent mode](#multi-agent-mode-swarm-on) for the round and what it costs.
+- `"planning": "coordinator"` — the pre-2026-10-07 behaviour kept behind the flag: the coordinator
+  writes the entire task list itself with `swarm_task_create` and the workers only claim from it.
+
+Any other value falls back to `"swarm"`.
 
 ## Use
 
@@ -309,13 +328,23 @@ session does both by itself:
    `MULTI-AGENT ON · idle`. The mode is per project and survives restarts (a session whose config
    says `auto: true` starts in the mode).
 2. Type a task in the normal prompt. The extension marks a planning window, and for that one turn
-   the coordinator receives standing instructions: decompose the request into 2–6 independent tasks
-   with `swarm_task_create`, post a `DECISION`, and do not edit the workers' files itself.
+   the coordinator receives standing instructions that depend on `planning`:
+   - `"swarm"` (default): decide HOW MANY agents the request needs, then open the goal with
+     `swarm_goal({ goal, agents })` — the coordinator does **not** write the task list. That call
+     records the goal and mints its ONE planning task; the pool then starts sized to the goal's agent
+     budget (at least `agents`, capped by `config.workers`), because the round's own plan is a single
+     task and without that budget it would run single-threaded.
+   - `"coordinator"`: decompose the request into 2–6 independent tasks with `swarm_task_create`, post a
+     `DECISION`, and do not edit the workers' files itself.
+   Either way the coordinator stops working on the task itself and stays available for progress
+   questions.
 3. Once the coordinator stops publishing tasks (a 20 s quiet period, so the roster is sized to the
-   whole plan rather than to the first task of a still-running turn), a roster is derived from what
-   the tasks need (`required_capabilities`, one agent per capability, plus a `reviewer` when
-   `review: true` and review-required work exists), sized to the plan and capped by `config.workers`
-   — work queued behind a dependency counts, so a dependency chain does not serialize the run.
+   whole plan rather than to the first task of a still-running turn; in `"swarm"` mode the goal's
+   agent budget sets the floor, because a live goal counts as work before any task exists), a roster
+   is derived from what the tasks need (`required_capabilities`, one agent per capability, plus a
+   `reviewer` when `review: true` and review-required work exists), sized to the plan and capped by
+   `config.workers` — work queued behind a dependency counts, so a dependency chain does not
+   serialize the run.
    Workers spawn, claim, and execute. The roster is not frozen at that first sizing: each tick while
    the driver is up and the pool is neither draining nor stalled, ready work above both the live
    worker count and the ready count the pool was sized for grows the pool
@@ -330,6 +359,37 @@ session does both by itself:
    notice with the counts, and the operator gets the batch-completion alert (see above) — answer,
    then send the next task if you have one.
 
+The planning round (mode `"swarm"`), in order:
+
+1. `swarm_goal({ goal, agents })` writes the goal row and its ONE planning task in one transaction, and
+   the pool starts sized to the goal's agent budget (at least `agents`, capped by `config.workers`). A
+   live goal counts as work for roster sizing even before any task exists, and it is deliberately never
+   reported as a stall.
+2. Every worker reads the goal (`swarm_status` names it; the planning task carries the brief) and posts
+   its own split with `swarm_propose` — a board `OBSERVATION` tagged `proposal` and scoped to the goal,
+   so the whole swarm can read and answer it (`swarm_message` to refine another agent's proposal).
+3. The first worker to `swarm_claim` the planning task is the **scribe**. `swarm_plan` then merges the
+   round in ONE transaction: it refuses unless the caller still holds that claim, the goal is still
+   open, and at least one proposal exists. It dedupes by the **normalized title** (lowercased,
+   whitespace collapsed, trailing punctuation stripped), so two proposals naming the same deliverable
+   become ONE task, with files, capabilities and dependencies unioned and the longest description kept;
+   deliverables the pool already holds are skipped and reported. The merged split is posted as a
+   `DECISION` and the goal is marked planned.
+4. The planning task completes and everyone claims the real tasks through the unchanged loop.
+
+Exactly-once is the ATOMIC CLAIM, not timing: two agents cannot hold the planning task at once, and a
+lease that expires (a scribe that died mid-round) hands it to the next claimer, who re-merges safely
+because creation is idempotent against the pool.
+
+What the round costs, and how it ends: every worker that proposes pays for its own read of the goal and
+its own proposal — roughly N × a coordination round, instead of one coordination round in the
+coordinator, which is the honest trade for the coordinator no longer writing the list. The round is
+bounded: no plan within 10 minutes of the goal closes it as `failed`, closes its unclaimed planning task
+with it, and posts a `FAIL` on the board plus a notice, so a round that cannot converge is reported
+rather than spun. And the dedupe key is the normalized title, so two proposals for the SAME deliverable
+cannot become two tasks — two DIFFERENT titles for the same deliverable still can, which is what the
+scribe's own reading of the round is for.
+
 The status line tracks the mode: `idle`, `planning`, `running` (`3a r0 c2 v0 d1` = online agents,
 ready/claimed/review/done), `done n/m`, `stalled`, prefixed while a pool is up by the compact
 progress (`SWARM 7/9 done`) and replaced once a batch drains by its headline
@@ -339,8 +399,9 @@ worker (state, task, branch, ctx%, tokens, cost, turns, age — see above), and 
 summary in place of the progress block; `/swarm agents` lists the roster from the store. `/swarm off`
 stops running workers and persists
 `"auto": false`; a swarm blocked with nothing claimable is stopped after 90 s and reported as
-`stalled` instead of spinning. If the coordinator never publishes tasks for a request that is still
-streaming, it is nudged once after 90 s and the mode returns to `idle`.
+`stalled` instead of spinning. If the coordinator opens no goal — or, in `"coordinator"` mode, creates
+no tasks — for a request that is still streaming, it is nudged once after 90 s and the mode returns to
+`idle`.
 
 Tasks that appear while no pool is running — a hand-made `/swarm task`, leftovers after `/swarm stop`
 — start a pool for them on the same terms. Tasks published while a pool is running are picked up by
@@ -365,6 +426,9 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_complete` | finish with summary/commit/files → `review` or `done` |
 | `swarm_fail` | fail with a reason; a FAIL board entry is written automatically. Also closes a task nobody holds whose dependency can never reach `done` — the only exit permanent residue has |
 | `swarm_task_create` | add work or a dependency you discovered; refuses an unknown, self- or cycle-closing dependency |
+| `swarm_goal` | open a goal's planning round: you choose only HOW MANY agents it needs (`agents`), never the task list — the workers split it themselves |
+| `swarm_propose` | post YOUR OWN split of an open goal onto the board (tagged `proposal`, scoped to the goal) for the scribe to merge |
+| `swarm_plan` | the scribe's merge: claim the goal's planning task first, then this dedupes the round into the real task graph, posts the DECISION and marks the goal planned |
 | `swarm_task_retry` | revive a `failed`/`blocked` task (fresh attempt, cleared claim) so its dependents can be promoted; stays `blocked` while its own dependencies are unresolved |
 | `swarm_integrate` | create an integration task requiring the `integrator` capability |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
@@ -424,7 +488,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 212 unit tests in the 8 files under tests/unit (incl. a 3-process claim race)
+bun run test                   # 262 unit tests in the 11 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
@@ -496,6 +560,15 @@ instead of waiting for the timeout.
 `last-run-auto-ui.json` (`--ui`) — **16/16 checks**. Both runs boot a project whose config already
 says `"auto": true`, dispatch one plain task, and send no `/swarm` command at all:
 
+**Both recorded runs predate swarm-side planning**: they were taken while the coordinator wrote the
+task list itself, which is today's `planning: "coordinator"`. The row "the coordinator decomposed the
+task — 4 tasks created by `main` before any worker existed" is a record of THAT path, kept as it was
+taken. No end-to-end run of the `"swarm"` default is recorded in this file yet; what that default has
+today is the unit suites (`unit/planning.test.ts` for the round's rules, `unit/goals.test.ts` including
+the three-OS-process scribe race, `unit/goal-tools.test.ts` for the whole round at the tool layer) and
+a real-host load check (the extension is loaded from disk against a fresh root and creates the `goals`
+table). A recorded run of the new default will be added here when it exists.
+
 | Check | Evidence |
 |---|---|
 | the mode was live | headless: `swarm.auto.idle` + `swarm.auto.planning` in the event trail; `--ui`: `setStatus MULTI-AGENT ON` + widget frames |
@@ -540,10 +613,16 @@ lines once its own settle window passed, which is the one-batch-one-alert rule a
 - The tick/heartbeat loop depends on the host process staying alive; the store survives restarts,
   but `/swarm start` must be re-run. In multi-agent mode a session whose config says `auto: true`
   re-arms the mode and its tick loop on start.
-- Multi-agent mode rides on the coordinator obeying the injected policy: if a turn ends with no
-  `swarm_task_create` rows, nothing starts (it nudges once after 90 s, then returns to `idle`), and a
-  request that cannot be split is answered normally. Tasks you create by hand while the mode is on
-  start a pool on the next tick.
+- Multi-agent mode rides on the coordinator obeying the injected policy: a turn that ends without
+  `swarm_goal` (mode `"swarm"`) or without `swarm_task_create` rows (mode `"coordinator"`) starts
+  nothing — the mode nudges once after 90 s, then returns to `idle` — and a request that cannot be
+  split is answered normally. Tasks you create by hand while the mode is on start a pool on the next
+  tick, and a goal opened by hand does the same.
+- A live goal counts as work: it keeps the pool out of the stall notice and sizes the roster on its
+  own, so a goal nobody can plan is reported by the round's own bound (a `FAIL` after 10 minutes)
+  rather than as `stalled`. The two are not the same latency: if the planning task was already closed
+  as `failed` while the goal stayed open, the pool can look quiet for the rest of that bound before
+  the `FAIL` lands — reported, but later than a stall would have been.
 - Roster growth is keyed to ready work: at most one step per ready-count increase, never past
   `config.workers`, and only while the pool is running and undrained — a task published after the
   pool stopped or drained waits for the next `/swarm start` instead. Because the trigger is the ready

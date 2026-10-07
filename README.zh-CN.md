@@ -24,7 +24,7 @@
 |---|---|---|
 | Agent 运行时 | `pi.pi.createAgentSession`（SDK） | 每个 worker 都是进程内真实的 OMP `AgentSession`，有自己的模型、自己的会话文件、自己的 `AgentRegistry` |
 | 会话 | `SessionManager.create(cwd, dir)` | 每个 worker 的转录存放在 `.swarm/sessions/<name>/` 下 |
-| 工具 API | `CustomTool` / `createAgentSession({ customTools })` | 19 个 swarm 工具被注入到 worker 会话中 |
+| 工具 API | `CustomTool` / `createAgentSession({ customTools })` | 22 个 swarm 工具被注入到 worker 会话中 |
 | 受限工具集 | `toolNames` + `restrictToolNames` + `allowRestrictedCustomTools` | worker 只拿到编码工具 + swarm 工具，别的什么都没有 |
 | 系统提示分层 | `appendSystemPrompt` | worker 章程是**追加**的，不替换 OMP 的提示 |
 | 子 agent 可观测性 | `session.subscribe()`（`agent_start` / `agent_end.isTerminal`） | 用于 tick 投递的空闲检测 |
@@ -47,10 +47,11 @@
 ```
 extension/
   index.ts     extension entry: tool registration, /swarm commands, status panel, lazy runtimes
-  auto.ts      multi-agent mode: roster derivation, mid-run growth + the auto-assemble/self-stop state machine
+  auto.ts      multi-agent mode: roster derivation (incl. the goal budget), mid-run growth + the auto-assemble/self-stop state machine + the planning round's bound
   driver.ts    worker lifecycle: spawn sessions, add workers to a running pool, tick, heartbeat, wake, worktrees, shutdown
-  tools.ts     the 19 agent tools (shared by workers and the main session)
-  store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages
+  tools.ts     the 22 agent tools (shared by workers and the main session)
+  store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages, goals and the scribe's merge
+  planning.ts  the planning round's pure rules: proposal parsing, the dedupe key, the merge and the creation order
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
@@ -59,8 +60,11 @@ extension/
   agentnav.ts  the agent-list selection model: main-first entries, cursor movement with wrap, the marker column, row rendering
   types.ts     domain types
 tests/
-  unit/store.test.ts           32 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            28 unit tests of multi-agent mode: roster derivation, mid-run growth and the assemble/self-stop state machine
+  unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
+  unit/auto.test.ts            38 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        17 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/goals.test.ts           11 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
+  unit/goal-tools.test.ts       7 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -68,6 +72,7 @@ tests/
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
+  unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -148,6 +153,13 @@ extensions:
 
 `model` 是可选的 —— 省略它，worker 就继承会话/供应商的默认值。角色的 `count` 会展开成呼号（`SwiftTiger`、`CalmFalcon` 等）；`capabilities` 决定认领资格。
 
+`planning` 决定由谁来拆分工作。它是唯一会改变协调者整体行为的键，也是这里提到的键当中唯一一个随仓库发布的 `config.example.json` 尚未收录的 —— 原样复制那份模板依然正确，因为缺这个键时默认值就会生效：
+
+- `"planning": "swarm"` —— **默认值**。协调者只判断请求需要多少个 agent，并用 `swarm_goal` 开一个目标；worker 各自用 `swarm_propose` 发布自己的拆分提案，第一个认领目标规划任务的人（*scribe*）用 `swarm_plan` 把它们合并、去重成真正的任务图，之后所有人从那张图里认领。这一轮的流程与代价见「多 agent 模式（`/swarm on`）」一节。
+- `"planning": "coordinator"` —— 2026-10-07 之前的行为，保留在开关后面：协调者自己用 `swarm_task_create` 写出整张任务清单，worker 只从中认领。
+
+其他任何取值都会回落到 `"swarm"`。
+
 ## 使用
 
 ```
@@ -216,14 +228,28 @@ message <id> <text>`（或 `swarm_message` 工具）仍然能在不离开这个�
 
 1. `/swarm on` 把 `"auto": true` 持久化进 `.swarm/config.json`，状态行切换为
    `MULTI-AGENT ON · idle`。模式是按项目生效的，且能扛住重启（配置写着 `auto: true` 的会话一启动就在模式里）。
-2. 在普通输入框里打一个任务。extension 会标出一个规划窗口，并且在那一个回合里，协调者会收到常驻指令：用 `swarm_task_create` 把请求拆成 2–6 个独立任务、发布一条 `DECISION`，并且不要自己去改 worker 的文件。
-3. 一旦协调者停止发布任务（20 秒静默期，这样名册会按整个计划而 sizing，而不是按一个仍在运行的回合里的第一个任务），就根据任务的需要推导出名册（`required_capabilities`，一个能力一个 agent，当 `review: true` 且存在需要评审的工作时再加一个 `reviewer`），按计划确定规模并受 `config.workers` 上限约束 —— 排在依赖后面的工作也算，所以依赖链不会让整次运行串行化。worker 随即启动、认领并执行。名册不会在第一次定规模时就冻结：driver 存活且池子既没排空也没停滞时，每个 tick 只要 ready 工作超过存活 worker 数**和**池子当初据以定规模的 ready 数，就按计划还需要的增量扩大池子
+2. 在普通输入框里打一个任务。extension 会标出一个规划窗口，并且在那一个回合里，协调者会收到常驻指令，内容取决于 `planning`：
+   - `"swarm"`（默认）：判断这个请求需要多少个 agent，然后用 `swarm_goal({ goal, agents })` 开一个目标 —— 协调者**不**写任务清单。这一调用会记录目标、铸出它唯一的那一个规划任务；随后池子按目标的 agent 预算启动（至少 `agents`，上限 `config.workers`），因为这一轮自己的计划只有一个任务，没有这个预算它就会单线程地跑。
+   - `"coordinator"`：用 `swarm_task_create` 把请求拆成 2–6 个独立任务、发布一条 `DECISION`，并且不要自己去改 worker 的文件。
+   两种模式下协调者都不再自己动手做这件事，并保持可应答进度问题。
+3. 一旦协调者停止发布任务（20 秒静默期，这样名册会按整个计划定规模，而不是按一个仍在运行的回合里的第一个任务；在 `"swarm"` 模式下目标的 agent 预算给出下限，因为一个存活的目标在任何任务存在之前就已经算作工作了），就根据任务的需要推导出名册（`required_capabilities`，一个能力一个 agent，当 `review: true` 且存在需要评审的工作时再加一个 `reviewer`），按计划确定规模并受 `config.workers` 上限约束 —— 排在依赖后面的工作也算，所以依赖链不会让整次运行串行化。worker 随即启动、认领并执行。名册不会在第一次定规模时就冻结：driver 存活且池子既没排空也没停滞时，每个 tick 只要 ready 工作超过存活 worker 数**和**池子当初据以定规模的 ready 数，就按计划还需要的增量扩大池子
    （`auto.ts:AutoController.tick` → `driver.addWorkers`），衡量基准取存活与计划 worker 数的较大者，并且只在计划中的 worker 少于 `config.workers` 时进行。增长在每一次 ready 计数上升时最多发生一次（水位在每一步重新绑定，并在模式重新布防、关闭、销毁、排空或停滞时重置），所以一个还没起来的 spawn 既不会自己触发一次增长，也不会被重复计数。因此，池子启动之后才发布的任务（协调者追加工作、某个 worker 拆分一个过大的任务）会拿到 worker，而不是排在一个对它来说太小的池子后面。
 4. 当每个任务都是 `done`/`failed` 时，集群自己停下，主会话收到带计数的完成通知，操作者收到批次完成告警（见上）—— 先回答，如果有下一个任务就发出去。
 
+规划轮（模式 `"swarm"`）按顺序是这样：
+
+1. `swarm_goal({ goal, agents })` 在一个事务里写入目标行和它唯一的那一个规划任务，池子随后按目标的 agent 预算启动（至少 `agents`，上限 `config.workers`）。存活的目标在任何任务存在之前就已经计入名册定规模，并且它被刻意排除在停滞通知之外。
+2. 每个 worker 读这个目标（`swarm_status` 会列出它；规划任务本身带着简报），并用 `swarm_propose` 发布自己的拆分 —— 一条打了 `proposal` 标签、限定在该目标下的 board `OBSERVATION`，所以整个集群都能读到并回应它（可以用 `swarm_message` 完善别的 agent 的提案）。
+3. 第一个 `swarm_claim` 到规划任务的 worker 就是 **scribe**。随后 `swarm_plan` 在一次事务里合并这一轮：只有在调用者仍持有那次认领、目标仍然 open、并且至少有一条提案时它才继续。它按**归一化标题**（转小写、折叠空白、去掉结尾标点）去重，所以两条命名同一个交付物的提案只会变成一个任务，文件、能力与依赖取并集，描述取最长的那条；池子里已经持有的交付物会被跳过并如实报告。合并后的拆分以 `DECISION` 发布，目标被标记为 planned。
+4. 规划任务完成，之后所有人通过那条并未改动的循环认领真正的任务。
+
+恰好一次靠的是**原子认领**，而不是时序：两个 agent 不可能同时持有规划任务，而一个过期租约（scribe 中途死掉）会把它交给下一个认领者，后者可以安全地重新合并，因为创建对池子而言是幂等的。
+
+这一轮花掉什么、又如何结束：每个提交提案的 worker 都要自己读一遍目标、自己写一份提案 —— 大致是 N × 一轮协调的开销，而不是协调者里那一轮协调，这正是「协调者不再写清单」的诚实代价。这一轮是有界的：目标开出后 10 分钟内没有产出计划，它就会被关闭为 `failed`，无人认领的规划任务随之关闭，并在 board 上留下一条 `FAIL` 加一条通知，所以无法收敛的一轮是被报告的，而不是空转。去重键就是归一化标题，因此同一个交付物的两条提案不可能变成两个任务 —— 但同一交付物的两个**不同**标题仍然可能，这正是 scribe 需要自己读一遍这一轮的原因。
+
 状态行会跟踪模式：`idle`、`planning`、`running`（`3a r0 c2 v0 d1` = 在线 agent 数，ready/claimed/review/done）、`done n/m`、`stalled`，池子存在时以紧凑进度为前缀（`SWARM 7/9 done`），批次排空后被它的标题替换
 （`SWARM DONE · 9/9 tasks (7 done, 2 failed) · 3 agents · 12m40s · $0.42`）；编辑器上方的 widget 在进度块之上带一个 `MULTI-AGENT MODE · <phase>` 表头，每个 worker 一行富信息（状态、任务、分支、ctx%、tokens、成本、轮次、年龄 —— 见上），并在进度块的位置保留已排空的摘要；`/swarm agents` 从存储里列出名册。`/swarm off` 停掉正在运行的 worker 并持久化
-`"auto": false`；一个没有可认领工作而被卡住的集群会在 90 秒后被停止并报告为 `stalled`，而不是空转。如果协调者对一个仍在流式输出的请求从未发布任务，它会在 90 秒后被催一次，模式回到 `idle`。
+`"auto": false`；一个没有可认领工作而被卡住的集群会在 90 秒后被停止并报告为 `stalled`，而不是空转。如果协调者对一个仍在流式输出的请求没有开目标（或者在 `"coordinator"` 模式下没有创建任何任务），它会在 90 秒后被催一次，模式回到 `idle`。
 
 在池子未运行时出现的任务 —— 手写的 `/swarm task`、`/swarm stop` 之后的遗留 —— 会按同样的规则为它们启动一个池子。池子运行时发布的任务由该池子接手，并向它们增长，上限是 `config.workers`。
 
@@ -246,6 +272,9 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_complete` | 带摘要/commit/files 完成 → `review` 或 `done` |
 | `swarm_fail` | 带原因失败；会自动写入一条 FAIL board 记录。也会关闭无人持有、且其依赖永不可能到达 `done` 的任务 —— 这是永久残留唯一的出口 |
 | `swarm_task_create` | 添加你发现的工作或依赖；会拒绝未知、自指或闭环的依赖 |
+| `swarm_goal` | 开一个目标的规划轮：你只选它需要多少个 agent（`agents`），永远不写任务清单 —— 拆分由 worker 自己做 |
+| `swarm_propose` | 把你**自己**的拆分发布到一个 open 目标上（打 `proposal` 标签、限定在该目标下），交给 scribe 合并 |
+| `swarm_plan` | scribe 的合并：先认领目标的规划任务，然后由它把这一轮去重成真正的任务图、发布 DECISION 并把目标标记为 planned |
 | `swarm_task_retry` | 复活 `failed`/`blocked` 任务（全新尝试、清空认领），以便其依赖项被提升；当它自身的依赖尚未解决时保持 `blocked` |
 | `swarm_integrate` | 创建一个需要 `integrator` 能力的集成任务 |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
@@ -283,7 +312,7 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 212 unit tests in the 8 files under tests/unit (incl. a 3-process claim race)
+bun run test                   # 262 unit tests in the 11 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
@@ -328,6 +357,8 @@ task-3:done, task-4:done, task-5:ready`。原因在两次验证者运行中都�
 `tests/integration/last-run-auto.json`（无头）—— **15/15 checks**，以及
 `last-run-auto-ui.json`（`--ui`）—— **16/16 checks**。两次运行都启动一个配置已经写着 `"auto": true` 的项目，派发一个普通任务，完全不发送任何 `/swarm` 命令：
 
+**这两次已记录的运行都早于 swarm 侧规划**：它们是在协调者自己写任务清单的时候录的，也就是今天的 `planning: "coordinator"`。「协调者拆解了任务 —— 在任何 worker 存在之前由 `main` 创建了 4 个任务」这一行是那条路径的记录，按当时的样子保留。本文件里还没有记录过 `"swarm"` 默认模式的端到端运行；该默认模式今天有的是单元测试套件（`unit/planning.test.ts` 覆盖这一轮的规则，`unit/goals.test.ts` 包含那个三进程 scribe 竞态，`unit/goal-tools.test.ts` 覆盖工具层的整轮流程）以及一次真实宿主加载检查（对一个全新根目录从磁盘加载 extension，并创建出 `goals` 表）。等新的默认模式有了真实运行，就会补记在这里。
+
 | 检查项 | 证据 |
 |---|---|
 | 模式是活的 | 无头：事件轨迹里有 `swarm.auto.idle` + `swarm.auto.planning`；`--ui`：`setStatus MULTI-AGENT ON` + widget 帧 |
@@ -362,8 +393,9 @@ UI 那次运行还断言了状态行跟随整个过程：`idle → planning → 
 - 每个根一个集群：`.swarm/` 是按工作目录的，driver 也是按根创建的。
 - 评审至少需要两个存活 agent（自审被拒绝）。只有一个 worker 时，手工完成评审：`/swarm approve <id>` 或 `/swarm reject <id> <notes>`。
 - tick/心跳循环依赖宿主进程存活；存储在重启后仍在，但必须重新执行 `/swarm start`。在多 agent 模式下，配置写着 `auto: true` 的会话会在启动时重新布防模式及其 tick 循环。
-- 多 agent 模式依赖协调者遵守注入的策略：如果某个回合结束时没有任何
-  `swarm_task_create` 行，什么都不会启动（它会在 90 秒后催一次，然后回到 `idle`），而一个无法拆分的请求会按平常方式回答。模式开启时你手工创建的任务会在下一个 tick 启动池子。
+- 多 agent 模式依赖协调者遵守注入的策略：一个回合如果没有 `swarm_goal`（模式 `"swarm"`）、也没有任何
+  `swarm_task_create` 行（模式 `"coordinator"`），什么都不会启动 —— 它会在 90 秒后催一次，然后回到 `idle` —— 而一个无法拆分的请求会按平常方式回答。模式开启时你手工创建的任务会在下一个 tick 启动池子，手工打开的目标也一样。
+- 存活的目标算作工作：它让池子不落入停滞通知，并自己决定名册规模，所以一个没人能规划的目标会由这一轮自己的界限来报告（10 分钟后一条 `FAIL`），而不是以 `stalled` 报告。两者的延迟并不相同：如果规划任务在目标仍 open 时就已经被关闭为 `failed`，池子可以在那个界限剩下的时间里看起来毫无动静，之后 `FAIL` 才落地 —— 有报告，但比一次停滞通知要晚。
 - 名册增长以 ready 工作为键：每次 ready 计数上升最多一步，绝不超过
   `config.workers`，且只在池子运行且未排空时发生 —— 池子停止或排空后才发布的任务会等下一次 `/swarm start`。因为触发条件是 ready 计数，启动失败的 worker 不会被后续的增长补上：只有新的可认领工作才会让池子增长。触发条件的比较对象是**存活** worker 数（`auto.ts:301`），而不是能力：没有任何存活 worker 能认领的 ready 工作不会自己让池子增长（在修复前的 SDK 运行里可见：1 个只有 `integrator` 能力的 ready 任务对上 4 个存活 worker → 0 个 `roster.grow` 事件；现在 harness 会以 `[stuck]` 行结束这类运行，而不是等超时）。增量本身以 `max(live, planned)` 为基准衡量（`auto.ts:304`）。
 - 状态行和 widget 是 extension 的 UI 帧 —— 无头会话（`--no-ui`）按宿主契约不产出；要看它们请用 UI 模式的会话。
