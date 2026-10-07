@@ -6,7 +6,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { AutoController, NUDGE_TEXT, planRoster, type AutoDeps, type AutoOptions } from "../../extension/auto";
+import {
+	AutoController,
+	COORDINATOR_NUDGE,
+	COORDINATOR_POLICY,
+	SWARM_NUDGE,
+	SWARM_POLICY,
+	planRoster,
+	type AutoDeps,
+	type AutoOptions,
+} from "../../extension/auto";
 import { loadSwarmConfig, saveSwarmAuto } from "../../extension/config";
 import { openInMemoryDatabase, swarmPaths } from "../../extension/db";
 import { SwarmStore } from "../../extension/store";
@@ -91,6 +100,7 @@ function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } 
 		controller,
 		calls,
 		settleMs: options.auto?.settleMs ?? 1000,
+		now: () => clock,
 		advance: (ms: number) => {
 			clock += ms;
 		},
@@ -324,14 +334,15 @@ describe("multi-agent mode", () => {
 	});
 
 	test("a busy coordinator that publishes nothing is nudged once, then given up on", async () => {
-		const h = harness();
+		// The legacy path: this nudge asks for the task list, so it belongs to coordinator planning.
+		const h = harness({ config: { planning: "coordinator" } });
 		h.controller.enable();
 		h.controller.noteTask("a task the coordinator forgot");
 		h.setBusy(true);
 		h.advance(1000);
 		await h.controller.tick();
 		expect(h.controller.phase).toBe("nudging");
-		expect(h.calls.nudge).toEqual([NUDGE_TEXT]);
+		expect(h.calls.nudge).toEqual([COORDINATOR_NUDGE]);
 		await h.controller.tick();
 		expect(h.calls.nudge.length).toBe(1);
 		h.advance(1000);
@@ -484,5 +495,143 @@ describe("status text", () => {
 		h.setDriverRunning(true);
 		expect(h.controller.phase).toBe("idle");
 		expect(h.controller.statusText()).toMatch(/^MULTI-AGENT ON · \d+a r1 c0 v0 d0$/);
+	});
+});
+
+describe("swarm-side planning", () => {
+	test("a live goal sizes the roster by itself, and never past the worker budget", () => {
+		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
+		expect(planRoster([], config, 3)).toEqual([{ name: "general", count: 3, capabilities: ["general"] }]);
+		expect(planRoster([], config, 9).reduce((n, role) => n + role.count, 0)).toBe(4);
+		expect(planRoster([], config)).toEqual([]); // without a goal there is still nothing to size
+	});
+
+	test("the round's single planning task does not shrink the pool to one worker", () => {
+		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
+		const planning = task({ requiredCapabilities: ["general"] });
+		expect(planRoster([planning], config, 3)).toEqual([{ name: "general", count: 3, capabilities: ["general"] }]);
+		expect(planRoster([planning], config).reduce((n, role) => n + role.count, 0)).toBe(1);
+	});
+
+	test("a goal with no tasks at all starts the pool with the requested agent count", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		const opened = h.store.createGoal({ goal: "split me", agents: 3, createdBy: "main", now: h.now() });
+		expect(opened.planningTask.requiredCapabilities).toEqual(["general"]);
+		await settle(h);
+		expect(h.calls.start.length).toBe(1);
+		expect(h.calls.start[0]?.count).toBe(3);
+		expect(h.controller.phase).toBe("running");
+		expect(h.controller.header()).toEqual(["MULTI-AGENT MODE · running · goal-1 (3a)"]);
+	});
+
+	test("a live goal keeps the pool out of the stall branch even when nothing is claimable", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		const opened = h.store.createGoal({ goal: "split me", agents: 2, createdBy: "main", deadlineMs: 600_000, now: h.now() });
+		// Residue of exactly the shape the stall notice fires on: blocked work, nothing claimable.
+		const seed = h.store.createTask({ title: "a", createdBy: "main" });
+		h.store.claim(seed.id, "main", 300);
+		h.store.fail(seed.id, "main", "cannot be done");
+		h.store.createTask({ title: "b", createdBy: "main", dependencies: [seed.id] });
+		await settle(h);
+		h.setDriverRunning(true);
+		// The round's only convergence path is closed, so nothing is actionable while the goal is open.
+		expect(h.store.claim(opened.planningTask.id, "w1", 300, ["general"]).ok).toBe(true);
+		expect(h.store.fail(opened.planningTask.id, "w1", "cannot merge").ok).toBe(true);
+		h.advance(h.settleMs + h.settleMs);
+		await h.controller.tick();
+		expect(h.calls.stop).toEqual([]); // the round is in flight, not a stall
+		expect(h.controller.phase).toBe("running");
+		expect(h.calls.notify).toEqual([]);
+	});
+
+	test("the round's bound closes the goal with a FAIL instead of spinning", async () => {
+		const h = harness();
+		h.controller.enable();
+		const opened = h.store.createGoal({ goal: "split me", agents: 2, createdBy: "main", deadlineMs: 1000, now: h.now() });
+		await h.controller.tick();
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("open"); // the bound does not fire early
+		expect(h.calls.notify).toEqual([]);
+		h.advance(1001);
+		await h.controller.tick();
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("failed");
+		expect(h.store.getTask(opened.planningTask.id)?.status).toBe("failed");
+		expect(h.calls.notify.length).toBe(1);
+		expect(h.calls.main.length).toBe(1);
+		const fails = h.store.searchBoard({ type: "FAIL" });
+		expect(fails.length).toBe(1);
+		expect(fails[0]?.content).toContain("hit its bound");
+		expect(fails[0]?.tags).toContain("goal:goal-1");
+	});
+
+	test("the bound never re-closes a goal the scribe already planned", async () => {
+		const h = harness();
+		h.controller.enable();
+		const opened = h.store.createGoal({ goal: "split me", agents: 2, createdBy: "main", deadlineMs: 1000, now: h.now() });
+		expect(h.store.claim(opened.planningTask.id, "w1", 300, ["general"]).ok).toBe(true);
+		h.store.postProposal(opened.goal, "w1", [{ title: "t" }]);
+		expect(h.store.planGoal(opened.goal.id, "w1").ok).toBe(true);
+		h.advance(10_000);
+		await h.controller.tick();
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("planned");
+		expect(h.calls.notify).toEqual([]);
+		expect(h.store.searchBoard({ type: "FAIL" })).toEqual([]);
+	});
+
+	test("the default policy hands the split to the workers and never asks for a task list", () => {
+		const h = harness();
+		h.controller.enable();
+		expect(h.config.planning).toBe("swarm");
+		expect(h.controller.policy()).toBe(SWARM_POLICY);
+		expect(h.controller.policy()).toContain("swarm_goal");
+		expect(h.controller.policy()).toContain("Do NOT write the task list yourself");
+		expect(h.controller.policy()).not.toContain("Decompose it into 2-6 independent tasks");
+		expect(h.controller.notice()).toContain("swarm_goal");
+	});
+
+	test('planning: "coordinator" keeps the old text, notice and nudge', async () => {
+		const h = harness({ config: { planning: "coordinator" } });
+		h.controller.enable();
+		expect(h.controller.policy()).toBe(COORDINATOR_POLICY);
+		expect(h.controller.policy()).toContain("Decompose it into 2-6 independent tasks");
+		expect(h.controller.notice()).toContain("swarm_task_create");
+		h.controller.noteTask("a task the coordinator forgot");
+		h.setBusy(true);
+		h.advance(1000);
+		await h.controller.tick();
+		expect(h.calls.nudge).toEqual([COORDINATOR_NUDGE]);
+	});
+
+	test("a swarm-planning coordinator that opens no goal is nudged toward swarm_goal", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.controller.noteTask("a task the coordinator forgot");
+		h.setBusy(true);
+		h.advance(1000);
+		await h.controller.tick();
+		expect(h.calls.nudge).toEqual([SWARM_NUDGE]);
+		expect(h.calls.nudge[0]).toContain("swarm_goal");
+	});
+});
+
+describe("planning config", () => {
+	test("defaults to swarm, honours coordinator, and ignores an unknown value", () => {
+		const dir = mkdtempSync(join(tmpdir(), "swarm-planning-config-"));
+		tempDirs.push(dir);
+		const configFile = join(dir, ".swarm", "config.json");
+		expect(loadSwarmConfig(join(dir, "absent.json")).planning).toBe("swarm");
+		saveSwarmAuto(configFile, false); // creates `.swarm/`, exactly as the mode switch does
+
+		writeFileSync(configFile, `${JSON.stringify({ planning: "swarm" }, null, 2)}\n`);
+		expect(loadSwarmConfig(configFile).planning).toBe("swarm");
+		writeFileSync(configFile, `${JSON.stringify({ planning: "coordinator", workers: 2 }, null, 2)}\n`);
+		expect(loadSwarmConfig(configFile).planning).toBe("coordinator");
+		expect(loadSwarmConfig(configFile).workers).toBe(2);
+
+		writeFileSync(configFile, `${JSON.stringify({ planning: "nonsense" }, null, 2)}\n`);
+		expect(loadSwarmConfig(configFile).planning).toBe("swarm");
 	});
 });

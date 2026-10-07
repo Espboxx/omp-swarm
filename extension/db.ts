@@ -87,6 +87,22 @@ CREATE TABLE IF NOT EXISTS task_deps (
   PRIMARY KEY (task_id, depends_on)
 );
 
+CREATE TABLE IF NOT EXISTS goals (
+  id            TEXT PRIMARY KEY,
+  goal          TEXT NOT NULL,
+  agents        INTEGER NOT NULL,
+  status        TEXT NOT NULL,
+  created_by    TEXT NOT NULL,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  deadline_at   INTEGER NOT NULL,
+  planning_task TEXT NOT NULL,
+  planner       TEXT,
+  planned_at    INTEGER,
+  result        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
+
 CREATE TABLE IF NOT EXISTS reservations (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   pattern     TEXT NOT NULL,

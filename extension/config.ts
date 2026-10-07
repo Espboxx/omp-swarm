@@ -39,6 +39,7 @@ export function loadSwarmConfig(configFile: string): SwarmConfig {
 		idleTickSeconds: typeof raw.idleTickSeconds === "number" && raw.idleTickSeconds > 0 ? raw.idleTickSeconds : DEFAULT_CONFIG.idleTickSeconds,
 		review: typeof raw.review === "boolean" ? raw.review : DEFAULT_CONFIG.review,
 		auto: typeof raw.auto === "boolean" ? raw.auto : DEFAULT_CONFIG.auto,
+		planning: raw.planning === "coordinator" ? "coordinator" : DEFAULT_CONFIG.planning,
 		worktrees: typeof raw.worktrees === "boolean" ? raw.worktrees : DEFAULT_CONFIG.worktrees,
 		model: typeof raw.model === "string" ? raw.model : undefined,
 		thinkingLevel: typeof raw.thinkingLevel === "string" ? raw.thinkingLevel : undefined,

@@ -102,6 +102,47 @@ export interface TaskCounts {
 	failed: number;
 }
 
+/** A goal's planning round: `open` until the scribe plans it or its bound closes it as `failed`. */
+export type GoalStatus = "open" | "planned" | "failed";
+
+export interface SwarmGoal {
+	id: string;
+	/** The user's request, verbatim: what the workers split. */
+	goal: string;
+	/** The agent budget the coordinator asked for (already clamped to `config.workers`). */
+	agents: number;
+	status: GoalStatus;
+	createdBy: string;
+	createdAt: number;
+	updatedAt: number;
+	/** `createdAt + GOAL_DEADLINE_MS`: past this, an unplanned goal is closed with a FAIL. */
+	deadlineAt: number;
+	/** The goal's ONE planning task; the first agent to claim it is the scribe. */
+	planningTask: string;
+	/** The scribe that merged the round. */
+	planner?: string;
+	plannedAt?: number;
+	/** The merged-split summary, or the reason the goal failed. */
+	result?: string;
+}
+
+export interface PlanResult {
+	ok: boolean;
+	/** Present when `ok`. */
+	goal?: SwarmGoal;
+	/** Ids of the tasks the merge created, in creation order. */
+	created: string[];
+	/** Deliverables the merge left alone because the pool already holds that deliverable. */
+	skipped: { title: string; id: string }[];
+	/** Number of proposals the round carried. */
+	proposals: number;
+	/** Deliverable keys more than one proposal named. */
+	folded: string[];
+	/** Dependency references that could not be resolved (dropped). */
+	unresolved: { task: string; dep: string }[];
+	reason?: string;
+}
+
 export interface ClaimResult {
 	ok: boolean;
 	reason?: string;
@@ -123,6 +164,13 @@ export interface SwarmConfig {
 	review: boolean;
 	/** Multi-agent mode: the next user task is decomposed into swarm tasks that start on their own. */
 	auto: boolean;
+	/**
+	 * Who splits the work. `"swarm"` (the default): the coordinator only decides how many agents a
+	 * goal needs (`swarm_goal`), the workers propose the split themselves and the first to claim the
+	 * goal's planning task merges it. `"coordinator"`: the pre-2026-10-07 path — the coordinator
+	 * writes the whole task list with `swarm_task_create` and the workers only claim from it.
+	 */
+	planning: "swarm" | "coordinator";
 	worktrees: boolean;
 	model?: string;
 	thinkingLevel?: string;
@@ -138,6 +186,7 @@ export const DEFAULT_CONFIG: SwarmConfig = {
 	idleTickSeconds: 15,
 	review: true,
 	auto: false,
+	planning: "swarm",
 	worktrees: false,
 	roles: [{ name: "general", count: 4, capabilities: ["general"] }],
 	tools: ["read", "grep", "glob", "edit", "write", "bash", "ast_grep", "ast_edit", "todo"],

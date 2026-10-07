@@ -12,7 +12,7 @@
  * and tests call it directly.
  */
 import type { SwarmStore } from "./store";
-import type { RoleConfig, SwarmConfig, SwarmTask, TaskCounts } from "./types";
+import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
 
 export type AutoPhase = "off" | "idle" | "planning" | "nudging" | "running" | "done" | "stalled";
 
@@ -61,10 +61,17 @@ const PENDING_TURN_WINDOW_MS = 10_000;
  */
 const START_SETTLE_MS = 20_000;
 
-/** Roles the swarm needs for these tasks: one agent per required capability, sized to the plan. */
-export function planRoster(tasks: SwarmTask[], config: SwarmConfig): RoleConfig[] {
+/**
+ * Roles the swarm needs for this work: one agent per required capability, sized to the plan.
+ *
+ * `goalAgents` is the budget a live planning round asked for (`swarm_goal`). A goal is work the pool
+ * owes even before any task exists — that is the point of swarm-side planning — so it sizes the
+ * roster on its own, and it raises the size when the round's one planning task would otherwise
+ * shrink the pool to a single worker.
+ */
+export function planRoster(tasks: SwarmTask[], config: SwarmConfig, goalAgents = 0): RoleConfig[] {
 	const active = tasks.filter((t) => t.status !== "done" && t.status !== "failed");
-	if (active.length === 0) return [];
+	if (active.length === 0 && goalAgents <= 0) return [];
 	const needed = new Set<string>();
 	for (const task of active) for (const cap of task.requiredCapabilities) needed.add(cap);
 	if (needed.size === 0) needed.add("general");
@@ -72,7 +79,8 @@ export function planRoster(tasks: SwarmTask[], config: SwarmConfig): RoleConfig[
 	const ordered = [...needed].sort((a, b) => (a === "general" ? -1 : b === "general" ? 1 : a.localeCompare(b)));
 	// Sized to the whole plan, capped by the worker budget: work that is `blocked` behind a dependency
 	// is still this plan's work, and a pool sized only to what is ready right now serializes the run.
-	const budget = Math.max(1, Math.min(config.workers, active.length));
+	const wanted = Math.max(active.length, goalAgents);
+	const budget = Math.max(1, Math.min(config.workers, wanted));
 	// One agent per needed capability, capped by the worker budget; the slack goes to the
 	// general-capable role so a wide pool stays cooperative rather than single-threaded.
 	const roster = ordered.slice(0, Math.max(1, budget)).map((cap) => {
@@ -98,7 +106,12 @@ function takeWorkers(desired: RoleConfig[], delta: number): RoleConfig[] {
 	return out;
 }
 
-export const MODE_POLICY = [
+/**
+ * The coordinator policy of the LEGACY path (`planning: "coordinator"`): the coordinator writes the
+ * whole task list itself. Kept verbatim behind the flag so the old behaviour stays reachable and
+ * provably unchanged.
+ */
+export const COORDINATOR_POLICY = [
 	"[MULTI-AGENT MODE] You are the coordinator of a peer swarm; the workers execute.",
 	"The user's message is a task for the swarm. Do this, in this order:",
 	"1. Decompose it into 2-6 independent tasks and create each with swarm_task_create:",
@@ -112,17 +125,43 @@ export const MODE_POLICY = [
 	"If the user's message is a question, chat, or work that cannot be split, ignore this block and answer normally - do not create tasks.",
 ].join("\n");
 
-export const MODE_NOTICE =
+/**
+ * The coordinator policy of the DEFAULT path (`planning: "swarm"`): the coordinator sizes the pool
+ * and nothing else. The workers evaluate the split themselves, negotiate it, create the tasks and
+ * claim them; the coordinator must NOT pre-write the task list.
+ */
+export const SWARM_POLICY = [
+	"[MULTI-AGENT MODE] You are the coordinator of a peer swarm; the workers evaluate and execute the work.",
+	"The user's message is a task for the swarm. Do this, in this order:",
+	"1. Decide HOW MANY agents it needs (1 to your worker budget). Do NOT write the task list yourself:",
+	"   the workers read the goal, each propose their own split, merge it and claim the result.",
+	"2. Call swarm_goal({ goal, agents }) ONCE with the user's request (carry every constraint they gave)",
+	"   and that agent count. It opens the planning round and starts the pool.",
+	"3. Tell the user the goal and the agent count, then STOP working on the task yourself: do not edit the files the workers own.",
+	"4. Stay available: answer progress questions with swarm_status / swarm_tasks / /swarm board.",
+	"If the user's message is a question, chat, or work that cannot be split, ignore this block and answer normally - do not call swarm_goal.",
+].join("\n");
+
+export const COORDINATOR_NOTICE =
 	"MULTI-AGENT MODE: this request is executed by a peer swarm. Publish the plan with swarm_task_create and do not edit the files yourself - the workers start automatically.";
 
-export const NUDGE_TEXT =
+export const SWARM_NOTICE =
+	"MULTI-AGENT MODE: this request is executed by a peer swarm. Post it with swarm_goal (you only choose how many agents) and do not edit the files yourself - the workers split it, claim it and start automatically.";
+
+export const COORDINATOR_NUDGE =
 	"[swarm] no tasks exist yet for the user's request. Create them now with swarm_task_create (2-6 tasks, required_capabilities general/reviewer/integrator) so the swarm can start; if the request cannot be split, say so instead.";
+
+export const SWARM_NUDGE =
+	"[swarm] no goal exists yet for the user's request. Call swarm_goal({ goal, agents }) now - decide only how many agents; the workers evaluate the split and claim it themselves. If the request cannot be split, say so instead.";
 
 const drainNotice = (counts: TaskCounts): string =>
 	`[swarm] the swarm finished: ${counts.done} task(s) done, ${counts.failed} failed. Run /swarm board for details, then report the outcome to the user.`;
 
 const stallNotice = (counts: TaskCounts): string =>
 	`[swarm] the swarm stalled: ${counts.blocked} task(s) blocked with no claimable work. Workers were stopped; fix the dependencies or run /swarm start manually.`;
+
+const goalBoundNotice = (goal: SwarmGoal): string =>
+	`[swarm] the planning round for ${goal.id} hit its bound with no plan, so the goal is closed as failed - nothing is spinning. Post a new goal, or create the tasks directly with swarm_task_create.`;
 
 export class AutoController {
 	readonly #deps: AutoDeps;
@@ -209,11 +248,16 @@ export class AutoController {
 	}
 
 	policy(): string {
-		return MODE_POLICY;
+		return this.#deps.config.planning === "coordinator" ? COORDINATOR_POLICY : SWARM_POLICY;
 	}
 
 	notice(): string {
-		return MODE_NOTICE;
+		return this.#deps.config.planning === "coordinator" ? COORDINATOR_NOTICE : SWARM_NOTICE;
+	}
+
+	/** The nudge that goes to a coordinator which never opened a planning round. */
+	#nudgeText(): string {
+		return this.#deps.config.planning === "coordinator" ? COORDINATOR_NUDGE : SWARM_NUDGE;
 	}
 
 	async tick(): Promise<void> {
@@ -224,10 +268,20 @@ export class AutoController {
 			const tasks = store.listTasks({ limit: 500 });
 			const counts = store.counts();
 			const actionable = counts.ready + counts.claimed + counts.review;
-
-			// Auto-start: the coordinator publishes tasks (or the operator seeds them) and the pool
-			// assembles once they stop arriving, so the roster is sized to the whole plan. A task
-			// created mid-turn must not fix the pool size for the entire run.
+			// A live goal is work the pool owes before any task exists: it sizes the roster on its own
+			// and it must not be read as a stall. The bound is enforced here, on the tick that already
+			// exists, so a round that cannot converge is CLOSED with a FAIL instead of spinning.
+			for (const goal of store.closeExpiredGoals(this.#deps.now())) {
+				const notice = goalBoundNotice(goal);
+				this.#deps.notify(notice, "warning");
+				this.#deps.notifyMain(notice);
+				this.#deps.onEvent?.("swarm.goal.failed", { goal: goal.id });
+			}
+			const liveGoals = store.liveGoals();
+			const goalAgents = liveGoals.reduce((n, goal) => Math.max(n, goal.agents), 0);
+			// Auto-start: the coordinator publishes tasks - or opens a goal, which mints exactly one
+			// planning task - and the pool assembles once they stop arriving, so the roster is sized to
+			// the whole plan. A task created mid-turn must not fix the pool size for the entire run.
 			if (!this.#deps.isDriverRunning()) {
 				const newIds = tasks.filter((t) => !this.#knownIds.has(t.id));
 				if (newIds.length > 0) {
@@ -242,7 +296,7 @@ export class AutoController {
 				!this.#deps.isMainBusy() &&
 				this.#deps.now() - this.#lastTaskAt >= this.#settleMs
 			) {
-				const roster = planRoster(tasks, config);
+				const roster = planRoster(tasks, config, goalAgents);
 				if (roster.length > 0) {
 					const size = roster.reduce((n, role) => n + role.count, 0);
 					this.#blockedSince = undefined;
@@ -270,7 +324,7 @@ export class AutoController {
 				if (this.#deps.now() - this.#plannedAt >= this.#nudgeMs) {
 					if (this.#deps.isMainBusy()) {
 						this.#setPhase("nudging");
-						this.#deps.nudgeToMain(NUDGE_TEXT);
+						this.#deps.nudgeToMain(this.#nudgeText());
 					} else {
 						this.#setPhase("idle");
 					}
@@ -326,9 +380,10 @@ export class AutoController {
 				}
 			}
 
-			// Stall: a running swarm with blocked work and nothing claimable.
+			// Stall: a running swarm with blocked work and nothing claimable. An OPEN GOAL is excluded:
+			// the planning round is work in flight, not a stall, and the bound above is what closes it.
 			if (this.#phase === "running" && this.#deps.isDriverRunning()) {
-				if (actionable === 0 && counts.blocked > 0) {
+				if (actionable === 0 && counts.blocked > 0 && liveGoals.length === 0) {
 					this.#blockedSince ??= this.#deps.now();
 					if (this.#deps.now() - this.#blockedSince >= this.#stallMs) {
 						const notice = stallNotice(counts);
@@ -376,7 +431,12 @@ export class AutoController {
 	}
 
 	header(): string[] {
-		return this.#phase === "off" ? [] : [`MULTI-AGENT MODE · ${this.#phase}`];
+		if (this.#phase === "off") return [];
+		// A live planning round is named on the header: it is the one thing the operator must see
+		// while no task exists yet.
+		const goals = this.#deps.store.liveGoals();
+		const round = goals.map((goal) => `${goal.id} (${goal.agents}a)`).join(" ");
+		return [`MULTI-AGENT MODE · ${this.#phase}${round === "" ? "" : ` · ${round}`}`];
 	}
 
 	dispose(): void {

@@ -1,11 +1,28 @@
 import { appendEventLine, type Db, type SwarmPaths } from "./db";
+import {
+	DEDUPE_KEY_TEXT,
+	GOAL_DEADLINE_MS,
+	MIN_PROPOSALS,
+	PROPOSAL_TAG,
+	deliverableKey,
+	goalTag,
+	mergeProposals,
+	orderForCreation,
+	parseProposal,
+	planningTaskBrief,
+	type MergedTask,
+	type Proposal,
+} from "./planning";
 import type {
 	AgentStatus,
 	BlackboardEntry,
 	BoardType,
 	ClaimResult,
+	GoalStatus,
+	PlanResult,
 	Reservation,
 	SwarmAgent,
+	SwarmGoal,
 	SwarmMessage,
 	SwarmTask,
 	TaskCounts,
@@ -86,6 +103,21 @@ interface CountRow {
 	n: number;
 }
 
+interface GoalRow {
+	id: string;
+	goal: string;
+	agents: number;
+	status: GoalStatus;
+	created_by: string;
+	created_at: number;
+	updated_at: number;
+	deadline_at: number;
+	planning_task: string;
+	planner: string | null;
+	planned_at: number | null;
+	result: string | null;
+}
+
 function parseList(raw: string): string[] {
 	try {
 		const value = JSON.parse(raw);
@@ -120,6 +152,34 @@ function toTask(row: TaskRow, deps: string[]): SwarmTask {
 			notes: row.review_notes ?? undefined,
 		},
 		attempts: row.attempts,
+	};
+}
+
+/**
+ * What a merged deliverable says on its row: the proposer's own description, plus the provenance a
+ * later reader needs (which proposals and agents it came from, and which goal round produced it).
+ */
+function mergedTaskDescription(task: MergedTask, goal: SwarmGoal, scribe: string): string {
+	const lines = [task.deliverable ?? task.title, ""];
+	lines.push(`Split by ${task.agents.join(", ")} in the planning round of ${goal.id} (goal: ${goal.goal}); merged by ${scribe}.`);
+	if (task.files.length > 0) lines.push(`Files: ${task.files.join(", ")}`);
+	return lines.join("\n");
+}
+
+function toGoal(row: GoalRow): SwarmGoal {
+	return {
+		id: row.id,
+		goal: row.goal,
+		agents: row.agents,
+		status: row.status,
+		createdBy: row.created_by,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		deadlineAt: row.deadline_at,
+		planningTask: row.planning_task,
+		planner: row.planner ?? undefined,
+		plannedAt: row.planned_at ?? undefined,
+		result: row.result ?? undefined,
 	};
 }
 
@@ -336,38 +396,44 @@ export class SwarmStore {
 	// ----------------------------------------------------------------- tasks
 
 	createTask(input: CreateTaskInput): SwarmTask {
+		return this.#db.transaction(() => this.#createTaskLocked(input));
+	}
+
+	/**
+	 * The task insert without its own transaction, so a caller that must be atomic across several
+	 * rows (`planGoal` creates a whole round) shares ONE write transaction instead of nesting them.
+	 */
+	#createTaskLocked(input: CreateTaskInput): SwarmTask {
 		const now = Date.now();
 		const deps = [...new Set(input.dependencies ?? [])];
-		return this.#db.transaction(() => {
-			const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM tasks");
-			const id = `task-${next?.n ?? 1}`;
-			this.#assertDependencies(id, deps);
-			const blocked = deps.some((dep) => {
-				const row = this.#db.get<{ status: TaskStatus }>("SELECT status FROM tasks WHERE id=?", dep);
-				return row === null || row.status !== "done";
-			});
-			this.#db.run(
-				`INSERT INTO tasks (id, title, description, status, priority, created_by, created_at, updated_at,
-				   required_capabilities, files, review_required, attempts)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
-				id,
-				input.title,
-				input.description ?? "",
-				blocked ? "blocked" : "ready",
-				input.priority ?? 0,
-				input.createdBy,
-				now,
-				now,
-				JSON.stringify(input.requiredCapabilities ?? []),
-				JSON.stringify(input.files ?? []),
-				input.reviewRequired ? 1 : 0,
-			);
-			for (const dep of deps) {
-				this.#db.run("INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?, ?)", id, dep);
-			}
-			this.#log("task.create", input.createdBy, id, { title: input.title, blocked });
-			return this.getTask(id) as SwarmTask;
+		const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM tasks");
+		const id = `task-${next?.n ?? 1}`;
+		this.#assertDependencies(id, deps);
+		const blocked = deps.some((dep) => {
+			const row = this.#db.get<{ status: TaskStatus }>("SELECT status FROM tasks WHERE id=?", dep);
+			return row === null || row.status !== "done";
 		});
+		this.#db.run(
+			`INSERT INTO tasks (id, title, description, status, priority, created_by, created_at, updated_at,
+			   required_capabilities, files, review_required, attempts)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+			id,
+			input.title,
+			input.description ?? "",
+			blocked ? "blocked" : "ready",
+			input.priority ?? 0,
+			input.createdBy,
+			now,
+			now,
+			JSON.stringify(input.requiredCapabilities ?? []),
+			JSON.stringify(input.files ?? []),
+			input.reviewRequired ? 1 : 0,
+		);
+		for (const dep of deps) {
+			this.#db.run("INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?, ?)", id, dep);
+		}
+		this.#log("task.create", input.createdBy, id, { title: input.title, blocked });
+		return this.getTask(id) as SwarmTask;
 	}
 
 	#deps(taskId: string): string[] {
@@ -705,6 +771,229 @@ export class SwarmStore {
 			this.#log("task.retry", agentId, taskId, { from: row.status, reason, claimable });
 			return { ok: true, task: this.getTask(taskId) };
 		});
+	}
+
+	// ----------------------------------------------------------------- goals
+
+	/**
+	 * Open a goal's planning round: the goal row plus the ONE planning task whose first claimer
+	 * becomes the scribe. One transaction, so a goal can never exist without its planning task.
+	 */
+	createGoal(input: { goal: string; agents: number; createdBy: string; deadlineMs?: number; now?: number }): {
+		goal: SwarmGoal;
+		planningTask: SwarmTask;
+	} {
+		const createdAt = input.now ?? Date.now();
+		const deadlineMs = input.deadlineMs ?? GOAL_DEADLINE_MS;
+		return this.#db.transaction(() => {
+			const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM goals");
+			const id = `goal-${next?.n ?? 1}`;
+			// The planning task is created first so the goal row can carry its id; the brief is built
+			// from the same values the row will hold.
+			const planningTask = this.#createTaskLocked({
+				title: `Plan ${id}: merge the split proposals into the task graph`,
+				description: planningTaskBrief({ id, goal: input.goal, agents: input.agents, createdBy: input.createdBy }, deadlineMs),
+				priority: 10,
+				createdBy: input.createdBy,
+				requiredCapabilities: ["general"],
+			});
+			this.#db.run(
+				`INSERT INTO goals (id, goal, agents, status, created_by, created_at, updated_at, deadline_at, planning_task)
+				 VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)`,
+				id,
+				input.goal,
+				input.agents,
+				input.createdBy,
+				createdAt,
+				createdAt,
+				createdAt + deadlineMs,
+				planningTask.id,
+			);
+			this.#log("goal.open", input.createdBy, planningTask.id, { goal: id, agents: input.agents, deadlineMs });
+			return { goal: this.getGoal(id) as SwarmGoal, planningTask };
+		});
+	}
+
+	getGoal(id: string): SwarmGoal | undefined {
+		const row = this.#db.get<GoalRow>("SELECT * FROM goals WHERE id=?", id);
+		return row ? toGoal(row) : undefined;
+	}
+
+	/** Goals whose planning round is still open, oldest first. */
+	liveGoals(): SwarmGoal[] {
+		return this.#db.all<GoalRow>("SELECT * FROM goals WHERE status='open' ORDER BY created_at, id").map(toGoal);
+	}
+
+	/** The goal a task belongs to, when that task is the goal's planning task. */
+	goalForPlanningTask(taskId: string): SwarmGoal | undefined {
+		const row = this.#db.get<GoalRow>("SELECT * FROM goals WHERE planning_task=?", taskId);
+		return row ? toGoal(row) : undefined;
+	}
+
+	/**
+	 * The split proposals of one round, oldest first. A proposal is an ordinary board entry: the
+	 * `proposal` tag makes it identifiable, and the entry's task_id IS the goal's planning task, so
+	 * the query scopes the round exactly (two goals cannot mix their proposals).
+	 */
+	listProposals(goal: SwarmGoal): Proposal[] {
+		return this.searchBoard({ taskId: goal.planningTask, tags: [PROPOSAL_TAG], limit: 500 })
+			.map(parseProposal)
+			.filter((proposal): proposal is Proposal => proposal !== undefined)
+			.sort((a, b) => a.entryId - b.entryId);
+	}
+
+	/** Post one worker's split: a board entry, so it is visible to the whole swarm, not a side table. */
+	postProposal(goal: SwarmGoal, agentId: string, tasks: unknown): BlackboardEntry {
+		return this.postBoard({
+			type: "OBSERVATION",
+			agentId,
+			taskId: goal.planningTask,
+			content: JSON.stringify({ goal: goal.id, tasks }, null, 2),
+			tags: [PROPOSAL_TAG, goalTag(goal.id)],
+		});
+	}
+
+	/**
+	 * The scribe's convergence step. Exactly once by construction:
+	 * - the election is `claim()` on the planning task (atomic, lease-backed); this refuses a caller
+	 *   that does not hold it, so a lease expiry hands the round to the next claimer;
+	 * - the whole write is ONE transaction that first re-checks the goal is still `open`, so two
+	 *   scribes can never both pour a plan into the same goal;
+	 * - creation is idempotent against the pool: a deliverable a live task already carries is
+	 *   skipped (and reported), so a scribe that dies mid-merge cannot duplicate the rows it wrote.
+	 */
+	planGoal(goalId: string, agentId: string): PlanResult {
+		const now = Date.now();
+		const created: string[] = [];
+		const skipped: { title: string; id: string }[] = [];
+		let proposals = 0;
+		let folded: string[] = [];
+		let unresolved: { task: string; dep: string }[] = [];
+		const outcome = this.#db.transaction((): PlanResult => {
+			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, unresolved, reason });
+			const goal = this.getGoal(goalId);
+			if (goal === undefined) return refuse(`unknown goal ${goalId}`);
+			if (goal.status !== "open") return refuse(`goal ${goalId} is ${goal.status}`);
+			const planning = this.getTask(goal.planningTask);
+			if (planning === undefined) return refuse(`goal ${goalId} has no planning task row`);
+			if (planning.status !== "claimed" || planning.claimedBy !== agentId) {
+				return refuse(
+					`the planning task ${goal.planningTask} is not claimed by ${agentId} - claim it first; the first claimer is the scribe`,
+				);
+			}
+			const round = this.listProposals(goal);
+			proposals = round.length;
+			if (round.length < MIN_PROPOSALS) {
+				return refuse(`no split proposal for ${goalId} yet; post yours with swarm_propose, or wait for the other workers`);
+			}
+			const merge = mergeProposals(round);
+			folded = merge.folded;
+			unresolved = merge.unresolved;
+			if (merge.tasks.length === 0) return refuse(`the ${round.length} proposal(s) for ${goalId} carry no usable task`);
+			// A `failed` row is not a deliverable the pool holds: only live/finished work dedupes.
+			const keys = new Map<string, string>();
+			for (const task of this.listTasks({ limit: 1000 })) if (task.status !== "failed") keys.set(deliverableKey(task.title), task.id);
+			for (const merged of orderForCreation(merge.tasks).ordered) {
+				const existing = keys.get(merged.key);
+				if (existing !== undefined) {
+					skipped.push({ title: merged.title, id: existing });
+					continue;
+				}
+				const dependencies = merged.dependsOn.map((key) => keys.get(key)).filter((id): id is string => id !== undefined);
+				const row = this.#createTaskLocked({
+					title: merged.title,
+					description: mergedTaskDescription(merged, goal, agentId),
+					createdBy: agentId,
+					dependencies,
+					requiredCapabilities: merged.capabilities,
+					files: merged.files,
+					reviewRequired: merged.reviewRequired,
+				});
+				keys.set(merged.key, row.id);
+				created.push(row.id);
+			}
+			const summary = `${created.length} task(s) from ${round.length} proposal(s)`;
+			this.#db.run(
+				"UPDATE goals SET status='planned', planner=?, planned_at=?, updated_at=?, result=? WHERE id=? AND status='open'",
+				agentId,
+				now,
+				now,
+				summary,
+				goalId,
+			);
+			this.#log("goal.planned", agentId, goal.planningTask, {
+				goal: goalId,
+				created: created.length,
+				proposals: round.length,
+				folded: folded.length,
+			});
+			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, unresolved };
+		});
+		// The merged split is announced AFTER the write: the DECISION is the round's public record,
+		// never a correctness dependency of the plan itself.
+		if (outcome.ok && outcome.goal !== undefined) {
+			const lines = [
+				`${outcome.goal.id} planned by ${agentId}: ${created.length} task(s) from ${proposals} proposal(s).`,
+				DEDUPE_KEY_TEXT,
+				...created.map((id) => {
+					const task = this.getTask(id) as SwarmTask;
+					return [
+						`- ${id} ${task.title}`,
+						task.requiredCapabilities.length > 0 ? ` [${task.requiredCapabilities.join(", ")}]` : "",
+						task.files.length > 0 ? ` files: ${task.files.join(", ")}` : "",
+						task.dependencies.length > 0 ? ` after ${task.dependencies.join(", ")}` : "",
+					].join("");
+				}),
+			];
+			if (folded.length > 0) lines.push(`folded ${folded.length} duplicate deliverable(s)`);
+			if (skipped.length > 0) lines.push(`skipped (a live task already carries them): ${skipped.map((s) => `${s.title} -> ${s.id}`).join(", ")}`);
+			if (unresolved.length > 0) lines.push(`dropped unresolvable dependency reference(s): ${unresolved.map((d) => `${d.task} <- ${d.dep}`).join(", ")}`);
+			this.postBoard({
+				type: "DECISION",
+				agentId,
+				taskId: outcome.goal.planningTask,
+				content: lines.join("\n"),
+				tags: ["plan", goalTag(goalId)],
+			});
+		}
+		return outcome;
+	}
+
+	/**
+	 * The round's hard exit: an `open` goal past its deadline is closed `failed`, its unclaimed
+	 * planning task is closed with it (never left behind as claimable work), and a FAIL lands on the
+	 * board so both the pool and the operator see WHY nothing happened. A CLAIMED planning task is
+	 * left to its holder: the goal is already failed, and `planGoal` refuses a non-open goal, so a
+	 * slow scribe can only report the failure, never resurrect the round.
+	 */
+	closeExpiredGoals(now = Date.now()): SwarmGoal[] {
+		const closed = this.#db.transaction(() => {
+			const out: { goal: SwarmGoal; reason: string }[] = [];
+			for (const row of this.#db.all<GoalRow>("SELECT * FROM goals WHERE status='open' AND deadline_at <= ? ORDER BY created_at, id", now)) {
+				const reason = `planning round for ${row.id} hit its bound (${Math.round((now - row.created_at) / 1000)}s) with no plan; closed as failed`;
+				const changed = this.#db.run(
+					"UPDATE goals SET status='failed', result=?, updated_at=? WHERE id=? AND status='open'",
+					reason,
+					now,
+					row.id,
+				);
+				if (changed.changes !== 1) continue;
+				this.#db.run(
+					`UPDATE tasks SET status='failed', result=?, claimed_by=NULL, claimed_at=NULL, lease_until=NULL, updated_at=?
+					 WHERE id=? AND status IN ('ready','blocked')`,
+					reason,
+					now,
+					row.planning_task,
+				);
+				this.#log("goal.fail", row.created_by, row.planning_task, { goal: row.id, reason });
+				out.push({ goal: this.getGoal(row.id) as SwarmGoal, reason });
+			}
+			return out;
+		});
+		for (const { goal, reason } of closed) {
+			this.postBoard({ type: "FAIL", agentId: goal.createdBy, taskId: goal.planningTask, content: reason, tags: ["failure", goalTag(goal.id)] });
+		}
+		return closed.map((entry) => entry.goal);
 	}
 
 	// ---------------------------------------------------------------- review

@@ -8,7 +8,7 @@ import { expandWorkers, type WorkerSpec } from "./config";
 import { renderPanel, type DrainSummary } from "./render";
 import type { SwarmStore } from "./store";
 import { buildSwarmTools, SWARM_TOOL_NAMES, type SwarmIdentity } from "./tools";
-import type { RoleConfig, SwarmConfig, SwarmTask, TaskCounts } from "./types";
+import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
 
 type HostSdk = ExtensionAPI["pi"];
 type CreateOptions = NonNullable<Parameters<HostSdk["createAgentSession"]>[0]>;
@@ -149,6 +149,7 @@ export function workerSystemPrompt(spec: WorkerSpec, config: SwarmConfig, root: 
 		"2. board_search — check FACT/DECISION entries and, above all, FAIL entries, so you never repeat a dead end.",
 		"3. If you hold a task: continue it, and call swarm_renew when the work is long.",
 		"4. Otherwise swarm_tasks (status=ready) and pick the best task for your capabilities; swarm_claim it. Losing the claim race is normal — pick another.",
+		"If the pool has a LIVE GOAL and no real tasks yet (swarm_status names it): read the goal, post YOUR OWN split with swarm_propose, then claim the goal's planning task — the first claimer is the scribe that merges every proposal with swarm_plan.",
 		"5. Before editing files that another agent might touch, swarm_reserve them. Overlap is refused; that is the point.",
 		"6. Verify your work (run the tests, run the command) before swarm_complete.",
 		"7. Afterwards post what you learned: FACT for verified behaviour, FAIL for dead ends, RESULT for the outcome, QUESTION when you need a peer.",
@@ -174,6 +175,7 @@ function workerBootstrap(spec: WorkerSpec, config: SwarmConfig): string {
 		"1. swarm_status to see the shared state.",
 		"2. swarm_inbox and board_search (types FAIL, DECISION) to pick up prior knowledge.",
 		"3. swarm_tasks status=ready, then swarm_claim the best match for your capabilities.",
+		"If there is no claimable task but swarm_status names an OPEN GOAL, that is your first job: read the goal, post your own split with swarm_propose, then claim the goal's planning task (the first claimer is the scribe that merges every proposal with swarm_plan).",
 		"4. Work the task in your working directory. Verify it. swarm_complete with a summary.",
 		"5. Keep going: swarm_wait when the pool is empty, then claim again. Do not stop between tasks.",
 		config.review
@@ -451,12 +453,16 @@ export class SwarmDriver {
 	async #tick(): Promise<void> {
 		if (!this.#running) return;
 		const { store, config } = this.#deps;
+		// The round a worker can join right now: a live goal is what the pool converges on before it
+		// has any real task to claim.
+		const goals = store.liveGoals();
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
 			const messages = store.inbox(worker.spec.name, 5);
 			const mine = store.listTasks({ status: "claimed", agent: worker.spec.name, limit: 5 });
+			const scribe = goals.find((goal) => mine.some((task) => task.id === goal.planningTask));
 			if (messages.length > 0 || mine.length > 0) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, messages.length, mine.length));
+				await this.#prompt(worker, this.#continuationPrompt(worker, messages.length, mine.length, 0, 0, scribe, scribe !== undefined));
 				worker.lastTickAt = Date.now();
 				continue;
 			}
@@ -465,13 +471,13 @@ export class SwarmDriver {
 				.filter((t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => worker.identity.capabilities.includes(cap)));
 			const reviews = config.review ? store.listTasks({ status: "review", limit: 20 }).filter((t) => t.claimedBy !== worker.spec.name) : [];
 			if (ready.length > 0 || reviews.length > 0) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, ready.length, reviews.length));
+				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, ready.length, reviews.length, goals[0]));
 				worker.lastTickAt = Date.now();
 				continue;
 			}
 			const idleFor = Date.now() - worker.lastTickAt;
 			if (idleFor > config.idleTickSeconds * 1000) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, 0, 0));
+				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, 0, 0, goals[0]));
 				worker.lastTickAt = Date.now();
 			}
 		}
@@ -572,9 +578,17 @@ export class SwarmDriver {
 		};
 	}
 
-	#continuationPrompt(worker: WorkerRuntime, messages: number, mine: number, ready = 0, reviews = 0): string {
+	#continuationPrompt(worker: WorkerRuntime, messages: number, mine: number, ready = 0, reviews = 0, goal?: SwarmGoal, scribe = false): string {
 		if (messages > 0) return `You have ${messages} unread peer message(s). swarm_inbox, act on them, then continue the loop.`;
+		if (scribe && goal !== undefined) {
+			return `You hold the planning task ${goal.planningTask} of ${goal.id}: you are the SCRIBE. Read every split proposal (board_search type=OBSERVATION tags=proposal), then call swarm_plan({ goal_id: "${goal.id}" }) to dedupe and merge them into the real task graph - or swarm_release the task with a reason if you cannot.`;
+		}
 		if (mine > 0) return `You still hold ${mine} task(s). Continue or swarm_release with a reason.`;
+		// A live goal outranks the planning task it minted: the round must converge before the pool
+		// can claim real work, so this is what an idle-but-useful worker is told to do.
+		if (goal !== undefined) {
+			return `The pool has an OPEN GOAL ${goal.id} and no plan yet: read it (swarm_status, then the planning task ${goal.planningTask}), post YOUR OWN split with swarm_propose, then claim the planning task ${goal.planningTask} - the first claimer is the scribe that merges every proposal with swarm_plan.`;
+		}
 		if (ready > 0) return `There are ${ready} claimable task(s) matching your capabilities. swarm_tasks status=ready, then swarm_claim one.`;
 		if (reviews > 0) return `There are ${reviews} task(s) waiting for review. swarm_tasks status=review and review one you did not write.`;
 		return `No claimable work right now (${worker.spec.name}). swarm_wait, then look again; if nothing useful exists, post a QUESTION or create the next task yourself.`;

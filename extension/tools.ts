@@ -105,7 +105,18 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 						.join(", ")}`,
 				);
 			}
-			return ok(lines.join("\n"), { counts: snapshot.counts, agents: snapshot.agents.length });
+			const goals = store.liveGoals();
+			if (goals.length > 0) {
+				lines.push(
+					`goal(s): ${goals
+						.map((goal) => {
+							const text = goal.goal.length > 160 ? `${goal.goal.slice(0, 157)}...` : goal.goal;
+							return `${goal.id} open (${goal.agents} agents, planning task ${goal.planningTask}, ${store.listProposals(goal).length} proposal(s)) "${text}"`;
+						})
+						.join("; ")}`,
+				);
+			}
+			return ok(lines.join("\n"), { counts: snapshot.counts, agents: snapshot.agents.length, goals: goals.length });
 		},
 	};
 
@@ -307,6 +318,120 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 				status: task.status,
 				duplicateRisk: shared.map((other) => other.id),
 			});
+		},
+	};
+
+	const goalSchema = z.object({ goal: z.string(), agents: z.number() });
+	const goalTool: CustomTool<typeof goalSchema> = {
+		name: "swarm_goal",
+		label: "Open A Goal",
+		description:
+			"Open a goal's planning round: you decide only HOW MANY agents it needs (`agents`), never the task list. The workers read the goal, each post their own split with swarm_propose, and the first of them to claim the goal's planning task becomes the scribe that merges it with swarm_plan. Use this instead of swarm_task_create while planning is swarm-side.",
+		parameters: goalSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			if (config.planning === "coordinator") {
+				return ok('this swarm uses coordinator planning (planning: "coordinator"): write the task list yourself with swarm_task_create');
+			}
+			const goal = params.goal.trim();
+			if (goal === "") return err("a goal needs the user's request: swarm_goal({ goal, agents })", { opened: false });
+			const wanted = Number.isFinite(params.agents) ? Math.floor(params.agents) : 0;
+			if (wanted < 1) return err("agents must be at least 1: you decide how many workers the goal needs", { opened: false });
+			const agents = Math.min(wanted, config.workers);
+			const opened = store.createGoal({ goal, agents, createdBy: identity.id });
+			onChange?.();
+			return ok(
+				[
+					`${opened.goal.id} open with ${agents} agent(s)${agents < wanted ? ` (capped by config.workers=${config.workers})` : ""}.`,
+					`planning task: ${opened.planningTask.id} - the first agent to claim it is the scribe.`,
+					"the workers post their own splits (swarm_propose) and converge; report the goal to the user and do not write the task list yourself.",
+				].join("\n"),
+				{ id: opened.goal.id, agents, planningTask: opened.planningTask.id },
+			);
+		},
+	};
+
+	const proposedTaskSchema = z.object({
+		title: z.string(),
+		deliverable: z.string().optional(),
+		capabilities: z.array(z.string()).optional(),
+		files: z.array(z.string()).optional(),
+		depends_on: z.array(z.string()).optional(),
+		review_required: z.boolean().optional(),
+	});
+	const proposeSchema = z.object({ goal_id: z.string().optional(), tasks: z.array(proposedTaskSchema) });
+	const proposeTool: CustomTool<typeof proposeSchema> = {
+		name: "swarm_propose",
+		label: "Propose A Split",
+		description:
+			"Post YOUR OWN split of an open goal (a board entry tagged `proposal`, so every worker and the scribe can read it). One entry per task you think the goal needs: title, the deliverable, optional capabilities/files/review_required, and depends_on = titles of other proposed tasks. Any number of workers may propose; the scribe dedupes them by normalized title.",
+		parameters: proposeSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const goal = params.goal_id !== undefined ? store.getGoal(params.goal_id) : store.liveGoals()[0];
+			if (goal === undefined) {
+				return ok(
+					params.goal_id !== undefined
+						? `unknown goal ${params.goal_id}; swarm_status lists the live ones`
+						: "no open goal: the coordinator has not opened one yet - swarm_wait, then look again",
+				);
+			}
+			if (goal.status !== "open") return ok(`goal ${goal.id} is ${goal.status}; its round is over, claim the real tasks instead`);
+			if (params.tasks.length === 0) return ok("a proposal needs at least one task");
+			const entry = store.postProposal(goal, identity.id, params.tasks);
+			const posted = store.listProposals(goal).length;
+			return ok(
+				`posted proposal #${entry.id} for ${goal.id}: ${params.tasks.length} task(s); ${posted} proposal(s) on the board so far.\nNow claim the planning task ${goal.planningTask} - the first claimer is the scribe that merges them (swarm_plan) - or claim the real tasks once the DECISION lands.`,
+				{ id: entry.id, goal: goal.id, proposals: posted },
+			);
+		},
+	};
+
+	const planSchema = z.object({ goal_id: z.string().optional() });
+	const planTool: CustomTool<typeof planSchema> = {
+		name: "swarm_plan",
+		label: "Merge The Split",
+		description:
+			"The scribe's convergence step, exactly once: claim the goal's planning task FIRST, then call this. It parses every swarm_propose split of the round, dedupes them by normalized title, creates the real task graph with its dependencies, posts the merged split as a DECISION and marks the goal planned.",
+		parameters: planSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const goal = params.goal_id !== undefined ? store.getGoal(params.goal_id) : store.liveGoals()[0];
+			if (goal === undefined) {
+				return ok(
+					params.goal_id !== undefined
+						? `unknown goal ${params.goal_id}; swarm_status lists the live ones`
+						: "no open goal to plan; swarm_status lists the live ones",
+				);
+			}
+			const planning = store.getTask(goal.planningTask);
+			if (planning?.status !== "claimed" || planning.claimedBy !== identity.id) {
+				return ok(
+					`claim the goal's planning task first: swarm_claim ${goal.planningTask} - the first agent to claim it is the scribe. (Then swarm_plan again.)`,
+					{ planned: false },
+				);
+			}
+			const result = store.planGoal(goal.id, identity.id);
+			if (!result.ok) return err(`plan refused: ${result.reason}`, { planned: false });
+			const done = store.complete(goal.planningTask, identity.id, {
+				summary: `planned ${goal.id}: ${result.created.length} task(s) from ${result.proposals} proposal(s)`,
+				reviewEnabled: false,
+			});
+			onChange?.();
+			return ok(
+				[
+					`${goal.id} planned: ${result.created.length} task(s) created${result.skipped.length > 0 ? `, ${result.skipped.length} skipped (already in the pool)` : ""}${result.folded.length > 0 ? `, ${result.folded.length} duplicate deliverable(s) folded` : ""}.`,
+					done.ok ? `planning task ${goal.planningTask} completed; the DECISION with the merged split is on the board.` : `planning task ${goal.planningTask} could not be completed (${done.reason}); release it.`,
+					...result.created.map((id) => {
+						const task = store.getTask(id);
+						return task === undefined ? `- ${id}` : `- ${id} ${task.title} (${task.status})`;
+					}),
+				].join("\n"),
+				{ planned: true, created: result.created, goal: goal.id },
+			);
 		},
 	};
 
@@ -562,6 +687,9 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		completeTool,
 		failTool,
 		createTool,
+		goalTool,
+		proposeTool,
+		planTool,
 		retryTool,
 		integrateTool,
 		postTool,
@@ -586,6 +714,9 @@ export const SWARM_TOOL_NAMES = [
 	"swarm_complete",
 	"swarm_fail",
 	"swarm_task_create",
+	"swarm_goal",
+	"swarm_propose",
+	"swarm_plan",
 	"swarm_task_retry",
 	"swarm_integrate",
 	"board_post",
