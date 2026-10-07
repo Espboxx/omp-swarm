@@ -49,6 +49,7 @@ export const STRINGS = {
 
 		"tasks.title": "任务",
 		"tasks.empty": "任务池是空的。",
+		"tasks.showingOf": "显示 {shown} / {total} 条（更早的未加载）",
 		"tasks.owner": "负责人",
 		"tasks.unowned": "无人认领",
 		"tasks.attempts": "尝试 {n} 次",
@@ -148,6 +149,7 @@ export const STRINGS = {
 
 		"tasks.title": "Tasks",
 		"tasks.empty": "The task pool is empty.",
+		"tasks.showingOf": "showing {shown} of {total} (older rows are not loaded)",
 		"tasks.owner": "owner",
 		"tasks.unowned": "unclaimed",
 		"tasks.attempts": "{n} attempts",

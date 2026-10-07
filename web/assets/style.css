@@ -654,6 +654,14 @@ details.collapsed-group[open] > summary {
 	border-color: var(--ink-faint);
 }
 
+/* The server caps the task rows: when a status group carries fewer rows than it has tasks, this says so
+   instead of letting the list quietly contradict the count above it. */
+.group-note {
+	margin: 4px 0 0;
+	color: var(--ink-soft);
+	font-size: 12.5px;
+}
+
 /* ------------------------------------------------------- collaboration */
 
 .tablist {

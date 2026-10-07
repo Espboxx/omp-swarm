@@ -468,7 +468,13 @@ function taskRow(task) {
 	);
 }
 
-function taskGroup(status, tasks, collapsed) {
+/**
+ * One status group. `total` is the AUTHORITATIVE count for that status (`snapshot.counts`), which can
+ * exceed the rows on hand: the server caps `tasks` (TASK_LIMIT), so counting the rows here made a group
+ * header read "已认领 20" beside a "40 已认领" chip once a pool passed the cap. The rows stay capped (the
+ * page must not render unbounded lists) — the header now tells the truth and `truncated` says the rest.
+ */
+function taskGroup(status, tasks, collapsed, total) {
 	const showAll = state.showAllTasks[status] === true;
 	const shown = showAll ? tasks : tasks.slice(0, TASK_ROW_CAP);
 	const body = el("div", {}, shown.map((task) => taskRow(task)));
@@ -485,35 +491,45 @@ function taskGroup(status, tasks, collapsed) {
 					},
 				})
 			: null;
+	const truncated =
+		total > tasks.length
+			? el("p", { class: "group-note", text: t("tasks.showingOf", { shown: tasks.length, total }) })
+			: null;
 	if (collapsed) {
 		return el(
 			"details",
 			{ class: "collapsed-group" },
-			el("summary", { text: `${statusLabel(status)} (${tasks.length})` }),
+			el("summary", { text: `${statusLabel(status)} (${total})` }),
 			body,
+			truncated,
 			more,
 		);
 	}
 	return el(
 		"div",
 		{ class: "task-group" },
-		el("div", { class: "task-group-head" }, el("h3", { text: statusLabel(status) }), badge(String(tasks.length), `status-${status}`)),
+		el("div", { class: "task-group-head" }, el("h3", { text: statusLabel(status) }), badge(String(total), `status-${status}`)),
 		body,
+		truncated,
 		more,
 	);
 }
 
 function renderTasks(snapshot) {
 	const tasks = snapshot.tasks ?? [];
+	const counts = snapshot.counts ?? {};
 	clear(dom.tasksBody);
-	if (tasks.length === 0) {
+	if (tasks.length === 0 && (counts.total ?? 0) === 0) {
 		dom.tasksBody.append(el("p", { class: "empty", text: t("tasks.empty") }));
 		return;
 	}
 	for (const status of TASK_ORDER) {
 		const group = tasks.filter((task) => task.status === status);
-		if (group.length === 0) continue;
-		dom.tasksBody.append(taskGroup(status, group, status === "done" || status === "failed"));
+		// The chip's number is the truth and the rows may be a subset of it — including an EMPTY subset
+		// for a status whose rows all fell past the server's cap, which must still be shown, not skipped.
+		const total = typeof counts[status] === "number" ? counts[status] : group.length;
+		if (group.length === 0 && total === 0) continue;
+		dom.tasksBody.append(taskGroup(status, group, status === "done" || status === "failed", total));
 	}
 }
 
@@ -589,7 +605,10 @@ function renderFeeds(snapshot) {
 	dom.feedBody.setAttribute("tabindex", "0");
 
 	if (tab === "board") {
-		const board = [...(snapshot.board ?? [])].reverse();
+		// The payload is NEWEST-first: this order is what makes the visible window (FEED_ROW_CAP) the
+		// newest rows, with "show more" walking backwards into history. Reversing here showed the OLDEST
+		// cap-sized slice instead, so the collaboration the operator opens the page to watch needed clicks.
+		const board = snapshot.board ?? [];
 		if (board.length === 0) {
 			dom.feedBody.append(el("p", { class: "empty", text: t("collab.empty.board") }));
 			return;
@@ -619,7 +638,7 @@ function renderFeeds(snapshot) {
 	}
 
 	if (tab === "messages") {
-		const messages = [...(snapshot.messages ?? [])].reverse();
+		const messages = snapshot.messages ?? [];
 		if (messages.length === 0) {
 			dom.feedBody.append(el("p", { class: "empty", text: t("collab.empty.messages") }));
 			return;
@@ -648,7 +667,7 @@ function renderFeeds(snapshot) {
 		return;
 	}
 
-	const events = [...(snapshot.events ?? [])].reverse();
+	const events = snapshot.events ?? [];
 	if (events.length === 0) {
 		dom.feedBody.append(el("p", { class: "empty", text: t("collab.empty.events") }));
 		return;
