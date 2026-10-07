@@ -356,10 +356,13 @@ session does both by itself:
 3. Once the coordinator stops publishing tasks (a 20 s quiet period, so the roster is sized to the
    whole plan rather than to the first task of a still-running turn; in `"swarm"` mode the goal's
    agent budget sets the floor, because a live goal counts as work before any task exists), a roster
-   is derived from what the tasks need (`required_capabilities`, one agent per capability, plus a
-   `reviewer` when `review: true` and review-required work exists), sized to the plan and capped by
-   `config.workers` — work queued behind a dependency counts, so a dependency chain does not
-   serialize the run.
+   is derived from what the tasks need (`required_capabilities`): one agent per capability, with the
+   slack going to the general-capable role — except the **review-capable role**, which is added when
+   `review: true` and review-required work exists and is then sized by DEMAND (the active rows that
+   require `reviewer`), because one reviewer cannot audit its own work and a queue of review-capability
+   rows with a single review agent would be unroutable by construction. The roster is sized to the plan
+   and capped by `config.workers` — work queued behind a dependency counts, so a dependency chain does
+   not serialize the run.
    Workers spawn, claim, and execute. The roster is not frozen at that first sizing: each tick while
    the driver is up and the pool is neither draining nor stalled, ready work above both the live
    worker count and the ready count the pool was sized for grows the pool
@@ -461,7 +464,10 @@ swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
   than applied minutes after the shape that motivated it is gone.
 - `config.workers` is the **operator's ceiling**, enforced where the resize happens rather than by
   convention: a larger ask is applied clamped, and the answer says so. No agent can spend past the
-  budget the operator set, whatever it asks for.
+  budget the operator set, whatever it asks for. The ceiling also **beats the work-shape floor**: when
+  the live work wants more workers than the budget allows, the pool HOLDS at the ceiling instead of
+  planning past it, and says so once per distinct (wanted, ceiling) pair with a `pool.underBudgeted`
+  notice. A grow reports the workers the host **actually started**, never the requested delta.
 - The pool now **shrinks** as well, which it never used to. A shrink stops only workers holding
   **nothing** — no claim, no review lease, no file reservation, and not mid-turn. Anything else defers
   the shrink, and the deferred ask stays pending so a later tick still applies it. Sizing is floored by
