@@ -464,6 +464,7 @@ export function planningTaskBrief(goal: { id: string; goal: string; agents: numb
 		"2. The scribe calls swarm_plan: it parses every proposal, dedupes them and creates the real task graph.",
 		`   Dedupe: ${DEDUPE_KEY_TEXT}.`,
 		"3. swarm_plan posts the merged split as a DECISION and marks the goal planned; the pool then claims the real tasks.",
+		"4. The goal's agent count was only a starting guess: if the merged shape needs a different number of agents, ask with swarm_scale({ agents, reason }). The controller reconciles the pool on its next tick and clamps to config.workers.",
 		`Bound: no plan within ${Math.round(deadlineMs / 60_000)} minute(s) of the goal closes it with a FAIL - the round never spins silently.`,
 	].join("\n");
 }

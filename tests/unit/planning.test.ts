@@ -226,6 +226,11 @@ describe("planningTaskBrief", () => {
 		expect(brief).toContain(DEDUPE_KEY_TEXT);
 		expect(GOAL_DEADLINE_MS).toBe(600_000);
 		expect(brief).toContain("10 minute(s)");
+		// The scribe is the one agent guaranteed to be looking at the whole plan, so the brief it is handed
+		// names the tool that corrects a wrong size (task-115's audit reported its absence) — and says the
+		// operator's ceiling still binds.
+		expect(brief).toContain("swarm_scale({ agents, reason })");
+		expect(brief).toContain("clamps to config.workers");
 	});
 
 	test("a custom bound is the one the brief states", () => {
