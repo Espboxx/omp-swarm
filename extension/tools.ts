@@ -469,7 +469,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			onChange?.();
 			return ok(
 				[
-					`${goal.id} planned: ${result.created.length} task(s) created${result.skipped.length > 0 ? `, ${result.skipped.length} skipped (already in the pool)` : ""}${result.folded.length > 0 ? `, ${result.folded.length} duplicate deliverable(s) folded` : ""}.`,
+					`${goal.id} planned: ${result.created.length} task(s) created${result.skipped.length > 0 ? `, ${result.skipped.length} skipped (already in the pool)` : ""}${result.folds.length > 0 ? `, ${result.folds.length} duplicate row(s) folded into ${result.folded.length} deliverable(s)` : ""}.`,
 					`SIZE: peak parallelism ${result.peak} task(s) at once; recommended agents ${result.recommended} (ceiling ${config.workers}). Any agent can ask for a different size with swarm_scale({ agents, reason }).`,
 					done.ok ? `planning task ${goal.planningTask} completed; the DECISION with the merged split is on the board.` : `planning task ${goal.planningTask} could not be completed (${done.reason}); release it.`,
 					...result.created.map((id) => {

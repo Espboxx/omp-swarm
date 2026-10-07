@@ -23,6 +23,7 @@ import type {
 	BoardType,
 	ClaimResult,
 	GoalStatus,
+	MergeFold,
 	PlanResult,
 	Reservation,
 	ScaleRequest,
@@ -1015,13 +1016,17 @@ export class SwarmStore {
 		const now = Date.now();
 		const created: string[] = [];
 		const skipped: { title: string; id: string }[] = [];
+		// Merge key -> the task row that carries it, created or already in the pool: the DECISION's
+		// fold mapping needs it after the transaction has committed.
+		const idByKey = new Map<string, string>();
 		let proposals = 0;
 		let folded: string[] = [];
+		let folds: MergeFold[] = [];
 		let unresolved: { task: string; dep: string }[] = [];
 		let peak = 0;
 		let recommended = 0;
 		const outcome = this.#db.transaction((): PlanResult => {
-			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, unresolved, peak, recommended, reason });
+			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, folds, unresolved, peak, recommended, reason });
 			const goal = this.getGoal(goalId);
 			if (goal === undefined) return refuse(`unknown goal ${goalId}`);
 			if (goal.status !== "open") return refuse(`goal ${goalId} is ${goal.status}`);
@@ -1039,6 +1044,7 @@ export class SwarmStore {
 			}
 			const merge = mergeProposals(round);
 			folded = merge.folded;
+			folds = merge.folds;
 			unresolved = merge.unresolved;
 			if (merge.tasks.length === 0) return refuse(`the ${round.length} proposal(s) for ${goalId} carry no usable task`);
 			// The plan states its own size: how wide the round can run, and the agent count that
@@ -1062,6 +1068,7 @@ export class SwarmStore {
 					keys.get(merged.key) ?? heldShapes.find((held) => isSameDeliverable(held.shape, shape))?.id;
 				if (existing !== undefined) {
 					skipped.push({ title: merged.title, id: existing });
+					idByKey.set(merged.key, existing);
 					continue;
 				}
 				const dependencies = merged.dependsOn.map((key) => keys.get(key)).filter((id): id is string => id !== undefined);
@@ -1075,6 +1082,7 @@ export class SwarmStore {
 					reviewRequired: merged.reviewRequired,
 				});
 				keys.set(merged.key, row.id);
+				idByKey.set(merged.key, row.id);
 				created.push(row.id);
 			}
 			const summary = `${created.length} task(s) from ${round.length} proposal(s)`;
@@ -1092,7 +1100,7 @@ export class SwarmStore {
 				proposals: round.length,
 				folded: folded.length,
 			});
-			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, unresolved, peak, recommended };
+			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, folds, unresolved, peak, recommended };
 		});
 		// The merged split is announced AFTER the write: the DECISION is the round's public record,
 		// never a correctness dependency of the plan itself.
@@ -1111,7 +1119,12 @@ export class SwarmStore {
 					].join("");
 				}),
 			];
-			if (folded.length > 0) lines.push(`folded ${folded.length} duplicate deliverable(s)`);
+			if (folds.length > 0) {
+				lines.push(`folded ${folds.length} duplicate row(s) into ${folded.length} deliverable(s):`);
+				// The audit trail: WHAT folded into WHAT, and why. "folded 2 duplicates" told the operator
+				// nothing, which is exactly how goal-5's four spellings of one report stayed invisible.
+				for (const fold of folds) lines.push(`  "${fold.title}" -> ${idByKey.get(fold.into) ?? fold.into} (${fold.reason})`);
+			}
 			if (skipped.length > 0) lines.push(`skipped (a live task already carries them): ${skipped.map((s) => `${s.title} -> ${s.id}`).join(", ")}`);
 			if (unresolved.length > 0) lines.push(`dropped unresolvable dependency reference(s): ${unresolved.map((d) => `${d.task} <- ${d.dep}`).join(", ")}`);
 			this.postBoard({

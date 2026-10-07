@@ -118,7 +118,7 @@ describe("swarm_plan", () => {
 		expect((await call("swarm_claim", { task_id: "task-1" })).length).toBeGreaterThan(0);
 		const planned = await call("swarm_plan", { goal_id: "goal-1" });
 		expect(planned).toContain("goal-1 planned: 2 task(s) created");
-		expect(planned).toContain("1 duplicate deliverable(s) folded");
+		expect(planned).toContain("1 duplicate row(s) folded into 1 deliverable(s)");
 		expect(planned).toContain("planning task task-1 completed");
 		const goal = store.getGoal("goal-1");
 		expect(goal?.status).toBe("planned");
@@ -149,6 +149,33 @@ describe("swarm_plan", () => {
 		expect(await w3.call("swarm_plan", { goal_id: "goal-1" })).toContain("claim the goal's planning task first");
 		expect(store.getGoal("goal-1")?.status).toBe("open");
 		expect(await w1.call("swarm_plan", { goal_id: "goal-1" })).toContain("2 task(s) created");
+		store.close();
+	});
+
+	test("three workers proposing the same deliverable in three spellings create ONE row, and the DECISION says why", async () => {
+		const store = makeStore();
+		await workerTools(store, "main").call("swarm_goal", { goal: "audit the idle burn", agents: 3 });
+		await workerTools(store, "w1").call("swarm_propose", {
+			tasks: [{ title: "Measure and publish the idle burn rate", files: ["scratch/burnrate/**"], capabilities: ["general"] }],
+		});
+		await workerTools(store, "w2").call("swarm_propose", {
+			tasks: [{ title: "量化烧钱速率：只读实测", files: ["scratch/burnrate/**"] }],
+		});
+		await workerTools(store, "w3").call("swarm_propose", {
+			tasks: [{ title: "只读测量：空转烧钱速率表", files: ["omp-swarm/scratch/burn/rate-table.md"] }],
+		});
+		const scribe = workerTools(store, "w1");
+		await scribe.call("swarm_claim", { task_id: "task-1" });
+		const planned = await scribe.call("swarm_plan", { goal_id: "goal-1" });
+		// Three proposals, three spellings, one deliverable: not three rows, and not nine.
+		expect(planned).toContain("1 task(s) created");
+		expect(planned).toContain("2 duplicate row(s) folded into 1 deliverable(s)");
+		expect(store.listTasks({ limit: 20 }).filter((task) => task.id !== "task-1").length).toBe(1);
+		const decision = store.searchBoard({ type: "DECISION" })[0]?.content ?? "";
+		expect(decision).toContain("folded 2 duplicate row(s) into 1 deliverable(s):");
+		expect(decision).toContain("量化烧钱速率：只读实测");
+		expect(decision).toContain("-> task-2");
+		expect(decision).toContain("scratch/burnrate ~ omp-swarm/scratch/burn/rate-table.md");
 		store.close();
 	});
 });

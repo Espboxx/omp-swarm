@@ -138,6 +138,8 @@ export interface PlanResult {
 	proposals: number;
 	/** Deliverable keys more than one proposal named. */
 	folded: string[];
+	/** Every folded row, with the survivor it folded into and why - the DECISION's audit trail. */
+	folds: MergeFold[];
 	/** Dependency references that could not be resolved (dropped). */
 	unresolved: { task: string; dep: string }[];
 	/** The widest set of the round's deliverables that can run at the same time. */
@@ -145,6 +147,16 @@ export interface PlanResult {
 	/** The agent count that peak implies, capped by the ceiling the caller passed (0 = unknown). */
 	recommended: number;
 	reason?: string;
+}
+
+/** One proposal row a planning round folded into a surviving deliverable, and why the two are one. */
+export interface MergeFold {
+	/** The merge key of the surviving deliverable. */
+	into: string;
+	/** The title of the row that folded. */
+	title: string;
+	/** Why the two are one deliverable, in the words the board shows the operator. */
+	reason: string;
 }
 
 /**

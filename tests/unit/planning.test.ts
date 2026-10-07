@@ -21,6 +21,7 @@ import {
 	type Proposal,
 } from "../../extension/planning";
 import type { BlackboardEntry } from "../../extension/types";
+import { GOAL5_ENTRIES } from "./helpers/goal5-round";
 
 function entry(overrides: Partial<BlackboardEntry> = {}): BlackboardEntry {
 	return {
@@ -246,10 +247,16 @@ describe("describeDeliverable", () => {
 		expect(describeDeliverable("Ship the thing").artifacts).toEqual([]);
 	});
 
-	test("an unknown kind is `other`, which pairs with nothing at all", () => {
+	test("an unknown kind pairs on the artifact it names, never on similar wording alone", () => {
 		const shape = describeDeliverable("Improve the error handling", ["src/errors.ts"]);
 		expect(shape.intent).toBe("other");
-		expect(isSameDeliverable(shape, shape)).toBe(false);
+		// A title the verb families cannot classify (any Chinese one, or an English one that opens
+		// with a noun) used to pair with nothing at all - not even its own twin. It names an artifact,
+		// so the artifact decides, which is what the live counterexample needed.
+		expect(isSameDeliverable(shape, shape)).toBe(true);
+		// …but an unknown kind is not a licence to pair two wordings that merely look alike.
+		expect(isSameDeliverable(shape, describeDeliverable("Speed up the parser loop", ["src/errors.ts"]))).toBe(false);
+		expect(isSameDeliverable(shape, describeDeliverable("Improve the error handling", ["src/other.ts"]))).toBe(false);
 	});
 
 	test("a title naming a part of the artifact is marked as a fragment, the artifact itself is not", () => {
@@ -429,5 +436,112 @@ describe("the deliverable key: a rephrasing is the same task, a different delive
 		expect(describeDeliverable("Write the tracker", ["1.2.3"]).artifacts).toEqual(["1.2.3"]);
 		expect(describeDeliverable("Write the tracker", ["/repo/docs/NOTES.md"]).artifacts).toEqual(["/repo/docs/notes.md"]);
 		expect(isSameDeliverable(describeDeliverable("Write it", ["/repo/docs/NOTES.md"]), describeDeliverable("Write it too", ["docs/NOTES.md"]))).toBe(true);
+	});
+});
+
+describe("the live counterexample: goal-5's round (3 splits, 20 rows) is 5 deliverables", () => {
+	const round = (ids?: number[]): Proposal[] =>
+		GOAL5_ENTRIES.filter((entry) => ids === undefined || ids.includes(entry.id)).map((entry) =>
+			proposal(entry.agentId, { goal: "goal-1", tasks: entry.tasks }, entry.id),
+		);
+	const task = (entryId: number, startsWith: string) => {
+		const found = GOAL5_ENTRIES.find((entry) => entry.id === entryId)?.tasks.find((candidate) => candidate.title.startsWith(startsWith));
+		if (found === undefined) throw new Error(`no task "${startsWith}" in #${entryId}`);
+		return found;
+	};
+	const burnEn = task(552, "Measure and publish the idle burn rate");
+	const burnCn = task(553, "量化烧钱速率");
+	const burnFile = task(554, "只读测量");
+	const wakeEn = task(552, "Enumerate every model-call wakeup source");
+	const wakeFile = task(554, "只读审计");
+	const brakeEn = task(552, "Ship an operator brake");
+	const obsEn = task(552, "Diagnose the observability defect");
+	const obsCn = task(553, "可观测性缺陷");
+	const handoff = task(552, "Consolidate the four advisories");
+
+	test("the same artifact in four path spellings is ONE row", () => {
+		const merged = mergeProposals([
+			proposal("RapidTiger", { goal: "goal-1", tasks: [burnEn, wakeEn, brakeEn, obsEn, handoff] }, 552),
+			proposal("VividTiger", { goal: "goal-1", tasks: [burnCn] }, 553),
+			proposal("SwiftTiger", { goal: "goal-1", tasks: [burnFile] }, 554),
+		]);
+		expect(merged.tasks.length).toBe(5); // these three splits created 8 rows
+		const burn = merged.tasks.find((candidate) => candidate.title === burnEn.title);
+		expect(burn?.files.sort()).toEqual(["omp-swarm/scratch/advisory-burn/rate-table.md", "scratch/advisory-burnrate/**"]);
+		expect(burn?.agents).toEqual(["RapidTiger", "VividTiger", "SwiftTiger"]);
+		// A directory and a file are one deliverable, and the reason names both spellings.
+		expect(merged.folds.map((fold) => fold.reason).join("\n")).toContain("scratch/advisory-burnrate ~ omp-swarm/scratch/advisory-burn/rate-table.md");
+	});
+
+	test("one directory holding three deliverables stays three rows", () => {
+		// rate-table.md, wake-sources.md and brake.md all live under scratch/advisory-burn/, which is
+		// why an artifact is matched by NAME and never by "the same directory".
+		const merged = mergeProposals([proposal("SwiftTiger", { goal: "goal-1", tasks: GOAL5_ENTRIES[2]?.tasks ?? [] }, 554)]);
+		expect(merged.tasks.length).toBe(3);
+		expect(merged.folded).toEqual([]);
+	});
+
+	test("a directory and the file inside it pair on the compound their names share", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [wakeEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [wakeFile] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.folds[0]?.reason).toContain("two spellings of one artifact");
+	});
+
+	test("two containers whose names share no word pair on near-identical wording", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [obsEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [obsCn] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.folds[0]?.reason).toContain("container");
+	});
+
+	test("two containers with different names and different wording stay apart", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [brakeEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [obsEn] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+		expect(merged.folded).toEqual([]);
+	});
+
+	test("a wider declaration folds into the deliverable, and the extra artifact is named in the reason", () => {
+		const wider = task(556, "落地前刹车");
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [brakeEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [wider] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.tasks[0]?.files).toEqual(["scratch/advisory-brake/**", "scratch/advisory-brake/", ".swarm/config.json"]);
+		expect(merged.folds[0]?.reason).toContain(".swarm/config.json");
+	});
+
+	test("every folded row is auditable: a survivor and a reason, never a bare count", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [burnEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [burnCn, burnFile] }, 2),
+		]);
+		expect(merged.folds.map((fold) => fold.title)).toEqual([burnCn.title, burnFile.title]);
+		expect(merged.folds.map((fold) => fold.into)).toEqual([deliverableKey(burnEn.title), deliverableKey(burnEn.title)]);
+		for (const fold of merged.folds) expect(fold.reason.length).toBeGreaterThan(0);
+	});
+
+	test("the whole round of three splits collapses to the five deliverables it really holds", () => {
+		const merged = mergeProposals(round([552, 553, 554]));
+		expect(merged.tasks.length).toBe(5);
+		expect(merged.folds.length).toBe(7);
+		// The handoff still waits on all four advisories, resolved onto the survivors.
+		const consolidated = merged.tasks.find((candidate) => candidate.title === handoff.title);
+		expect(new Set(consolidated?.dependsOn)).toEqual(new Set(merged.tasks.filter((candidate) => candidate !== consolidated).map((candidate) => candidate.key)));
+		expect(merged.unresolved).toEqual([]);
+	});
+
+	test("the whole five-entry round adds only the verification row LunarTiger really did propose", () => {
+		const merged = mergeProposals(round());
+		expect(merged.tasks.length).toBe(6); // 22 proposed tasks: 4 advisories + the handoff + the verifier
+		expect(merged.tasks.filter((candidate) => candidate.files.some((file) => file.startsWith("scratch/advisory-verify"))).length).toBe(1);
 	});
 });

@@ -9,7 +9,7 @@
  * Everything here is pure: no database, no clock, no timers. The round's rules are therefore
  * testable without a swarm, and the store stays the only writer.
  */
-import type { BlackboardEntry } from "./types";
+import type { BlackboardEntry, MergeFold } from "./types";
 
 /** How long a planning round may take before the goal is closed with a FAIL (never left to spin). */
 export const GOAL_DEADLINE_MS = 600_000;
@@ -33,7 +33,7 @@ export function goalTag(goalId: string): string {
  * differently are ONE task, with files, capabilities and dependencies unioned into the survivor.
  */
 export const DEDUPE_KEY_TEXT =
-	"a deliverable is keyed by its TARGET ARTIFACT (the `files` it declares, else the file names in its title) plus the KIND of work (write/verify/fix/document/remove/refactor), not by its wording: identical titles always collapse, two proposals declaring the same artifact with the same kind collapse when one is a section of the other or their wording is close enough, and two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner) so they never both become tasks. Files, capabilities and dependencies are unioned into the survivor and the longest description is kept";
+	"a deliverable is keyed by its TARGET ARTIFACT (the `files` it declares, else the file names in its title) plus the KIND of work (write/verify/fix/document/remove/refactor), not by its wording: an artifact is normalized to one form first, so casing, separators, a trailing `/**` and the two spellings of one name (`advisory-burnrate/` vs `advisory-burn/rate-table.md`) name the same artifact; identical titles always collapse; an unknown kind (`other`) never contradicts a known one; two proposals on one artifact collapse when one is a section of the other, their wording is close enough, or one declares extra artifacts (a wording this rule reads no words out of cannot disagree either); two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner); and two container spellings of one deliverable (a directory standing for it) may still collapse on near-identical wording. Files, capabilities and dependencies are unioned into the survivor and the longest description is kept";
 
 /** Stable name of a deliverable: the same title in any casing/spacing is the same deliverable. */
 export function deliverableKey(title: string): string {
@@ -131,8 +131,27 @@ function looksLikeFileName(token: string): boolean {
 	return dot >= 0 && KNOWN_FILE_EXTENSIONS[token.slice(dot + 1).toLowerCase()] === true;
 }
 
-/** How close two non-writer wordings of one artifact must be to count as the same deliverable. */
+/** How much of the SHORTER wording two phrasings of one artifact must share to be one deliverable. */
 export const SAME_DELIVERABLE_SIMILARITY = 0.6;
+
+/**
+ * A FILE pins a deliverable: two non-writers that name the same file are one deliverable only when
+ * their wording agrees. A CONTAINER is a scope, not a deliverable - naming it already says "the work
+ * lives here" - so a shared directory pairs on less agreeing wording.
+ */
+export const SAME_DELIVERABLE_CONTAINER_SIMILARITY = 0.5;
+
+/**
+ * How much of the SHORTER wording an artifact-insufficient pair must share. A container (a directory
+ * standing for a deliverable) and an unknown kind are the two cases where the artifact alone cannot
+ * decide, so the wording has to carry the pair almost entirely by itself. This is the bar the live
+ * counterexample needs: `advisory-observability/` and `advisory-status/` share 8 of the shorter
+ * side's 9 words while the closest false pair shares 6 of 9.
+ */
+export const SAME_DELIVERABLE_OVERLAP = 0.8;
+
+/** A name token has to be this long before a prefix/compound match counts as a shared word. */
+const NAME_TOKEN_MIN = 4;
 
 function words(text: string): string[] {
 	return text.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word !== "");
@@ -140,46 +159,147 @@ function words(text: string): string[] {
 
 /** One artifact path, in the single form two proposals can be compared in. */
 function canonicalArtifact(raw: string): string {
-	return raw.trim().toLowerCase().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+	return raw
+		.trim()
+		.toLowerCase()
+		.replace(/\\/g, "/")
+		.replace(/^\.\/+/, "")
+		.replace(/\/+/g, "/")
+		.replace(/\/\*\*$/, "")
+		.replace(/\/+$/, "");
 }
 
 const isAbsoluteArtifact = (path: string): boolean => path.startsWith("/") || /^[a-z]:\//.test(path);
 const artifactName = (path: string): string => path.split("/").pop() ?? path;
+const artifactSegments = (path: string): string[] => path.split("/").filter((segment) => segment !== "");
 
-/** Same artifact: identical paths, or an absolute and a bare path naming the same file. */
+/**
+ * Whether an artifact is a CONTAINER - a directory standing for the deliverable (`scratch/burnrate/`,
+ * `.../burnrate/**`) rather than a file. The name is what says so: a file's last segment carries an
+ * extension. A file with no extension is read as a container, which only widens the one fallback that
+ * needs near-identical wording anyway, so the cheap direction to be wrong in is the safe one.
+ */
+function isContainerArtifact(path: string): boolean {
+	const last = artifactName(path);
+	const dot = last.lastIndexOf(".");
+	return dot <= 0;
+}
+
+/**
+ * Same artifact: the identical path, one path being the tail of the other (`omp-swarm/src/a.ts` and
+ * `src/a.ts` are one file seen from two roots), an absolute and a bare path naming the same file, or
+ * two names that only spell the same thing differently (see {@link namesShareAToken}).
+ */
 function sameArtifact(left: string, right: string): boolean {
 	if (left === right) return true;
-	return isAbsoluteArtifact(left) !== isAbsoluteArtifact(right) && artifactName(left) === artifactName(right);
+	if (artifactName(left) === artifactName(right) && isAbsoluteArtifact(left) !== isAbsoluteArtifact(right)) return true;
+	const [shorter, longer] =
+		artifactSegments(left).length <= artifactSegments(right).length ? [artifactSegments(left), artifactSegments(right)] : [artifactSegments(right), artifactSegments(left)];
+	if (shorter.length < 2 || shorter.length > longer.length) return false;
+	const tail = longer.slice(longer.length - shorter.length);
+	return shorter.every((segment, at) => segment === tail[at]);
 }
 
-function artifactsEqual(left: string[], right: string[]): boolean {
-	if (left.length === 0 || left.length !== right.length) return false;
-	const pool = [...right];
-	for (const path of left) {
-		const at = pool.findIndex((candidate) => sameArtifact(path, candidate));
-		if (at < 0) return false;
+/** The words of an artifact's own name - its last segment with the extension removed. */
+function nameTokens(path: string): string[] {
+	const last = artifactName(path);
+	const dot = last.lastIndexOf(".");
+	return words(dot > 0 ? last.slice(0, dot) : last);
+}
+
+/** Two name words are the same one when they are equal, or one spells the other out (`burn` in `burnrate`). */
+function relatedNameTokens(left: string, right: string): boolean {
+	if (left === right) return true;
+	if (left.length < NAME_TOKEN_MIN || right.length < NAME_TOKEN_MIN) return false;
+	return left.startsWith(right) || right.startsWith(left) || left.includes(right) || right.includes(left);
+}
+
+/**
+ * Two artifact names that share a word once their common HEAD is dropped: `advisory-burnrate` and
+ * `advisory-status` are told apart by `burnrate` vs `status`, while the `advisory-` both spell is the
+ * theme of the directory, not the deliverable. Equal names overlap entirely but are not the same
+ * spelling; {@link sameArtifact} already decides those.
+ */
+function namesShareAToken(left: string, right: string): boolean {
+	const a = nameTokens(left);
+	const b = nameTokens(right);
+	let head = 0;
+	while (head < a.length && head < b.length && a[head] === b[head]) head += 1;
+	const rest = [a.slice(head), b.slice(head)];
+	if (rest[0].length === 0 || rest[1].length === 0) return false;
+	return rest[0].some((word) => rest[1].some((other) => relatedNameTokens(word, other)));
+}
+
+/** How two artifact SETS matched: the paths that line up, and what that match is worth as evidence. */
+interface ArtifactMatch {
+	/** The matched paths, `written ~ spelled` when the two sides named one artifact differently. */
+	detail: string;
+	/** True when at least one pair matched by NAME rather than by path - evidence in its own right. */
+	spelled: boolean;
+	/** True when every matched artifact is a container (a directory standing for the deliverable). */
+	container: boolean;
+}
+
+/**
+ * Two artifact SETS name one deliverable: the smaller side matches into the larger, each artifact
+ * with its own counterpart. A narrower declaration folds into a wider one (`brake/` into
+ * `brake/ + .swarm/config.json`) because the union keeps every declared file and the extra artifacts
+ * are reported in the reason - the difference is visible, never lost.
+ */
+function artifactsRelation(left: string[], right: string[]): ArtifactMatch | undefined {
+	const [fewer, more] = left.length <= right.length ? [left, right] : [right, left];
+	if (fewer.length === 0) return undefined;
+	const pool = [...more];
+	const matched: string[] = [];
+	let spelled = false;
+	for (const path of fewer) {
+		const at = pool.findIndex(
+			(candidate) => sameArtifact(path, candidate) || (artifactName(path) !== artifactName(candidate) && namesShareAToken(path, candidate)),
+		);
+		if (at < 0) return undefined;
+		const hit = pool[at] as string;
+		if (path !== hit) {
+			spelled = true;
+			matched.push(`${path} ~ ${hit}`);
+		} else {
+			matched.push(path);
+		}
 		pool.splice(at, 1);
 	}
-	return true;
+	return {
+		detail: pool.length > 0 ? `${matched.join(", ")} (+${pool.join(", ")})` : matched.join(", "),
+		spelled,
+		container: fewer.every(isContainerArtifact),
+	};
 }
 
-/** Jaccard over the significant words. An empty either side is 0: no evidence is not a match. */
-function wordingSimilarity(left: string[], right: string[]): number {
+/**
+ * How much of the SHORTER side's wording the other carries. Jaccard punishes a long English
+ * description against a short Chinese one for being long, which is exactly the pair a language-blind
+ * rule has to keep: this asks whether the smaller wording is contained in the larger.
+ */
+function wordingOverlap(left: string[], right: string[]): number {
 	if (left.length === 0 || right.length === 0) return 0;
 	const other = new Set(right);
-	const shared = left.filter((word) => other.has(word)).length;
-	return shared / new Set([...left, ...right]).size;
+	const shared = new Set(left.filter((word) => other.has(word))).size;
+	return shared / Math.min(new Set(left).size, new Set(right).size);
 }
+
+const percent = (value: number): string => `${Math.round(value * 100)}%`;
 
 /**
  * Read a deliverable out of a title (and the artifact paths a proposal declared for it). Everything
  * here is pure and total: a title that names no artifact yields an empty artifact list, which the
  * matcher then refuses to pair with anything.
+ *
+ * The KIND comes from the title alone. The description is prose - it lists evidence, files and side
+ * notes - and letting a verb buried in it classify the work makes one deliverable `verify` in one
+ * proposal and `write` in the next, which is a false split no rule can see through.
  */
 export function describeDeliverable(title: string, files: string[] = [], deliverable = ""): DeliverableShape {
 	const tokens = words(`${title} ${deliverable}`);
 	let intent: DeliverableIntent = "other";
-	for (const token of tokens) {
+	for (const token of words(title)) {
 		const family = INTENT_VERBS.find(([, verbs]) => verbs.includes(token));
 		if (family !== undefined) {
 			intent = family[0];
@@ -200,19 +320,57 @@ export function describeDeliverable(title: string, files: string[] = [], deliver
 }
 
 /**
- * Whether two proposal shapes are the same deliverable.
+ * Why two proposal shapes are the same deliverable, or `undefined` when they are two. The pairing
+ * carries its reason because the plan's DECISION has to show the operator WHAT folded into what, and
+ * this is the only place that knows.
  *
- * Conservative by construction: an unknown kind (`other`) or a deliverable with no identifiable
- * artifact never matches anything, because a false merge loses work while a false split only costs
- * a duplicate task. On one artifact, two WRITERS are always one deliverable - an artifact has one
- * owner, so the reservation collisions of the live counterexample cannot happen by plan.
+ * The direction of every doubtful case is the same: a false split costs one visible duplicate task
+ * while a false merge loses a deliverable silently, so an unknown kind and a bare directory only
+ * pair on evidence that is nearly unambiguous.
  */
+export function sameDeliverableReason(left: DeliverableShape, right: DeliverableShape): string | undefined {
+	// Two KNOWN kinds that differ are two deliverables; an unknown kind contradicts nothing.
+	if (left.intent !== right.intent && left.intent !== "other" && right.intent !== "other") return undefined;
+	const artifact = artifactsRelation(left.artifacts, right.artifacts);
+	if (artifact !== undefined) {
+		if (left.intent === "write" || right.intent === "write") return `one artifact has one owner: ${artifact.detail}`;
+		// The two sides named one artifact under two spellings (`advisory-wakeups` and
+		// `advisory-burn/wake-sources.md` share the compound `wake`): that correspondence is the
+		// evidence, and demanding the wording agree on top of it is what kept the live pairs apart.
+		if (artifact.spelled) return `two spellings of one artifact: ${artifact.detail}`;
+		if (left.section !== right.section) return `one is a section of the other: ${artifact.detail}`;
+		// On one artifact only the wording separates two kinds of work, and what separates them is
+		// whether the SHORTER wording is contained in the other - never how long either one is, which
+		// is what a Jaccard score reads as "different" the moment a terse title meets a long one.
+		const bar = artifact.container ? SAME_DELIVERABLE_CONTAINER_SIMILARITY : SAME_DELIVERABLE_SIMILARITY;
+		const overlap = wordingOverlap(left.words, right.words);
+		if (overlap >= bar) return `the same artifact and ${percent(overlap)} of the shorter wording: ${artifact.detail}`;
+		// A wording the tokenizer reads no words out of at all (a Chinese title against an English one)
+		// cannot DISAGREE with the other - there is nothing to disagree with - so on the identical
+		// spelling of one artifact it is no obstacle either.
+		if (!artifact.spelled && (left.words.length === 0 || right.words.length === 0)) {
+			return `the same artifact, one side carries no readable wording: ${artifact.detail}`;
+		}
+		return undefined;
+	}
+	// Neither artifact matched. A container - a directory standing for the deliverable - is the one
+	// spelling whose own name cannot carry the identity, so two of them may still be one deliverable
+	// when their wording is the same all but in length.
+	if (containerOnly(left.artifacts) && containerOnly(right.artifacts)) {
+		const overlap = wordingOverlap(left.words, right.words);
+		if (overlap >= SAME_DELIVERABLE_OVERLAP) return `two spellings of one container and ${percent(overlap)} of the shorter wording`;
+	}
+	return undefined;
+}
+
+/** Whether every artifact a deliverable declares is a container (an empty list is not one). */
+function containerOnly(artifacts: string[]): boolean {
+	return artifacts.length > 0 && artifacts.every(isContainerArtifact);
+}
+
+/** Whether two proposal shapes are the same deliverable (see {@link sameDeliverableReason}). */
 export function isSameDeliverable(left: DeliverableShape, right: DeliverableShape): boolean {
-	if (left.intent !== right.intent || left.intent === "other") return false;
-	if (!artifactsEqual(left.artifacts, right.artifacts)) return false;
-	if (left.intent === "write") return true;
-	if (left.section !== right.section) return true;
-	return wordingSimilarity(left.words, right.words) >= SAME_DELIVERABLE_SIMILARITY;
+	return sameDeliverableReason(left, right) !== undefined;
 }
 
 export interface ProposedTask {
@@ -256,6 +414,8 @@ export interface MergeResult {
 	proposals: number;
 	/** Keys that more than one proposal named (the duplicates the merge folded in). */
 	folded: string[];
+	/** Every folded row, with the survivor and the reason - the DECISION's audit trail. */
+	folds: MergeFold[];
 	/** Dependency references that could not be resolved and were dropped (self/unknown title). */
 	unresolved: MergeDep[];
 	/** Proposals that carried no usable task at all. */
@@ -316,23 +476,41 @@ export function parseProposal(entry: BlackboardEntry): Proposal | undefined {
 }
 
 /**
+ * The reason a shape is one of the spellings already seen for a deliverable, or `undefined`. A merged
+ * deliverable keeps EVERY declaration that named it: matching against the first one alone would split
+ * whatever arrived naming the spelling that folded in second.
+ */
+function matchingSpelling(spellings: DeliverableShape[] | undefined, shape: DeliverableShape): string | undefined {
+	for (const spelling of spellings ?? []) {
+		const reason = sameDeliverableReason(spelling, shape);
+		if (reason !== undefined) return reason;
+	}
+	return undefined;
+}
+
+/**
  * Merge every proposal of one round into the deduped deliverable list.
  *
  * First proposal wins the title; a later one for the same deliverable only adds (files,
  * capabilities, dependencies, a longer description, review_required). "The same deliverable" is the
- * exact key when the phrasing matches and the shape rule ({@link isSameDeliverable}) when it does
+ * exact key when the phrasing matches and the shape rule ({@link sameDeliverableReason}) when it does
  * not - so four agents writing one file in four phrasings yield one task, while two genuinely
  * different deliverables on one file (different kinds of work, or work that is not close enough)
- * stay apart. Dependency references are resolved the same way, so an agent may depend on a
- * deliverable another agent proposed under different wording; a reference to an unknown or to the
- * task's own title is dropped and reported.
+ * stay apart. Every row that folds is recorded with its survivor and the reason
+ * ({@link MergeFold}), which is what the plan's DECISION prints. Dependency references are resolved
+ * against the same spellings, so an agent may depend on a deliverable another agent proposed under
+ * different wording; a reference to an unknown or to the task's own title is dropped and reported,
+ * never turned into a row of its own.
  */
 export function mergeProposals(proposals: Proposal[]): MergeResult {
 	const order: string[] = [];
 	const byKey = new Map<string, MergedTask>();
-	const shapeByKey = new Map<string, DeliverableShape>();
+	const spellingsByKey = new Map<string, DeliverableShape[]>();
+	// Every key any proposal used -> the surviving key it belongs to. A dependency that names a row
+	// this round folded must resolve THROUGH that row to its survivor, or the edge is dead on arrival.
+	const survivorByKey = new Map<string, string>();
 	const rawDeps = new Map<string, string[]>();
-	const folded: string[] = [];
+	const folds: MergeFold[] = [];
 	const unresolved: MergeDep[] = [];
 	let empty = 0;
 	for (const proposal of proposals) {
@@ -347,9 +525,23 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 				continue;
 			}
 			const shape = describeDeliverable(proposed.title, proposed.files ?? [], proposed.deliverable ?? "");
-			const target = byKey.has(key)
-				? key
-				: order.find((seen) => isSameDeliverable(shapeByKey.get(seen) as DeliverableShape, shape));
+			let target: string | undefined;
+			let reason = "the identical title";
+			if (byKey.has(key)) {
+				target = key;
+			} else if (survivorByKey.has(key)) {
+				// The identical title of a row this round already folded: same deliverable, same survivor.
+				target = survivorByKey.get(key);
+			} else {
+				for (const seen of order) {
+					const why = matchingSpelling(spellingsByKey.get(seen), shape);
+					if (why !== undefined) {
+						target = seen;
+						reason = why;
+						break;
+					}
+				}
+			}
 			const mergeKey = target ?? key;
 			const known = byKey.get(mergeKey);
 			if (known === undefined) {
@@ -363,16 +555,15 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 					reviewRequired: proposed.reviewRequired === true,
 					agents: [proposal.agentId],
 				});
-				shapeByKey.set(mergeKey, shape);
+				spellingsByKey.set(mergeKey, [shape]);
+				survivorByKey.set(mergeKey, mergeKey);
 				order.push(mergeKey);
 			} else {
-				if (!folded.includes(mergeKey)) folded.push(mergeKey);
-				const seen = shapeByKey.get(mergeKey) as DeliverableShape;
+				folds.push({ into: mergeKey, title: proposed.title, reason });
+				survivorByKey.set(key, mergeKey);
+				(spellingsByKey.get(mergeKey) as DeliverableShape[]).push(shape);
 				// A section title must not stand for the whole artifact once the whole one is proposed.
-				if (seen.section && !shape.section) {
-					known.title = proposed.title;
-					shapeByKey.set(mergeKey, { ...seen, section: false, words: shape.words });
-				}
+				if (describeDeliverable(known.title, known.files).section && !shape.section) known.title = proposed.title;
 				const deliverable = proposed.deliverable?.trim() ?? "";
 				if (deliverable.length > (known.deliverable?.length ?? 0)) known.deliverable = deliverable;
 				known.capabilities = [...new Set([...known.capabilities, ...(proposed.capabilities ?? [])])];
@@ -387,10 +578,12 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 		const deps: string[] = [];
 		for (const raw of rawDeps.get(key) ?? []) {
 			const exact = deliverableKey(raw);
-			let dep: string | undefined = exact !== "" && byKey.has(exact) ? exact : undefined;
+			// A reference that names a row this round folded resolves to that row's SURVIVOR: the work
+			// is one deliverable, and an edge onto the spelling that lost is how goal-5's residue hung.
+			let dep: string | undefined = exact === "" ? undefined : survivorByKey.get(exact);
 			if (dep === undefined) {
 				const wanted = describeDeliverable(raw);
-				dep = order.find((seen) => isSameDeliverable(shapeByKey.get(seen) as DeliverableShape, wanted));
+				dep = order.find((seen) => matchingSpelling(spellingsByKey.get(seen), wanted) !== undefined);
 			}
 			// A dependency inside the same round can only be a reference to another deliverable of
 			// this round; anything else (own title, a typo, a stale id) is dropped and reported.
@@ -402,7 +595,14 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 		}
 		(byKey.get(key) as MergedTask).dependsOn = deps;
 	}
-	return { tasks: order.map((key) => byKey.get(key) as MergedTask), proposals: proposals.length, folded, unresolved, empty };
+	return {
+		tasks: order.map((key) => byKey.get(key) as MergedTask),
+		proposals: proposals.length,
+		folded: [...new Set(folds.map((fold) => fold.into))],
+		folds,
+		unresolved,
+		empty,
+	};
 }
 
 /**
