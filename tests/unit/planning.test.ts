@@ -393,4 +393,36 @@ describe("the deliverable key: a rephrasing is the same task, a different delive
 		expect(describeDeliverable("Add support for NOTES.md").artifacts).toEqual(["notes.md"]);
 		expect(describeDeliverable("Ship src/parser.ts").artifacts).toEqual(["src/parser.ts"]);
 	});
+
+	test("a version WORD in the final segment is not a file name, so release writers still stay apart", () => {
+		// Both sides are asserted WRITE first: an `other` intent is an absolute gate that would make the
+		// pair pass for the wrong reason, which is exactly how the first version of this rule survived.
+		expect(describeDeliverable("Write the v1.0.beta release notes").intent).toBe("write");
+		expect(describeDeliverable("Create the v1.0.beta announcement").intent).toBe("write");
+		expect(describeDeliverable("Write the v1.0.beta release notes").artifacts).toEqual([]);
+		expect(describeDeliverable("Write notes for v2.1.alpha").artifacts).toEqual([]);
+		expect(
+			isSameDeliverable(describeDeliverable("Write the v1.0.beta release notes"), describeDeliverable("Create the v1.0.beta announcement")),
+		).toBe(false);
+		expect(isSameDeliverable(describeDeliverable("Write notes for v2.1.alpha"), describeDeliverable("Create notes for v2.1.alpha"))).toBe(false);
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Write the v1.0.beta release notes" }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Create the v1.0.beta announcement" }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+	});
+
+	test("only a token that can BE a file name is read as one", () => {
+		// A bare token needs a known extension; a path-shaped token is trusted whatever it ends in.
+		expect(describeDeliverable("Write NOTES.md").artifacts).toEqual(["notes.md"]);
+		expect(describeDeliverable("Ship src/parser.ts").artifacts).toEqual(["src/parser.ts"]);
+		expect(describeDeliverable("Bump main.go").artifacts).toEqual(["main.go"]);
+		expect(describeDeliverable("Patch src/theme.zzz").artifacts).toEqual(["src/theme.zzz"]);
+		expect(describeDeliverable("Publish report.beta").artifacts).toEqual([]);
+		expect(describeDeliverable("Publish report.2024.md").artifacts).toEqual(["report.2024.md"]);
+		// The declared-`files` path is untouched by any of this: an explicit list is authoritative.
+		expect(describeDeliverable("Write the tracker", ["1.2.3"]).artifacts).toEqual(["1.2.3"]);
+		expect(describeDeliverable("Write the tracker", ["/repo/docs/NOTES.md"]).artifacts).toEqual(["/repo/docs/notes.md"]);
+		expect(isSameDeliverable(describeDeliverable("Write it", ["/repo/docs/NOTES.md"]), describeDeliverable("Write it too", ["docs/NOTES.md"]))).toBe(true);
+	});
 });

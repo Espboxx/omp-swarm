@@ -92,11 +92,44 @@ const STOPWORDS: Record<string, true> = {
 
 /**
  * A file-name-ish token inside a title, used only when a proposal declares no `files`. The final
- * segment must look like an EXTENSION (letters first), which is what stops a version or a dotted
- * number (`1.2.3`, `v2.0.0`) from being read as an artifact - two write-intent proposals sharing one
- * of those would otherwise merge and silently swallow a deliverable.
+ * segment must start with a letter, which stops a dotted number (`1.2.3`, `v2.0.0`) from being read
+ * as an artifact - two write-intent proposals sharing one of those would otherwise merge and silently
+ * swallow a deliverable. (See {@link looksLikeFileName} for the version whose last segment is a WORD.)
  */
 const ARTIFACT_IN_TITLE = /[A-Za-z0-9_@][A-Za-z0-9_@./\\-]*\.[A-Za-z][A-Za-z0-9]{0,7}/g;
+
+/**
+ * Extensions a title-borne token must carry to count as a file name. The final segment's SHAPE cannot
+ * decide it: `1.2.3` ends in a digit and `v1.0.beta` / `v2.1.alpha` end in letters, so "letters first"
+ * lets a version tag through and two release-shaped writers merge into one task. A token that cannot
+ * be a file name is not an artifact at all, which is the cheap direction to be wrong in: a false
+ * split only costs a duplicate task, while a false merge loses a deliverable.
+ */
+const KNOWN_FILE_EXTENSIONS: Record<string, true> = {
+	// documents + data
+	md: true, markdown: true, txt: true, rst: true, adoc: true, tex: true, pdf: true, csv: true, tsv: true, log: true, lock: true,
+	// source
+	ts: true, tsx: true, mts: true, cts: true, js: true, jsx: true, mjs: true, cjs: true, py: true, rb: true, go: true, rs: true,
+	java: true, kt: true, scala: true, c: true, h: true, cc: true, cpp: true, hpp: true, cs: true, php: true, swift: true,
+	lua: true, pl: true, r: true, sql: true, sh: true, bash: true, zsh: true, ps1: true, bat: true, cmd: true,
+	// config + markup
+	json: true, jsonc: true, json5: true, yml: true, yaml: true, toml: true, ini: true, cfg: true, conf: true, env: true,
+	html: true, htm: true, css: true, scss: true, sass: true, less: true, xml: true, svg: true, vue: true, svelte: true, astro: true,
+	// assets
+	png: true, jpg: true, jpeg: true, gif: true, webp: true, ico: true, mp3: true, mp4: true, wav: true, webm: true, zip: true, tar: true, gz: true,
+};
+
+/**
+ * Whether a token found in a title can be a FILE NAME. A path-shaped token (it carries a separator)
+ * always can, whatever its extension; a bare token must end in one we know. This is what keeps
+ * `v1.0.beta` and `v2.1.alpha` from becoming shared "artifacts" while `NOTES.md`, `src/parser.ts` and
+ * `main.go` stay one.
+ */
+function looksLikeFileName(token: string): boolean {
+	if (/[/\\]/.test(token)) return true;
+	const dot = token.lastIndexOf(".");
+	return dot >= 0 && KNOWN_FILE_EXTENSIONS[token.slice(dot + 1).toLowerCase()] === true;
+}
 
 /** How close two non-writer wordings of one artifact must be to count as the same deliverable. */
 export const SAME_DELIVERABLE_SIMILARITY = 0.6;
@@ -154,7 +187,7 @@ export function describeDeliverable(title: string, files: string[] = [], deliver
 		}
 	}
 	const declared = files.map(canonicalArtifact).filter((path) => path !== "");
-	const fromTitle = title.match(ARTIFACT_IN_TITLE) ?? [];
+	const fromTitle = (title.match(ARTIFACT_IN_TITLE) ?? []).filter(looksLikeFileName);
 	const artifacts = [...new Set((declared.length > 0 ? declared : fromTitle.map(canonicalArtifact)).filter((path) => path !== ""))].sort();
 	const artifactWords = new Set(words(artifacts.join(" ")));
 	const verbs = new Set(INTENT_VERBS.flatMap(([, family]) => family));
