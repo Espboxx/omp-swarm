@@ -760,6 +760,14 @@ lines once its own settle window passed, which is the one-batch-one-alert rule a
   holds only while a dependency of it can never reach `done` (`store.ts:deadDependencies`). A task
   whose dependency is merely unfinished stays unclosable, so the exit cannot be used to skip work —
   and a pool loaded from a tree older than this one still refuses the close entirely.
+- The suite covers this repo, not the extensions it runs against: the `/provider-config` crash this
+  batch fixed lives in `~/.omp/agent/extensions/provider-config/index.ts`, outside the tree, so a
+  green `tests/unit` run is a no-regression signal only — that the crash is gone is proven by a live
+  probe against a real `Settings` instance (the legacy string-path `settings.get(...)` still throws
+  `settings.get is not a function`, the shipped `lookup(...)` handle path reads `95` from
+  `config.yml`, writes survive `scope.flush()` and the config file is restored), pinned in-repo by
+  `tests/unit/provider-config-settings-api.test.ts`. The fix sits in the operator's install rather
+  than in git: a reinstall or upgrade of OMP that rolls back `extensions/` needs it applied again.
 
 ## Scaling to 8 / 16 / 32 agents
 
