@@ -14,6 +14,7 @@
 import type { SwarmStore } from "./store";
 import { reconcilePool } from "./scaling";
 import { findStarvation } from "./starvation";
+import { postStrandedNotice } from "./stranded";
 import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
 
 export type AutoPhase = "off" | "idle" | "planning" | "nudging" | "running" | "done" | "stalled";
@@ -603,6 +604,19 @@ export class AutoController {
 						missing: report.missing,
 						online: report.online,
 					});
+					// The durable half: the notice above goes to the transcript and the event to
+					// `events`, and neither answers "how long has this been stuck" once the turn is
+					// over. One board entry per distinct condition, with each row's age and the repair
+					// paths ranked — the strand that cost this pool two idle hours on task-221/222/223
+					// was visible in neither form.
+					postStrandedNotice(
+						report,
+						new Map(store.listTasks({ status: "ready", limit: 500 }).map((task) => [task.id, { createdAt: task.createdAt, title: task.title }])),
+						this.#deps.now(),
+						undefined,
+						(entry) => store.postBoard({ ...entry, agentId: "auto" }),
+						"auto",
+					);
 				}
 			}
 
