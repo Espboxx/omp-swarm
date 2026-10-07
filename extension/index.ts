@@ -10,6 +10,7 @@ import { colorEnabled, fitColored } from "./color";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
 import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
 import { SwarmDriver, type NavState, type SwarmDriverDeps, type TimerApi } from "./driver";
+import { COORDINATOR_EDIT_NOTICE, decideCoordinatorEdit, mutatesFiles } from "./guard";
 import {
 	drainSummaryLines,
 	drainSummaryTitle,
@@ -242,6 +243,8 @@ export default function swarm(pi: ExtensionAPI): void {
 	const controllers = new Set<AutoController>();
 	/** Close handles for every open `/swarm nav` overlay, so shutdown cannot leave one mounted. */
 	const navClosers = new Set<() => void>();
+	/** Latched by the coordinator-edit guard: one reminder per turn, not one per tool call. */
+	let coordinatorEditNotified = false;
 	const remember = (root: string, ctx: ExtensionContext): void => {
 		contexts.set(resolve(root), ctx);
 	};
@@ -566,6 +569,39 @@ export default function swarm(pi: ExtensionAPI): void {
 			message: { customType: "swarm", content: auto.notice(), display: true },
 			systemPrompt: [...event.systemPrompt, auto.policy()],
 		};
+	});
+
+	/**
+	 * The behavioural half of "the coordinator only sizes the pool" (see `./guard`). Prose cannot stop a
+	 * model from executing a specification itself — the live counterexample did 68 tool calls with no goal
+	 * — so this watches what the session DOES: multi-agent mode on, no goal open, no pool running, and the
+	 * MAIN session starts a file-mutating tool. It is a reminder, never a gate: it cannot refuse or delay
+	 * the call, and an operator-requested edit is noise the operator can ignore.
+	 */
+	pi.on("tool_execution_start", (event, ctx) => {
+		const runtime = runtimes.peek(ctx.cwd);
+		const auto = runtime?.auto;
+		if (runtime === undefined || auto === undefined || !auto.enabled) return;
+		// Workers are separate sessions in this process and register their session id (driver.ts:475 ->
+		// agents.session_id); the main session is never in that table, so a match identifies a worker and
+		// keeps the notice off its tool calls.
+		const sessionId = ctx.sessionManager.getSessionId();
+		const decision = decideCoordinatorEdit({
+			modeOn: true,
+			sessionIsMain: !runtime.store.listAgents().some((agent) => agent.sessionId === sessionId),
+			goalOpen: runtime.store.liveGoals().length > 0,
+			poolRunning: runtime.driver?.running ?? false,
+			mutatesFiles: mutatesFiles(event.toolName, event.args),
+			notifiedThisTurn: coordinatorEditNotified,
+		});
+		if (decision === "notify") {
+			coordinatorEditNotified = true;
+			ctx.ui.notify(COORDINATOR_EDIT_NOTICE, "warning");
+		}
+	});
+
+	pi.on("turn_start", () => {
+		coordinatorEditNotified = false;
 	});
 
 	pi.on("session_shutdown", async () => {
