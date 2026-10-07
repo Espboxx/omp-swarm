@@ -76,7 +76,7 @@ web/
   lib/         the read-only DB handle, asset path resolution and the row types
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
-  unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
+  unit/store.test.ts           45 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
   unit/auto.test.ts            54 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
@@ -91,6 +91,7 @@ tests/
   unit/web-server.test.ts      10 unit tests of the dashboard's HTTP surface: the frozen contract, the error surface, SSE change detection, read-only
   unit/web-snapshot.test.ts    11 unit tests of the snapshot reader: counts, blockedReason, the newest-first feeds and the task-size cap
   unit/web-dashboard.test.ts    1 browser test of the page's own DOM: the newest-first feeds and a group header that cannot contradict the counts chip
+  unit/web-format.test.ts       6 unit tests of the page's pure presentation helper: where a long path may break, and that the transform loses nothing
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
@@ -589,7 +590,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 373 unit tests in the 17 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 387 unit tests in the 18 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
