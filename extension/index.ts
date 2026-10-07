@@ -8,7 +8,7 @@ import { MAIN_ID, moveSelection, navEntries, renderNavLines, type NavEntry } fro
 import { AUTO_TICK_MS, AutoController } from "./auto";
 import { colorEnabled, fitColored } from "./color";
 import { loadSwarmConfig, expandWorkers, saveSwarmAuto } from "./config";
-import { appendEventLine, openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
+import { openDatabase, openInMemoryDatabase, swarmPaths, type SwarmPaths } from "./db";
 import { SwarmDriver, type NavState, type SwarmDriverDeps, type TimerApi } from "./driver";
 import { COORDINATOR_EDIT_NOTICE, decideCoordinatorEdit, mutatesFiles } from "./guard";
 import {
@@ -389,8 +389,7 @@ export default function swarm(pi: ExtensionAPI): void {
 			notify: (text, level) => latest().ui.notify(text, level ?? "info"),
 			onChange: () => refreshPanel(latest(), runtime),
 			now: () => Date.now(),
-			onEvent: (type, data) =>
-				appendEventLine(runtime.paths, { type, agentId: MAIN_AGENT_ID, createdAt: Date.now(), data: data ?? {} }),
+			onEvent: (type, data) => runtime.store.logEvent(type, MAIN_AGENT_ID, data ?? {}),
 		});
 		runtime.auto = auto;
 		controllers.add(auto);

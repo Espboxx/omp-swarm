@@ -345,6 +345,17 @@ export class SwarmStore {
 		appendEventLine(this.#paths, { type, agentId, taskId, data, createdAt });
 	}
 
+	/**
+	 * Record an event that no tool call produced — a controller decision such as `roster.shrink`,
+	 * `roster.grow`, `pool.underBudgeted`, `swarm.auto.*`. It goes through BOTH sinks `#log` uses
+	 * (the `events` table and `.swarm/events.jsonl`), because a controller event that reached only the
+	 * jsonl left every reader of the table — the web panel, the DB-reading proof fixtures, ops queries —
+	 * blind to the fact that the pool had changed size at all.
+	 */
+	logEvent(type: string, agentId: string, data: Record<string, unknown> = {}): void {
+		this.#log(type, agentId, undefined, data);
+	}
+
 	// ---------------------------------------------------------------- agents
 
 	registerAgent(agent: {

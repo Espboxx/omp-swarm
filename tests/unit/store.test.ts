@@ -729,6 +729,22 @@ describe("event log", () => {
 		expect(JSON.parse(lines.at(-1) ?? "").type).toBe("task.complete");
 		store.close();
 	});
+
+	test("a controller decision reaches the events table, not only the jsonl", () => {
+		const { store, paths } = makeRoot();
+		store.logEvent("roster.shrink", "main", { workers: 3, stopped: ["A"], ready: 10, requested: 1 });
+		// The proof fixtures and the web panel read the DATABASE, not the jsonl:
+		// `SELECT id, data FROM events WHERE type='roster.shrink'`. A controller event that only
+		// appended to the jsonl made the pool look like it had never changed size.
+		const reader = openDatabase(paths, { readonly: true });
+		const rows = reader.all<{ data: string }>("SELECT data FROM events WHERE type='roster.shrink'");
+		reader.close();
+		expect(rows.length).toBe(1);
+		expect(JSON.parse(rows[0]?.data ?? "{}")).toEqual({ workers: 3, stopped: ["A"], ready: 10, requested: 1 });
+		const lines = readFileSync(paths.eventsFile, "utf8").trim().split("\n");
+		expect(JSON.parse(lines.at(-1) ?? "{}").type).toBe("roster.shrink");
+		store.close();
+	});
 });
 
 describe("sqlite handles", () => {
