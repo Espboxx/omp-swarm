@@ -198,6 +198,50 @@ describe("planRoster", () => {
 	test("a terminal pool needs no roster", () => {
 		expect(planRoster([task({ status: "done" }), task({ id: "task-2", status: "failed" })], DEFAULT_CONFIG)).toEqual([]);
 	});
+
+	test("two review-capability rows mint TWO reviewers: one reviewer cannot audit its own work", () => {
+		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
+		const roster = planRoster(
+			[task({ id: "task-95", requiredCapabilities: ["reviewer"] }), task({ id: "task-99", requiredCapabilities: ["reviewer"] })],
+			config,
+		);
+		expect(roster.find((role) => role.name === "reviewer")?.count).toBe(2);
+		expect(roster.reduce((n, role) => n + role.count, 0)).toBeLessThanOrEqual(config.workers);
+	});
+
+	test("a single review-capability row still mints exactly one reviewer, and the slack still goes to general", () => {
+		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
+		// The other two rows declare `general` explicitly, so the roster has a separate general role to take
+		// the slack (with capability-less rows the review role itself carries it — pre-existing behaviour).
+		const roster = planRoster(
+			[
+				task({ requiredCapabilities: ["reviewer"] }),
+				task({ id: "task-2", requiredCapabilities: ["general"] }),
+				task({ id: "task-3", requiredCapabilities: ["general"] }),
+			],
+			config,
+		);
+		expect(roster.find((role) => role.name === "reviewer")?.count).toBe(1);
+		expect(roster.find((role) => role.name === "general")?.count).toBe(2);
+	});
+
+	test("a demand larger than the budget still respects the operator's ceiling", () => {
+		const six = Array.from({ length: 6 }, (_, index) => task({ id: `task-${index + 1}`, requiredCapabilities: ["reviewer"] }));
+		const roster = planRoster(six, { ...DEFAULT_CONFIG, workers: 3 });
+		expect(roster.reduce((n, role) => n + role.count, 0)).toBe(3);
+	});
+
+	test("a plan with no review-capability row is unchanged by this rule", () => {
+		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
+		expect(planRoster([task(), task({ id: "task-2" }), task({ id: "task-3" })], config)).toEqual([
+			{ name: "general", count: 3, capabilities: ["general"] },
+		]);
+		// Two rows needing an integrator still yield one integrator that carries the slack (and the
+		// general capability with it) — the pre-existing rule, untouched.
+		expect(
+			planRoster([task({ requiredCapabilities: ["integrator"] }), task({ id: "task-2", requiredCapabilities: ["integrator"] })], config),
+		).toEqual([{ name: "integrator", count: 2, capabilities: ["integrator", "general"] }]);
+	});
 });
 
 describe("saveSwarmAuto", () => {

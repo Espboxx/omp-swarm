@@ -105,8 +105,25 @@ export function planRoster(tasks: SwarmTask[], config: SwarmConfig, goalAgents =
 		const capabilities = named?.capabilities ?? (cap === "general" ? ["general"] : [cap, "general"]);
 		return { name: cap, count: 1, capabilities };
 	});
+	// A REVIEW-capable row cannot always be taken by the review agent the pool already has: an auditor
+	// must not audit its own work ("do not claim this task if you authored its dependency" — the rule the
+	// pool honours), so a queue of review-capability rows with a single review agent is unroutable BY
+	// CONSTRUCTION. That is the deadlock that left task-95/task-99 `ready` with an EMPTY eligible set while
+	// three general agents idled. So this ONE capability is sized by demand — the active rows that require
+	// it — bounded by the same budget; a second reviewer is a non-author of every dependency the first one
+	// wrote, which is what routability needs. Every other capability stays at one agent with the slack
+	// going to the general role, exactly as before. DEMAND here is rows that REQUIRE the `reviewer`
+	// capability — the claim-side deadlock. A row that merely needs its RESULT reviewed is served by the
+	// review flow, where one reviewer normally suffices, so review-required rows do not inflate the role.
+	const reviewer = roster.find(
+		(role) => role.name === "reviewer" || ((role.capabilities ?? []).includes("reviewer") && role.name !== "general"),
+	);
+	if (reviewer !== undefined) {
+		const demand = active.filter((task) => task.requiredCapabilities.includes("reviewer")).length;
+		reviewer.count += Math.min(Math.max(0, budget - roster.length), Math.max(0, demand - 1));
+	}
 	const general = roster.find((role) => (role.capabilities ?? []).includes("general")) ?? roster[0];
-	if (general) general.count += budget - roster.length;
+	if (general) general.count += budget - roster.reduce((n, role) => n + role.count, 0);
 	return roster;
 }
 
