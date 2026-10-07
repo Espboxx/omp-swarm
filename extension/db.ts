@@ -183,6 +183,19 @@ CREATE TABLE IF NOT EXISTS vote_ballots (
   created_at  INTEGER NOT NULL,
   PRIMARY KEY (decision_id, voter)
 );
+
+-- A round is a ONE-SHOT ticket, not a standing permission (goal-9): the row below is the whole
+-- "already used" marker. It is a NEW table on purpose - this schema is CREATE TABLE IF NOT EXISTS
+-- only, with no ALTER and no version, so a column added to the votes table would exist on a fresh
+-- database and be missing on the operator's live one, silently. The PRIMARY KEY is what makes the
+-- consumption atomic: two consumers, in two processes, cannot both insert the same vote_id.
+CREATE TABLE IF NOT EXISTS vote_consumptions (
+  vote_id     TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  consumed_by TEXT NOT NULL,
+  consumed_at INTEGER NOT NULL
+);
 `;
 
 export interface OpenOptions {
@@ -196,6 +209,8 @@ export interface OpenOptions {
  */
 export class Db {
 	readonly #database: Database;
+	/** Nesting depth of {@link Db.transaction}: 0 means no transaction is open on this connection. */
+	#depth = 0;
 
 	constructor(database: Database) {
 		this.#database = database;
@@ -218,13 +233,23 @@ export class Db {
 	}
 
 	transaction<T>(body: () => T): T {
-		this.#database.exec("BEGIN IMMEDIATE");
+		// A transaction opened INSIDE another one is a SAVEPOINT: the gate consumes a vote ticket and
+		// performs the action it authorises in ONE atomic step, and every store mutation opens its own
+		// transaction, so nesting is the norm there. SQLite refuses a nested BEGIN, and the inner body
+		// must still be able to roll back on its own without killing the outer one. The outermost call is
+		// unchanged - BEGIN IMMEDIATE, one COMMIT - so no existing caller can tell the difference.
+		const outer = this.#depth === 0;
+		const savepoint = `swarm_sp_${this.#depth + 1}`;
+		this.#database.exec(outer ? "BEGIN IMMEDIATE" : `SAVEPOINT ${savepoint}`);
+		this.#depth += 1;
 		try {
 			const result = body();
-			this.#database.exec("COMMIT");
+			this.#depth -= 1;
+			this.#database.exec(outer ? "COMMIT" : `RELEASE ${savepoint}`);
 			return result;
 		} catch (error) {
-			this.#database.exec("ROLLBACK");
+			this.#depth -= 1;
+			this.#database.exec(outer ? "ROLLBACK" : `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`);
 			throw error;
 		}
 	}

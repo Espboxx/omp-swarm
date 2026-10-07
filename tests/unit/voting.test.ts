@@ -4,6 +4,7 @@ import {
 	decide,
 	DEFAULT_VOTING,
 	eligibleVoters,
+	payloadSignature,
 	resolveVotingConfig,
 	votingSignature,
 	type Vote,
@@ -221,5 +222,59 @@ describe("voting: the wait is an edge, not a clock (rule 5 / task-170-171)", () 
 		const withFour = round(["a", "b", "c", "d"], [ballot("a", true)]);
 		const withThree = round(["a", "b", "c"], [ballot("a", true)]);
 		expect(votingSignature("vote-1", withThree)).not.toBe(votingSignature("vote-1", withFour));
+	});
+});
+
+describe("voting: consent is bound to the PAYLOAD, canonically (goal-9)", () => {
+	// The hole VERDICT §3 measured was that a passed round authorised its KIND: any later call of the same
+	// kind rode on it. The fix compares a canonical signature of the payload, so these are the properties
+	// the whole gate rests on — a signature that is too loose would re-open the hole in a quieter way.
+	test("the same decision spelled differently signs the same", () => {
+		expect(payloadSignature({ title: " alpha ", files: ["b.ts", "a.ts"] })).toBe(
+			payloadSignature({ files: ["a.ts", "b.ts"], title: "alpha" }),
+		);
+		// An optional parameter the call site did not pass is not part of the decision.
+		expect(payloadSignature({ title: "a", description: undefined })).toBe(payloadSignature({ title: "a" }));
+	});
+
+	test("a different decision never signs the same, and an empty payload authorises only an empty request", () => {
+		expect(payloadSignature({ title: "alpha" })).not.toBe(payloadSignature({ title: "beta" }));
+		expect(payloadSignature({ agents: 2 })).not.toBe(payloadSignature({ agents: 3 }));
+		// The dangerous direction: a round that froze nothing must NOT match a real request.
+		expect(payloadSignature({})).not.toBe(payloadSignature({ title: "alpha" }));
+		expect(payloadSignature({})).not.toBe(payloadSignature({ agents: 2 }));
+	});
+
+	test("nothing is ever dropped: a field the executor ignores still signs, so a ticket cannot authorise more than it says", () => {
+		expect(payloadSignature({ title: "a", priority: 5 })).not.toBe(payloadSignature({ title: "a" }));
+	});
+});
+
+describe("voting: a ballot dropped because its voter went offline is NAMED (goal-9 minor ①)", () => {
+	test("the arithmetic is unchanged, and the dropped approval is named instead of vanishing", () => {
+		const outcome = decide({
+			decision: decision(),
+			votes: [ballot("a", true), ballot("b", true), ballot("c", true)],
+			agents: [agent("a"), agent("b"), agent("c", { status: "offline" as AgentStatus })],
+			now: NOW,
+			offlineAfterMs: WINDOW,
+		});
+		// c left: the base shrinks to 2 (nobody can stall a round by leaving) and the round passes on a+b...
+		expect(outcome.base).toBe(2);
+		expect(outcome.status).toBe("passed");
+		expect(outcome.approvals).toEqual(["a", "b"]);
+		// ...but c's real approval is reported as DROPPED-BECAUSE-OFFLINE: not "absent" (c did vote), and not
+		// swallowed into `ignored` (which is what the tally used to do, silently).
+		expect(outcome.offline).toEqual(["c"]);
+		expect(outcome.absent).toEqual([]);
+		expect(outcome.ignored).toEqual([]);
+		expect(outcome.reason).toContain("voter offline at settlement: c");
+	});
+
+	test("a non-voter stays `ignored`, not `offline`: the two are different facts", () => {
+		const outcome = round(["a", "b"], [ballot("a", true), ballot("b", true), ballot("operator", true)]);
+		expect(outcome.ignored.map((vote) => vote.voter)).toEqual(["operator"]);
+		expect(outcome.offline).toEqual([]);
+		expect(outcome.reason).not.toContain("offline");
 	});
 });

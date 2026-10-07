@@ -166,7 +166,7 @@ describe("swarm_vote: who counts", () => {
 });
 
 describe("the gate: cluster-level decisions need a passed round", () => {
-	test("a regular agent cannot create a task without one, and can with a passed round", async () => {
+	test("a regular agent cannot create a task without one; a passed round executes ITSELF once and is then spent", async () => {
 		const store = makeStore();
 		roster(store, ["w1", "w2"]);
 		const w1 = toolkit(store, "w1");
@@ -174,13 +174,17 @@ describe("the gate: cluster-level decisions need a passed round", () => {
 		expect(refused).toContain("cluster-level decision (create-task)");
 		expect(store.listTasks({}).length).toBe(0);
 
-		await w1.call("swarm_vote", { kind: "create-task", question: "approved row", payload_json: JSON.stringify({ title: "approved" }) });
+		await w1.call("swarm_vote", { kind: "create-task", question: "approved row", payload_json: JSON.stringify({ title: "ALPHA" }) });
 		await w1.call("swarm_vote", { decision_id: "vote-1", approve: true });
 		await toolkit(store, "w2").call("swarm_vote", { decision_id: "vote-1", approve: true });
 
-		const allowed = await w1.call("swarm_task_create", { title: "second", vote_id: "vote-1" });
-		expect(allowed).toContain("created task-2");
-		expect(store.listTasks({}).length).toBe(2);
+		// The round created the task it voted on, exactly once, by itself...
+		expect(store.listTasks({}).map((task) => task.title)).toEqual(["ALPHA"]);
+		// ...and SPENT itself doing it. This pair is the regression for VERDICT §3, where the same 2/2 pass
+		// was a standing permission and two more calls created BETA and GAMMA, neither ever voted on.
+		expect(await w1.call("swarm_task_create", { title: "ALPHA", vote_id: "vote-1" })).toContain("already consumed");
+		expect(await w1.call("swarm_task_create", { title: "BETA (never voted on)", vote_id: "vote-1" })).toContain("consent binds to the decision");
+		expect(store.listTasks({}).map((task) => task.title)).toEqual(["ALPHA"]);
 		store.close();
 	});
 
@@ -213,11 +217,16 @@ describe("the gate: cluster-level decisions need a passed round", () => {
 		expect(await w1.call("swarm_scale", { agents: 2, reason: "cheaper" })).toContain("cluster-level decision (scale)");
 		expect(store.pendingScaleRequests()).toEqual([]);
 
-		await w1.call("swarm_vote", { kind: "scale", question: "shrink to 2" });
+		await w1.call("swarm_vote", { kind: "scale", question: "shrink to 2", payload_json: JSON.stringify({ agents: 2 }) });
 		await w1.call("swarm_vote", { decision_id: "vote-1", approve: true });
 		await toolkit(store, "w2").call("swarm_vote", { decision_id: "vote-1", approve: true });
 
 		expect(await w1.call("swarm_scale", { agents: 2, reason: "cheaper", vote_id: "vote-1" })).toContain("scale request #1");
+		expect(store.pendingScaleRequests().length).toBe(1);
+		// The round named a SIZE, and it is spent: a second ask under the same ticket is refused, and so is a
+		// different size (goal-9's payload binding).
+		expect(await w1.call("swarm_scale", { agents: 2, reason: "again", vote_id: "vote-1" })).toContain("already consumed");
+		expect(await w1.call("swarm_scale", { agents: 4, reason: "bigger", vote_id: "vote-1" })).toContain("consent binds to the decision");
 		expect(store.pendingScaleRequests().length).toBe(1);
 		store.close();
 	});
@@ -252,7 +261,12 @@ describe("the bound is enforced by the MECHANISM, not by an external tick (task-
 		expect(store.searchBoard({ tags: ["vote_failed"] })[0]?.content).toContain("absent 2");
 		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
 		// ...and the gate cannot be fooled by the same round on a later pass.
-		expect(store.passedVote("create-task", "vote-1", DEFAULT_CONFIG.offlineAfterSeconds, (opened?.deadlineAt ?? 0) + 1)).toBeUndefined();
+		expect(
+			store.passedVote("create-task", "vote-1", {
+				offlineAfterSeconds: DEFAULT_CONFIG.offlineAfterSeconds,
+				now: (opened?.deadlineAt ?? 0) + 1,
+			}),
+		).toBeUndefined();
 		store.close();
 	});
 
@@ -284,7 +298,7 @@ describe("the bound is enforced by the MECHANISM, not by an external tick (task-
 		expect(store.searchBoard({ tags: ["vote_failed"] })[0]?.content).toContain("timeout");
 		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
 		// ...and the gate cannot be talked into it by the same round on a later pass.
-		expect(store.passedVote("create-task", "vote-1", DEFAULT_CONFIG.offlineAfterSeconds, bound + 1)).toBeUndefined();
+		expect(store.passedVote("create-task", "vote-1", { offlineAfterSeconds: DEFAULT_CONFIG.offlineAfterSeconds, now: bound + 1 })).toBeUndefined();
 		store.close();
 	});
 
@@ -306,6 +320,33 @@ describe("the bound is enforced by the MECHANISM, not by an external tick (task-
 		expect(store.eventsOfType("vote.failed").length).toBe(1);
 		expect(store.searchBoard({ tags: ["vote_failed"] }).length).toBe(1);
 		expect(store.inbox("w1", 5).some((message) => message.body.includes("vote_failed"))).toBe(true);
+		store.close();
+	});
+});
+
+describe("a ballot dropped because its voter went offline is NAMED in the record (goal-9 minor ①)", () => {
+	test("the round's own reason and the board tally say 'voter offline', not a bare absence", async () => {
+		const store = makeStore();
+		roster(store, ["w1", "w2", "w3"]);
+		const w1 = toolkit(store, "w1", { voteTimeoutSeconds: 1 });
+		await w1.call("swarm_vote", { kind: "create-task", question: "who left", payload_json: JSON.stringify({ title: "never" }) });
+		await w1.call("swarm_vote", { decision_id: "vote-1", approve: true });
+		await toolkit(store, "w2").call("swarm_vote", { decision_id: "vote-1", approve: true });
+		// w2 approved for real and then left before the round settled: the arithmetic drops the ballot (safe
+		// direction, unchanged), and the record must name WHY instead of reporting a quiet absence.
+		store.setAgentStatus("w2", "offline");
+		const bound = store.getVote("vote-1")?.deadlineAt ?? 0;
+		const read = store.tallyVote("vote-1", DEFAULT_CONFIG.offlineAfterSeconds, bound + 1);
+
+		expect(read?.outcome.offline).toEqual(["w2"]);
+		expect(read?.outcome.reason).toContain("voter offline at settlement: w2");
+		expect(read?.outcome.reason).toContain("timeout");
+		expect(store.searchBoard({ tags: ["vote_failed"] })[0]?.content).toContain("offline 1 [w2]");
+		// The tally is also on the ordinary event read path — `recentEvents` carries `data` now (minor ②).
+		const failed = store.recentEvents(20).find((event) => event.type === "vote.failed");
+		expect(failed?.data.offline).toEqual(["w2"]);
+		expect(failed?.data.absent).toEqual(["w3"]);
+		expect(store.listTasks({}).length).toBe(0);
 		store.close();
 	});
 });

@@ -37,7 +37,7 @@ import type {
 	TaskStatus,
 	VoteState,
 } from "./types";
-import { decide, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
+import { decide, payloadSignature, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
 
 interface TaskRow {
 	id: string;
@@ -90,6 +90,15 @@ interface VoteRow {
 	status: VoteState;
 	result: string | null;
 	updated_at: number;
+}
+
+/** The one-shot marker of a spent round (goal-9): a passed decision authorises exactly one action. */
+interface VoteConsumptionRow {
+	vote_id: string;
+	kind: DecisionKind;
+	payload: string;
+	consumed_by: string;
+	consumed_at: number;
 }
 
 interface BoardRow {
@@ -1534,22 +1543,46 @@ export class SwarmStore {
 	#finishVote(vote: SwarmVote, outcome: VoteOutcome, now: number): SwarmVote | undefined {
 		if (vote.status !== "open") return undefined;
 		const passed = outcome.status === "passed";
-		const tally = `for ${outcome.approvals.length}/${outcome.base} [${outcome.approvals.join(", ") || "-"}]; against ${outcome.rejections.length} [${outcome.rejections.join(", ") || "-"}]; absent ${outcome.absent.length} [${outcome.absent.join(", ") || "-"}]`;
-		let status: VoteState = passed ? "passed" : "failed";
-		let result = outcome.reason;
-		if (passed && vote.kind === "create-task") {
-			try {
-				// The payload was written by the vote tool in CreateTaskInput's own shape; a malformed one
-				// fails the decision rather than creating a half-row.
-				const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
-				result = `${outcome.reason}; executed: created ${task.id}`;
-			} catch (error) {
-				status = "failed";
-				result = `${outcome.reason}; execution failed: ${error instanceof Error ? error.message : String(error)}`;
+		const tally = `for ${outcome.approvals.length}/${outcome.base} [${outcome.approvals.join(", ") || "-"}]; against ${outcome.rejections.length} [${outcome.rejections.join(", ") || "-"}]; absent ${outcome.absent.length} [${outcome.absent.join(", ") || "-"}]${outcome.offline.length === 0 ? "" : `; offline ${outcome.offline.length} [${outcome.offline.join(", ")}]`}`;
+		// The status transition and whatever the round executes are ONE transaction: a round can never be
+		// recorded as passed while the action it authorised half-happened, and the ticket it spends is
+		// consumed in the same step (goal-9's high 1).
+		const finished = this.#db.transaction(() => {
+			const status: VoteState = passed ? "passed" : "failed";
+			let result = outcome.reason;
+			if (passed && vote.kind === "create-task") {
+				try {
+					// The payload was written by the vote tool in CreateTaskInput's own shape; a malformed one
+					// fails the decision rather than creating a half-row.
+					const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
+					// The round spends ITSELF on the task it authorised. Without this the same 2/2 pass stayed
+					// a standing permission and re-issued `swarm_task_create(..., { vote_id })` created one more
+					// task per call (VERDICT §3: ONE vote, THREE tasks).
+					this.#recordConsumptionLocked(vote.id, vote.kind, vote.payload, vote.openedBy, now);
+					result = `${outcome.reason}; executed: created ${task.id}`;
+				} catch (error) {
+					// A round whose action failed is NOT passed: it is failed, and its ticket is not burned
+					// (the rollback below undoes the consumption with it).
+					return {
+						changes: this.#db.run(
+							"UPDATE votes SET status='failed', result=?, updated_at=? WHERE id=? AND status='open'",
+							`${outcome.reason}; execution failed: ${error instanceof Error ? error.message : String(error)}`,
+							now,
+							vote.id,
+						).changes,
+						status: "failed" as VoteState,
+						result: `${outcome.reason}; execution failed: ${error instanceof Error ? error.message : String(error)}`,
+					};
+				}
 			}
-		}
-		const changed = this.#db.run("UPDATE votes SET status=?, result=?, updated_at=? WHERE id=? AND status='open'", status, result, now, vote.id);
-		if (changed.changes !== 1) return undefined;
+			return {
+				changes: this.#db.run("UPDATE votes SET status=?, result=?, updated_at=? WHERE id=? AND status='open'", status, result, now, vote.id).changes,
+				status,
+				result,
+			};
+		});
+		if (finished.changes !== 1) return undefined;
+		const { status, result } = finished;
 		this.#log(status === "passed" ? "vote.passed" : "vote.failed", vote.openedBy, undefined, {
 			vote: vote.id,
 			kind: vote.kind,
@@ -1557,6 +1590,7 @@ export class SwarmStore {
 			for: outcome.approvals,
 			against: outcome.rejections,
 			absent: outcome.absent,
+			offline: outcome.offline,
 			reason: outcome.reason,
 		});
 		const headline = `${status === "passed" ? "vote_passed" : "vote_failed"} ${vote.id} (${vote.kind}): ${vote.question}`;
@@ -1582,6 +1616,7 @@ export class SwarmStore {
 		try {
 			const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
 			this.#db.run("UPDATE votes SET result=?, updated_at=? WHERE id=?", `seeded: created ${task.id}`, Date.now(), vote.id);
+			this.#recordConsumptionLocked(vote.id, vote.kind, vote.payload, vote.openedBy, Date.now());
 			this.#log("vote.executed", vote.openedBy, undefined, { vote: vote.id, kind: vote.kind, task: task.id, seeded: true });
 		} catch (error) {
 			const reason = `seeded execution failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1591,14 +1626,115 @@ export class SwarmStore {
 		return this.getVote(vote.id);
 	}
 
-	/** The passed round of `kind` a gated decision point may act on, or undefined. The gate's whole test. */
-	passedVote(kind: DecisionKind, voteId: string | undefined, offlineAfterSeconds = 60, now = Date.now()): SwarmVote | undefined {
-		if (voteId === undefined) return undefined;
-		// The gate reads through the same due-check, so a round that timed out is settled and can never be
-		// mistaken for a standing permission.
+	/** The one-shot marker of a round, if it was spent: who spent it, on what, and when. */
+	#consumption(voteId: string): VoteConsumptionRow | undefined {
+		return this.#db.get<VoteConsumptionRow>("SELECT * FROM vote_consumptions WHERE vote_id=?", voteId) ?? undefined;
+	}
+
+	/**
+	 * Mark a round spent. The PRIMARY KEY is the whole mechanism: a second insert changes 0 rows, so
+	 * exactly one consumer can ever win — in this process or in another one holding the same database.
+	 * Called with an open transaction only, so it either lands with the action it authorises or not at all.
+	 */
+	#recordConsumptionLocked(voteId: string, kind: DecisionKind, payload: Record<string, unknown>, consumedBy: string, now: number): number {
+		return this.#db.run(
+			"INSERT OR IGNORE INTO vote_consumptions (vote_id, kind, payload, consumed_by, consumed_at) VALUES (?, ?, ?, ?, ?)",
+			voteId,
+			kind,
+			payloadSignature(payload),
+			consumedBy,
+			now,
+		).changes;
+	}
+
+	/**
+	 * Everything that must hold before a round may act, or the ONE reason it may not. `kind` alone was the
+	 * old test, and it was the hole (goal-9, VERDICT §3): a passed round stayed a standing permission for
+	 * every later call of its kind. Now consent is bound to the DECISION — the frozen payload — and to a
+	 * single use. Read-only: it consumes nothing, so a report can ask the same question.
+	 */
+	#ticketRefusal(
+		kind: DecisionKind,
+		voteId: string,
+		payload: Record<string, unknown>,
+		offlineAfterSeconds: number,
+		now: number,
+	): string | undefined {
+		// The due-check runs first, so a round that timed out is settled here and can never be mistaken
+		// for a live permission.
 		this.#settleIfDue(voteId, offlineAfterSeconds, now);
 		const vote = this.#voteRow(voteId);
-		return vote !== undefined && vote.status === "passed" && vote.kind === kind ? vote : undefined;
+		if (vote === undefined) return `unknown vote ${voteId}`;
+		if (vote.status !== "passed") return `${voteId} is ${vote.status}, not passed: only a passed round can authorise an action`;
+		if (vote.kind !== kind) return `${voteId} is a ${vote.kind} round, not ${kind}`;
+		const voted = payloadSignature(vote.payload);
+		const acting = payloadSignature(payload);
+		if (voted !== acting) {
+			return `${voteId} voted on ${voted}, this call acts on ${acting}: consent binds to the decision, not to the kind`;
+		}
+		const spent = this.#consumption(voteId);
+		if (spent !== undefined) {
+			return `${voteId} was already consumed by ${spent.consumed_by} at ${new Date(spent.consumed_at).toISOString()}: one decision, one action`;
+		}
+		return undefined;
+	}
+
+	/**
+	 * The passed round of `kind` a gated decision point may act on, or undefined. A REPORT, never an
+	 * authorisation: it is read-only, so only {@link SwarmStore.consumeVote} may actually act on a round.
+	 */
+	passedVote(
+		kind: DecisionKind,
+		voteId: string | undefined,
+		options: { payload?: Record<string, unknown>; offlineAfterSeconds: number; now?: number },
+	): SwarmVote | undefined {
+		if (voteId === undefined) return undefined;
+		const refusal = this.#ticketRefusal(kind, voteId, options.payload ?? {}, options.offlineAfterSeconds, options.now ?? Date.now());
+		return refusal === undefined ? this.#voteRow(voteId) : undefined;
+	}
+
+	/**
+	 * Act under a round's consent: the ticket is checked, spent and the action performed in ONE
+	 * transaction, or nothing happens at all. That is the fix for goal-9's high 1 — a passed round is a
+	 * one-shot ticket for exactly the payload it froze, so a replay (same payload, second use) and a
+	 * payload swap (different payload, same ticket) are both refused with a reason, and there is no
+	 * window between the check and the action for a second consumer to slip through.
+	 *
+	 * An action that THROWS rolls the transaction back, ticket included: a failed action must not burn
+	 * the consent it could not use.
+	 */
+	consumeVote<T>(input: {
+		kind: DecisionKind;
+		voteId: string;
+		payload: Record<string, unknown>;
+		consumedBy: string;
+		offlineAfterSeconds: number;
+		action: (vote: SwarmVote) => T;
+		now?: number;
+	}): { ok: true; vote: SwarmVote; value: T } | { ok: false; reason: string } {
+		const now = input.now ?? Date.now();
+		return this.#db.transaction(() => {
+			const refusal = this.#ticketRefusal(input.kind, input.voteId, input.payload, input.offlineAfterSeconds, now);
+			if (refusal !== undefined) return { ok: false as const, reason: refusal };
+			if (this.#recordConsumptionLocked(input.voteId, input.kind, input.payload, input.consumedBy, now) !== 1) {
+				// Two consumers passed the same check before either spent the ticket: the database decides,
+				// and the loser is told who won rather than being allowed to act twice.
+				const spent = this.#consumption(input.voteId);
+				return {
+					ok: false as const,
+					reason: `${input.voteId} was consumed by ${spent?.consumed_by ?? "another agent"} first: one decision, one action`,
+				};
+			}
+			const vote = this.#voteRow(input.voteId);
+			if (vote === undefined) return { ok: false as const, reason: `unknown vote ${input.voteId}` };
+			const value = input.action(vote);
+			this.#log("vote.consume", input.consumedBy, undefined, {
+				vote: input.voteId,
+				kind: input.kind,
+				payload: payloadSignature(input.payload),
+			});
+			return { ok: true as const, vote, value };
+		});
 	}
 
 	// ---------------------------------------------------------------- review
@@ -1852,9 +1988,10 @@ export class SwarmStore {
 	// --------------------------------------------------------------- events
 
 	/**
-	 * The events of one type, newest first, WITH their `data` — the audit reader `recentEvents` deliberately
-	 * is not (it feeds panels that only need labels). A vote's tally lives in its event, so the proof that
-	 * `vote_failed` publishes for/against/absent needs this one.
+	 * The events of one type, newest first, WITH their `data` — kept as the type-filtered audit reader
+	 * for callers that want one kind of event only (`recentEvents` now carries `data` too, goal-9's
+	 * minor ②: a vote's {for, against, absent} tally lives in its event, and the tally of a decision
+	 * must be readable on the ordinary read path, not only here and on the board).
 	 */
 	eventsOfType(type: string, limit = 50): { id: number; agentId?: string; taskId?: string; data: Record<string, unknown>; createdAt: number }[] {
 		return this.#db
@@ -1872,10 +2009,10 @@ export class SwarmStore {
 			}));
 	}
 
-	recentEvents(limit = 30): { id: number; type: string; agentId?: string; taskId?: string; createdAt: number }[] {
+	recentEvents(limit = 30): { id: number; type: string; agentId?: string; taskId?: string; data: Record<string, unknown>; createdAt: number }[] {
 		return this.#db
-			.all<{ id: number; type: string; agent_id: string | null; task_id: string | null; created_at: number }>(
-				"SELECT id, type, agent_id, task_id, created_at FROM events ORDER BY id DESC LIMIT ?",
+			.all<{ id: number; type: string; agent_id: string | null; task_id: string | null; data: string; created_at: number }>(
+				"SELECT id, type, agent_id, task_id, data, created_at FROM events ORDER BY id DESC LIMIT ?",
 				limit,
 			)
 			.map((row) => ({
@@ -1883,6 +2020,7 @@ export class SwarmStore {
 				type: row.type,
 				agentId: row.agent_id ?? undefined,
 				taskId: row.task_id ?? undefined,
+				data: JSON.parse(row.data) as Record<string, unknown>,
 				createdAt: row.created_at,
 			}));
 	}

@@ -16,9 +16,10 @@ function makeStore(): SwarmStore {
 	return new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-goal-tools")));
 }
 
-/** A worker's tool surface, exactly as `driver.ts` builds it. */
-function workerTools(store: SwarmStore, id: string, config: Partial<SwarmConfig> = {}) {
-	const identity: SwarmIdentity = { id, role: "general", capabilities: ["general"], isMain: false };
+/** A worker's tool surface, exactly as `driver.ts` builds it. `isMain` marks the coordinator's own seat,
+ * whose goal/budget calls are seed authority (rule 2) and are therefore not gated (goal-9). */
+function workerTools(store: SwarmStore, id: string, config: Partial<SwarmConfig> = {}, isMain = false) {
+	const identity: SwarmIdentity = { id, role: "general", capabilities: ["general"], isMain };
 	const tools = buildSwarmTools({ store, config: { ...DEFAULT_CONFIG, ...config }, identity, z: zod });
 	const call = async (name: string, params: object): Promise<string> => {
 		const picked = tools.find((candidate) => candidate.name === name);
@@ -35,7 +36,7 @@ function workerTools(store: SwarmStore, id: string, config: Partial<SwarmConfig>
 describe("swarm_goal", () => {
 	test("opens the round and hands back the one planning task", async () => {
 		const store = makeStore();
-		const { call, names } = workerTools(store, "main");
+		const { call, names } = workerTools(store, "main", {}, true);
 		expect(names).toContain("swarm_goal");
 		expect(names).toContain("swarm_propose");
 		expect(names).toContain("swarm_plan");
@@ -51,7 +52,7 @@ describe("swarm_goal", () => {
 
 	test("clamps the budget to config.workers and refuses an empty or unusable count", async () => {
 		const store = makeStore();
-		const { call } = workerTools(store, "main", { workers: 2 });
+		const { call } = workerTools(store, "main", { workers: 2 }, true);
 		expect(await call("swarm_goal", { goal: "big", agents: 9 })).toContain("capped by config.workers=2");
 		expect(store.getGoal("goal-1")?.agents).toBe(2);
 		expect(await call("swarm_goal", { goal: "   ", agents: 2 })).toContain("needs the user's request");
@@ -62,7 +63,7 @@ describe("swarm_goal", () => {
 
 	test("the legacy mode refuses to open a round and says what to do instead", async () => {
 		const store = makeStore();
-		const { call } = workerTools(store, "main", { planning: "coordinator" });
+		const { call } = workerTools(store, "main", { planning: "coordinator" }, true);
 		expect(await call("swarm_goal", { goal: "x", agents: 2 })).toContain("swarm_task_create");
 		expect(store.liveGoals()).toEqual([]);
 		store.close();
@@ -72,7 +73,7 @@ describe("swarm_goal", () => {
 describe("swarm_propose", () => {
 	test("posts the worker's own split onto the board and names the next step", async () => {
 		const store = makeStore();
-		const main = workerTools(store, "main");
+		const main = workerTools(store, "main", {}, true);
 		await main.call("swarm_goal", { goal: "split the work", agents: 2 });
 		const text = await workerTools(store, "w1").call("swarm_propose", {
 			tasks: [{ title: "Ship the parser", files: ["src/p.ts"], capabilities: ["general"] }],
@@ -101,7 +102,7 @@ describe("swarm_propose", () => {
 describe("swarm_plan", () => {
 	async function announced(): Promise<{ store: SwarmStore; call: (name: string, params: object) => Promise<string> }> {
 		const store = makeStore();
-		await workerTools(store, "main").call("swarm_goal", { goal: "split the work", agents: 2 });
+		await workerTools(store, "main", {}, true).call("swarm_goal", { goal: "split the work", agents: 2 });
 		await workerTools(store, "w1").call("swarm_propose", {
 			tasks: [
 				{ title: "Ship the parser", deliverable: "parser + tests", files: ["src/p.ts"] },
@@ -154,7 +155,7 @@ describe("swarm_plan", () => {
 
 	test("three workers proposing the same deliverable in three spellings create ONE row, and the DECISION says why", async () => {
 		const store = makeStore();
-		await workerTools(store, "main").call("swarm_goal", { goal: "audit the idle burn", agents: 3 });
+		await workerTools(store, "main", {}, true).call("swarm_goal", { goal: "audit the idle burn", agents: 3 });
 		await workerTools(store, "w1").call("swarm_propose", {
 			tasks: [{ title: "Measure and publish the idle burn rate", files: ["scratch/burnrate/**"], capabilities: ["general"] }],
 		});

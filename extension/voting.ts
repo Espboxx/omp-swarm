@@ -97,6 +97,13 @@ export interface VoteOutcome {
 	absent: string[];
 	/** Ballots that did not count: a repeat from one voter, or a non-voter's (rule 4). */
 	ignored: Vote[];
+	/**
+	 * Voters whose ballot did NOT count because they are offline at settlement (goal-9's minor ①). The
+	 * arithmetic is unchanged — a voter who left drops out of the base, so nobody can stall a round by
+	 * leaving — but the DROPPED approval is named instead of vanishing into `ignored`: a real yes that
+	 * was silently discarded is the one thing the tally must never hide.
+	 */
+	offline: string[];
 	/** One line the caller may publish verbatim. */
 	reason: string;
 	/** True when the round is over (seeded / passed / failed) and the caller must act or report. */
@@ -169,6 +176,38 @@ export function votingSignature(decisionId: string, outcome: VoteOutcome): strin
 }
 
 /**
+ * The canonical identity of WHAT a round decided, so consent binds to the decision and not merely to
+ * its kind (goal-9, VERDICT §3). Two payloads sign the same string only when they say the same thing:
+ * object keys are sorted, object values recursed, strings trimmed, a list of names (`files`,
+ * `dependencies`, `capabilities`) sorted because the order of a set is not part of the decision, and
+ * `undefined` dropped.
+ *
+ * Nothing else is ever dropped: an unrecognised key still signs, so a ticket can only ever authorise
+ * exactly the payload it froze — never more, and never "whatever the caller felt like meaning".
+ */
+export function payloadSignature(payload: Record<string, unknown>): string {
+	return JSON.stringify(canonicalize(payload));
+}
+
+function canonicalize(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		const items = value.map((item) => canonicalize(item));
+		return items.every((item) => typeof item === "string") ? [...(items as string[])].sort() : items;
+	}
+	if (value !== null && typeof value === "object") {
+		const source = value as Record<string, unknown>;
+		const out: Record<string, unknown> = {};
+		for (const key of Object.keys(source).sort()) {
+			const item = source[key];
+			if (item === undefined) continue;
+			out[key] = canonicalize(item);
+		}
+		return out;
+	}
+	return typeof value === "string" ? value.trim() : value;
+}
+
+/**
  * Decide a round. Pure: same input, same outcome, no clock of its own and no side effect.
  *
  * Settling EARLY is deliberate in both directions — a round that already has the approvals, or one
@@ -185,12 +224,21 @@ export function decide(input: VotingInput): VoteOutcome {
 	const approvals: string[] = [];
 	const rejections: string[] = [];
 	const ignored: Vote[] = [];
+	const offline: string[] = [];
 	const seen = new Set<string>();
 	for (const vote of input.votes) {
-		// A non-voter (the coordinator, the operator, an offline agent) and a repeat are recorded but
-		// never counted: one agent, one ballot (rule 4).
-		if (!present.has(vote.voter) || seen.has(vote.voter)) {
+		// A repeat is recorded but never counted: one agent, one ballot (rule 4).
+		if (seen.has(vote.voter)) {
 			ignored.push(vote);
+			continue;
+		}
+		if (!present.has(vote.voter)) {
+			// A ballot that does not count. Two very different reasons, kept apart on purpose (minor ①): a
+			// voter who is STILL on the roster but offline at settlement is NAMED as such, because their
+			// approval was real and only the arithmetic dropped it; anyone else (the coordinator, the
+			// operator, an unknown id) is simply not a voter.
+			if (input.agents.some((agent) => agent.id === vote.voter)) offline.push(vote.voter);
+			else ignored.push(vote);
 			continue;
 		}
 		seen.add(vote.voter);
@@ -208,7 +256,13 @@ export function decide(input: VotingInput): VoteOutcome {
 		rejections,
 		absent,
 		ignored,
-		reason,
+		offline,
+		// Never silent: a ballot the arithmetic discarded because its voter left is named in the line the
+		// caller publishes, so the tally cannot read as "nobody was interested".
+		reason:
+			offline.length === 0
+				? reason
+				: `${reason}; ${offline.length} ballot(s) DROPPED, voter offline at settlement: ${offline.join(", ")}`,
 		settled,
 	});
 

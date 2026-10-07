@@ -91,6 +91,19 @@ export const UNDER_BUDGET_COOLDOWN_MS = 60_000;
  * owes even before any task exists — that is the point of swarm-side planning — so it sizes the
  * roster on its own, and it raises the size when the round's one planning task would otherwise
  * shrink the pool to a single worker.
+ *
+ * WHERE THAT NUMBER COMES FROM IS THE WHOLE POINT (goal-9 high 2). This function is a CONSUMER of an
+ * authenticated budget, never an authority of its own, so it deliberately contains no gate: every path
+ * that can raise `goalAgents` is a cluster-level decision at the tool layer — `swarm_goal` needs a
+ * passed `spawn` round naming the size (its payload is {"agents":N}) unless the caller is the
+ * coordinator, whose own goal is seed authority (rule 2), and `swarm_scale` needs a passed `scale`
+ * round the same way. Before that, `grep -n vote extension/auto.ts` returned nothing and ANY agent
+ * could raise N through `swarm_goal`, which grew the pool with no ballot at all.
+ *
+ * Shrinking is deliberately NOT gated here: the only automatic shrink is the reconciliation that
+ * follows the work (a finished goal, an idle peer, the operator's own `config.workers` ceiling) and it
+ * can never stop a worker that holds work. An agent asking for a smaller pool goes through the gated
+ * `swarm_scale`, so no agent can grow OR shrink the roster by asking twice.
  */
 export function planRoster(tasks: SwarmTask[], config: SwarmConfig, goalAgents = 0): RoleConfig[] {
 	const active = tasks.filter((t) => t.status !== "done" && t.status !== "failed");
