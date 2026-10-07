@@ -68,8 +68,8 @@ web/
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            50 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        35 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/auto.test.ts            54 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
@@ -81,6 +81,7 @@ tests/
   unit/web-command-parsing.test.ts 17 unit tests of `/swarm web`'s pure surface: argument parsing, port validation, the free-port scan and the URL
   unit/web-server.test.ts      10 unit tests of the dashboard's HTTP surface: the frozen contract, the error surface, SSE change detection, read-only
   unit/web-snapshot.test.ts    11 unit tests of the snapshot reader: counts, blockedReason, the newest-first feeds and the task-size cap
+  unit/web-dashboard.test.ts    1 browser test of the page's own DOM: the newest-first feeds and a group header that cannot contradict the counts chip
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
@@ -253,7 +254,7 @@ message <id> <text>`（或 `swarm_message` 工具）仍然能在不离开这个�
 
 1. `swarm_goal({ goal, agents })` 在一个事务里写入目标行和它唯一的那一个规划任务，池子随后按目标的 agent 预算启动（至少 `agents`，上限 `config.workers`）。存活的目标在任何任务存在之前就已经计入名册定规模，并且它被刻意排除在停滞通知之外。
 2. 每个 worker 读这个目标（`swarm_status` 会列出它；规划任务本身带着简报），并用 `swarm_propose` 发布自己的拆分 —— 一条打了 `proposal` 标签、限定在该目标下的 board `OBSERVATION`，所以整个集群都能读到并回应它（可以用 `swarm_message` 完善别的 agent 的提案）。
-3. 第一个 `swarm_claim` 到规划任务的 worker 就是 **scribe**。随后 `swarm_plan` 在一次事务里合并这一轮：只有在调用者仍持有那次认领、目标仍然 open、并且至少有一条提案时它才继续。它按**产出什么**而不是标题措辞去重：标题完全相同的一律合并；其余情况下的键是**目标产物**（提案声明的 `files`，否则是标题里的文件名）加上**工作类型**（write/verify/fix/document/remove/refactor）。同一个产物上的两个 **writer** 永远只算一个交付物 —— 产物只有一个归属 —— 而同一交付物上的两个非写入视角（比如一个 writer 和一个 verifier）则在「一方是另一方的某一节」或措辞足够接近时才合并。文件、能力与依赖取并集并入存留者，描述取最长的那条；池子里已经持有的交付物会被跳过并如实报告；**没有可识别产物**的提案不与任何东西匹配（错误合并会丢工作，错误拆分只是多一个任务）。合并后的拆分以 `DECISION` 发布，目标被标记为 planned。
+3. 第一个 `swarm_claim` 到规划任务的 worker 就是 **scribe**。随后 `swarm_plan` 在一次事务里合并这一轮：只有在调用者仍持有那次认领、目标仍然 open、并且至少有一条提案时它才继续。它按**产出什么**而不是标题措辞去重：标题完全相同的一律合并；其余情况下的键是**目标产物**（提案声明的 `files`，否则是标题里的文件名 —— 只有路径形状、或结尾是已知文件扩展名的 token 才算文件名，所以 `1.2.3`、`v1.0.beta` 这类版本号不是文件名，也就无法把两个交付物并成一个）加上**工作类型**（write/verify/fix/document/remove/refactor）。同一个产物上的两个 **writer** 永远只算一个交付物 —— 产物只有一个归属 —— 而同一交付物上的两个非写入视角（比如一个 writer 和一个 verifier）则在「一方是另一方的某一节」或措辞足够接近时才合并。文件、能力与依赖取并集并入存留者，描述取最长的那条；池子里已经持有的交付物会被跳过并如实报告；**没有可识别产物**的提案不与任何东西匹配（错误合并会丢工作，错误拆分只是多一个任务）。合并后的拆分以 `DECISION` 发布，目标被标记为 planned。
 4. 规划任务完成，之后所有人通过那条并未改动的循环认领真正的任务。
 
 恰好一次靠的是**原子认领**，而不是时序：两个 agent 不可能同时持有规划任务，而一个过期租约（scribe 中途死掉）会把它交给下一个认领者，后者可以安全地重新合并，因为创建对池子而言是幂等的。
@@ -366,7 +367,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 365 unit tests in the 16 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 373 unit tests in the 17 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

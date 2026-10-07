@@ -77,8 +77,8 @@ web/
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            50 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        35 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/auto.test.ts            54 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
@@ -90,6 +90,7 @@ tests/
   unit/web-command-parsing.test.ts 17 unit tests of `/swarm web`'s pure surface: argument parsing, port validation, the free-port scan and the URL
   unit/web-server.test.ts      10 unit tests of the dashboard's HTTP surface: the frozen contract, the error surface, SSE change detection, read-only
   unit/web-snapshot.test.ts    11 unit tests of the snapshot reader: counts, blockedReason, the newest-first feeds and the task-size cap
+  unit/web-dashboard.test.ts    1 browser test of the page's own DOM: the newest-first feeds and a group header that cannot contradict the counts chip
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
@@ -385,7 +386,9 @@ The planning round (mode `"swarm"`), in order:
    round in ONE transaction: it refuses unless the caller still holds that claim, the goal is still
    open, and at least one proposal exists. It dedupes a deliverable by WHAT IS PRODUCED, not by the
    wording: identical titles always collapse, and otherwise the key is the TARGET ARTIFACT (the `files`
-   a proposal declares, else the file names in its title) plus the KIND of work
+   a proposal declares, else the file names in its title — where a title token counts as one only if it
+   is path-shaped or ends in a known file extension, so a version tag like `1.2.3` or `v1.0.beta` is not
+   a file name and cannot make two deliverables one) plus the KIND of work
    (write/verify/fix/document/remove/refactor). On one artifact, two WRITERS are always one task — an
    artifact has one owner — while two non-writing views of it (a writer and a verifier, say) collapse
    when one is a section of the other or the wording is close enough. Files, capabilities and
@@ -583,7 +586,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 365 unit tests in the 16 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 373 unit tests in the 17 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
