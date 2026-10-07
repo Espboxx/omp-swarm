@@ -383,10 +383,15 @@ The planning round (mode `"swarm"`), in order:
    so the whole swarm can read and answer it (`swarm_message` to refine another agent's proposal).
 3. The first worker to `swarm_claim` the planning task is the **scribe**. `swarm_plan` then merges the
    round in ONE transaction: it refuses unless the caller still holds that claim, the goal is still
-   open, and at least one proposal exists. It dedupes by the **normalized title** (lowercased,
-   whitespace collapsed, trailing punctuation stripped), so two proposals naming the same deliverable
-   become ONE task, with files, capabilities and dependencies unioned and the longest description kept;
-   deliverables the pool already holds are skipped and reported. The merged split is posted as a
+   open, and at least one proposal exists. It dedupes a deliverable by WHAT IS PRODUCED, not by the
+   wording: identical titles always collapse, and otherwise the key is the TARGET ARTIFACT (the `files`
+   a proposal declares, else the file names in its title) plus the KIND of work
+   (write/verify/fix/document/remove/refactor). On one artifact, two WRITERS are always one task — an
+   artifact has one owner — while two non-writing views of it (a writer and a verifier, say) collapse
+   when one is a section of the other or the wording is close enough. Files, capabilities and
+   dependencies are unioned into the survivor and the longest description is kept; deliverables the pool
+   already holds are skipped and reported, and a proposal with NO identifiable artifact matches nothing
+   at all (a false merge loses work; a false split only costs a task). The merged split is posted as a
    `DECISION` and the goal is marked planned.
 4. The planning task completes and everyone claims the real tasks through the unchanged loop.
 
@@ -399,9 +404,11 @@ its own proposal — roughly N × a coordination round, instead of one coordinat
 coordinator, which is the honest trade for the coordinator no longer writing the list. The round is
 bounded: no plan within 10 minutes of the goal closes it as `failed`, closes its unclaimed planning task
 with it, and posts a `FAIL` on the board plus a notice, so a round that cannot converge is reported
-rather than spun. And the dedupe key is the normalized title, so two proposals for the SAME deliverable
-cannot become two tasks — two DIFFERENT titles for the same deliverable still can, which is what the
-scribe's own reading of the round is for.
+rather than spun. And the dedupe key is the deliverable — its target artifact plus the kind of work —
+never the title's wording: two writers on one artifact always become ONE task, because an artifact has
+one owner. What can still split is a proposal the key cannot see at all: with no declared `files` and no
+file name in its title it has no artifact to match on and merges with nothing, so two far-apart
+phrasings of it stay two tasks — which is what the scribe's own reading of the round is for.
 
 The status line tracks the mode: `idle`, `planning`, `running` (`3a r0 c2 v0 d1` = online agents,
 ready/claimed/review/done), `done n/m`, `stalled`, prefixed while a pool is up by the compact
