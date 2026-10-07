@@ -244,9 +244,9 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_renew` | 延长你持有的租约 |
 | `swarm_release` | 带原因把工作交回（绝不静默停摆） |
 | `swarm_complete` | 带摘要/commit/files 完成 → `review` 或 `done` |
-| `swarm_fail` | 带原因失败；会自动写入一条 FAIL board 记录 |
+| `swarm_fail` | 带原因失败；会自动写入一条 FAIL board 记录。也会关闭无人持有、且其依赖永不可能到达 `done` 的任务 —— 这是永久残留唯一的出口 |
 | `swarm_task_create` | 添加你发现的工作或依赖；会拒绝未知、自指或闭环的依赖 |
-| `swarm_task_retry` | 把 `failed`/`blocked` 任务复活为 `ready`（全新尝试、清空认领），以便其依赖项被提升 |
+| `swarm_task_retry` | 复活 `failed`/`blocked` 任务（全新尝试、清空认领），以便其依赖项被提升；当它自身的依赖尚未解决时保持 `blocked` |
 | `swarm_integrate` | 创建一个需要 `integrator` 能力的集成任务 |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
 | `board_search` | 按 type/task/agent/tag/keyword 过滤 |
@@ -266,7 +266,7 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 **任务图。** 依赖在创建事务内检查（`store.ts:createTask` →
 `#assertDependencies`），在任何行被写入之前：未知 id 被拒绝为
 `unknown dependency: task-99`，自指边被拒绝为 `dependency_self: task-2 depends on itself`，而会闭环的边被拒绝为
-`dependency_cycle: task-2 -> task-1 -> task-2` —— 什么都不插入。`blockedReason()` 会解释任何仍处于 blocked 的行 —— 依赖 id 已不存在时是 `missing: <ids>`，永不可能到达 `done` 的图是 `cycle: <path>`，否则是 `waiting` —— `swarm_status` 会把这个原因打印在任务旁边。`failed` 任务不再是死路：`swarm_task_retry`（`store.ts:retryTask`）把它以全新尝试放回池子并置为 `ready`，随后常规的 `sweep()` 会在它完成时提升其依赖项。
+`dependency_cycle: task-2 -> task-1 -> task-2` —— 什么都不插入。`blockedReason()` 会解释任何仍处于 blocked 的行 —— 依赖 id 已不存在时是 `missing: <ids>`，永不可能到达 `done` 的图是 `cycle: <path>`，否则是 `waiting` —— `swarm_status` 会把这个原因打印在任务旁边。`failed` 任务不再是死路：`swarm_task_retry`（`store.ts:retryTask`）把它以全新尝试放回池子并置为 `ready`，随后常规的 `sweep()` 会在它完成时提升其依赖项。镜像的情形是残留：依赖永不可能到达 `done` 的任务（`store.ts:deadDependencies` —— 依赖为 `failed`、缺失或成环）同样永远无法被认领，所以只要没有任何 agent 持有它，`fail()` 也能由非持有者关闭它。这是永久阻塞的行唯一的出口：没有删除，也没有归档。
 
 **租约 + 心跳。** 每次认领都会写入 `claimed_by`/`lease_until`。任何工具调用以及 driver 的心跳都会续租。清扫器（`sweep()`）在每次认领内部以及每个心跳上运行：租约过期的任务回到 `ready` 并产生一个 `task.reclaim` 事件，由租约支撑的文件预留也随之过期。因此崩溃的 agent 无法卡住池子，而存活的租约永远不会被抢。
 
@@ -371,7 +371,7 @@ UI 那次运行还断言了状态行跟随整个过程：`idle → planning → 
 - 最响的那个界面是 `TERMINAL.sendNotification`，`PI_NOTIFICATIONS=off` 会抑制它，无头终端会丢弃它。常驻标记（widget + 状态行）也只存在于 UI，所以 `--no-ui` 会话只有在多 agent 模式关闭时才会以转录消息的形式拿到摘要。
 - `swarm_wait` 会阻塞一个 worker 回合；它不是调度器的替代品。
 - 环现在无法进入任务图（`store.ts:createTask` 拒绝未知/自指/成环的依赖），但在那个检查存在之前创建的行仍可能成环：它们会一直 `blocked`，并由 `swarm_status` 报告为 `cycle: <path>`（`store.ts:blockedReason`）—— 没有任何东西会就地修复它们。
-- 用 `swarm_task_retry` 复活一个 `blocked` 任务会把它置回 `ready`，即使它的依赖尚未完成；`store.ts:claim` 仍会拒绝认领直到它们 `done`（工具会打印这个注意事项）。重试是用来救死路的，不是用来跳过依赖的。
+- 没有删除，也没有归档：残留以 `failed` 关闭，而只有当某个依赖永不可能到达 `done` 时，`fail()` 才接受一个无人持有的行（`store.ts:deadDependencies`）。依赖只是尚未完成的任务仍然无法关闭，所以这个出口不能被用来跳过工作 —— 而用早于当前代码树的扩展加载的池子仍然完全拒绝这种关闭。
 
 ## 扩展到 8 / 16 / 32 个 agent
 

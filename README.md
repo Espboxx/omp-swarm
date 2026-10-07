@@ -363,9 +363,9 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_renew` | extend leases you hold |
 | `swarm_release` | give work back with a reason (never stall silently) |
 | `swarm_complete` | finish with summary/commit/files → `review` or `done` |
-| `swarm_fail` | fail with a reason; a FAIL board entry is written automatically |
+| `swarm_fail` | fail with a reason; a FAIL board entry is written automatically. Also closes a task nobody holds whose dependency can never reach `done` — the only exit permanent residue has |
 | `swarm_task_create` | add work or a dependency you discovered; refuses an unknown, self- or cycle-closing dependency |
-| `swarm_task_retry` | revive a `failed`/`blocked` task as `ready` (fresh attempt, cleared claim) so its dependents can be promoted |
+| `swarm_task_retry` | revive a `failed`/`blocked` task (fresh attempt, cleared claim) so its dependents can be promoted; stays `blocked` while its own dependencies are unresolved |
 | `swarm_integrate` | create an integration task requiring the `integrator` capability |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
 | `board_search` | filter by type/task/agent/tag/keyword |
@@ -392,7 +392,11 @@ inserted. `blockedReason()` explains any row that is still blocked — `missing:
 dependency id that no longer exists, `cycle: <path>` for a graph that can never reach `done`,
 otherwise `waiting` — and `swarm_status` prints that reason next to the task. A `failed` task is no
 longer a dead end: `swarm_task_retry` (`store.ts:retryTask`) returns it to the pool as `ready` with a
-fresh attempt, and the usual `sweep()` promotes its dependents once it completes.
+fresh attempt, and the usual `sweep()` promotes its dependents once it completes. The mirror case is
+residue: a task whose dependency can never reach `done` (`store.ts:deadDependencies` — a `failed`,
+missing or cyclic dependency) can never be claimed either, so `fail()` closes it even for an agent
+that does not hold it, as long as no agent does. That is the only exit a permanently-blocked row has:
+there is no delete or archive.
 
 **Lease + heartbeat.** Every claim writes `claimed_by`/`lease_until`. Any tool call and the driver's
 heartbeat renew leases. A sweeper (`sweep()`) runs inside every claim and on each heartbeat: tasks
@@ -564,9 +568,10 @@ lines once its own settle window passed, which is the one-batch-one-alert rule a
   dependencies), but rows created before that check existed can still be cyclic: they stay `blocked`
   and are reported as `cycle: <path>` by `swarm_status` (`store.ts:blockedReason`) — nothing repairs
   them in place.
-- Reviving a `blocked` task with `swarm_task_retry` returns it to `ready` even while its dependencies
-  are unfinished; `store.ts:claim` still refuses it until they are `done` (the tool prints that
-  caveat). Retry is for a dead end, not for skipping a dependency.
+- There is no delete or archive: residue is closed as `failed`, and `fail()` accepts a row no agent
+  holds only while a dependency of it can never reach `done` (`store.ts:deadDependencies`). A task
+  whose dependency is merely unfinished stays unclosable, so the exit cannot be used to skip work —
+  and a pool loaded from a tree older than this one still refuses the close entirely.
 
 ## Scaling to 8 / 16 / 32 agents
 
