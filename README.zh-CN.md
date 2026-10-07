@@ -24,7 +24,7 @@
 |---|---|---|
 | Agent 运行时 | `pi.pi.createAgentSession`（SDK） | 每个 worker 都是进程内真实的 OMP `AgentSession`，有自己的模型、自己的会话文件、自己的 `AgentRegistry` |
 | 会话 | `SessionManager.create(cwd, dir)` | 每个 worker 的转录存放在 `.swarm/sessions/<name>/` 下 |
-| 工具 API | `CustomTool` / `createAgentSession({ customTools })` | 22 个 swarm 工具被注入到 worker 会话中 |
+| 工具 API | `CustomTool` / `createAgentSession({ customTools })` | 23 个 swarm 工具被注入到 worker 会话中 |
 | 受限工具集 | `toolNames` + `restrictToolNames` + `allowRestrictedCustomTools` | worker 只拿到编码工具 + swarm 工具，别的什么都没有 |
 | 系统提示分层 | `appendSystemPrompt` | worker 章程是**追加**的，不替换 OMP 的提示 |
 | 子 agent 可观测性 | `session.subscribe()`（`agent_start` / `agent_end.isTerminal`） | 用于 tick 投递的空闲检测 |
@@ -70,7 +70,7 @@ tests/
   unit/store.test.ts           54 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, a status that can never outlive the hold that justifies it, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
-  unit/planning.test.ts        51 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
+  unit/planning.test.ts        53 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard, the union shape a merged row still recognises), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
   unit/planning-residue.test.ts  5 unit tests of the REAL goal-5 residue: every dependency the round folded must resolve to the survivor, and no row is ever minted for a reference that resolves to nothing
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
@@ -92,7 +92,7 @@ tests/
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
-  unit/helpers/goal5-round.ts  the real goal-5 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
+  unit/helpers/goal5-round.ts  the real goal-5 and goal-3 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -374,7 +374,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 455 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 476 unit tests in the 23 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

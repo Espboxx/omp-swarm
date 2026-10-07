@@ -79,7 +79,7 @@ tests/
   unit/store.test.ts           54 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, a status that can never outlive the hold that justifies it, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
-  unit/planning.test.ts        51 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
+  unit/planning.test.ts        53 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard, the union shape a merged row still recognises), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
   unit/planning-residue.test.ts  5 unit tests of the REAL goal-5 residue: every dependency the round folded must resolve to the survivor, and no row is ever minted for a reference that resolves to nothing
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
@@ -101,7 +101,7 @@ tests/
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
-  unit/helpers/goal5-round.ts  the real goal-5 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
+  unit/helpers/goal5-round.ts  the real goal-5 and goal-3 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -622,7 +622,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 455 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 476 unit tests in the 23 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
