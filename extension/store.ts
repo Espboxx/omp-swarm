@@ -29,6 +29,7 @@ import type {
 	Reservation,
 	ScaleRequest,
 	SwarmAgent,
+	SwarmConfig,
 	SwarmGoal,
 	SwarmMessage,
 	SwarmTask,
@@ -37,6 +38,7 @@ import type {
 	TaskStatus,
 	VoteState,
 } from "./types";
+import { candidatesFromTasks, formatCapsRepair, planCapsRepair, strandedRows, type CapsRepairRecord, type StrandedRow } from "./caps-repair";
 import { decide, payloadSignature, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
 
 interface TaskRow {
@@ -340,6 +342,19 @@ export interface UnroutableClose {
 }
 
 /**
+ * Caller-supplied policy for `repairCaps`, for the same reason as `UnroutableClose`: the roster the
+ * capability label must be judged against belongs to the config the caller already holds. A store
+ * that read a config of its own would judge a row against a DIFFERENT fact than the one the claim
+ * gate uses, which is exactly the "two capability tables" split goal-14 forbids.
+ */
+export interface CapsRepairPolicy {
+	/** The live config, so the repair reuses `expandWorkers`' derivation rather than a second table. */
+	config: SwarmConfig;
+	/** Recorded on the audit trail next to the caller, so a repair never looks authorless. */
+	reason?: string;
+}
+
+/**
  * All swarm state lives in one SQLite database shared by every agent.
  * Every mutation that decides ownership runs inside `BEGIN IMMEDIATE`, so the
  * claim/lease/review races are settled by the database, not by agent etiquette.
@@ -528,6 +543,64 @@ export class SwarmStore {
 		const stale = this.#db.all<{ id: string }>("SELECT id FROM agents WHERE status != 'offline' AND heartbeat_at < ?", cutoff);
 		for (const row of stale) this.#db.run("UPDATE agents SET status='offline' WHERE id=?", row.id);
 		return stale.map((r) => r.id);
+	}
+
+	/**
+	 * goal-14's clause 3: relax the capability label of a row nobody can claim, as a legitimate,
+	 * audited operation. The pure rule lives in `caps-repair.ts` (`planCapsRepair`), so the store
+	 * only enforces it: it refuses a row that is claimable (that would override a planner's
+	 * routing), refuses a row that requires nothing, and refuses a row that is `claimed` or `done`
+	 * (nothing is waiting for a claimant). The change is a single-column UPDATE — the only write of
+	 * `required_capabilities` outside the INSERT — and every repair leaves a `caps.repair` event
+	 * plus a board entry, so a relaxed label is never indistinguishable from a wrong one (DECISION
+	 * #1076: the failure was not the write, it was the missing audit trail).
+	 */
+	repairCaps(taskId: string, requestedBy: string, options: CapsRepairPolicy): { ok: boolean; reason?: string; task?: SwarmTask } {
+		return this.#db.transaction(() => {
+			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
+			if (row === null) return { ok: false, reason: `unknown task ${taskId}` };
+			if (row.status === "claimed" || row.status === "done") {
+				return { ok: false, reason: `task ${taskId} is ${row.status} - a repair only applies to a row waiting for a claimant` };
+			}
+			const current = parseList(row.required_capabilities);
+			const plan = planCapsRepair({ taskId, currentCapabilities: current, requestedBy, reason: options.reason }, options.config);
+			if (!plan.ok) return { ok: false, reason: plan.reason };
+			const now = Date.now();
+			this.#db.run("UPDATE tasks SET required_capabilities=?, updated_at=? WHERE id=?", JSON.stringify(plan.to), now, taskId);
+			const record: CapsRepairRecord = { taskId, from: plan.from, to: plan.to, requestedBy, reason: plan.reason, at: now };
+			this.#log("caps.repair", requestedBy, taskId, { from: plan.from, to: plan.to, reason: plan.reason });
+			const updated = this.getTask(taskId);
+			if (updated !== undefined) {
+				this.postBoard({
+					type: "DECISION",
+					agentId: requestedBy,
+					taskId,
+					content: formatCapsRepair(record),
+					tags: ["caps-repair", "goal-14"],
+				});
+			}
+			return { ok: true, task: updated };
+		});
+	}
+
+	/**
+	 * goal-14's clause 3, the reporting half: every row in a claimable state that no configured role
+	 * can take, oldest first. The claim gate's own predicate decides (via `caps-repair.ts`), so this
+	 * list is exactly what an agent would see refusing a claim — not a second opinion about it.
+	 * Takes the config for the same reason `repairCaps` does.
+	 */
+	strandedTasks(config: SwarmConfig, now = Date.now()): StrandedRow[] {
+		return strandedRows(candidatesFromTasks(this.listTasks({ status: ["ready", "blocked", "review"], limit: 1000 })), config, now);
+	}
+
+	/**
+	 * Read-only companion to `repairCaps` for the caller that wants to see the label a repair
+	 * replaced without re-deriving it. Not an audit trail by itself — the trail is the board entry
+	 * and the `caps.repair` event — this is a convenience for a tool reply.
+	 */
+	capsBefore(taskId: string): string[] | undefined {
+		const row = this.#db.get<{ required_capabilities: string }>("SELECT required_capabilities FROM tasks WHERE id=?", taskId);
+		return row === null || row === undefined ? undefined : parseList(row.required_capabilities);
 	}
 
 	listAgents(): SwarmAgent[] {

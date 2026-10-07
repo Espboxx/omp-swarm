@@ -622,6 +622,47 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
+	/**
+	 * goal-14's clause 3: repair a row nobody can claim, through a legitimate operation with an
+	 * audit trail. Without it the only path was a worker editing the database directly — DECISION
+	 * #1076 is the record of that attempt, and what it cost. The repair is deliberately NOT gated by
+	 * a vote: it is not a cluster-level decision about ownership, it is a label correction on a row
+	 * that has no owner and cannot get one, and the gate it needs is the rule in `planCapsRepair`
+	 * (a claimable row is refused, so a planner's routing can never be quietly overridden) plus the
+	 * board entry + event the store writes for every repair.
+	 */
+	const repairCapsSchema = z.object({
+		task_id: z.string(),
+		reason: z.string().optional(),
+	});
+	const repairCapsTool: CustomTool<typeof repairCapsSchema> = {
+		name: "swarm_repair_caps",
+		label: "Repair Row Capabilities",
+		description:
+			"Relax the capability label of a task row that NO configured role can claim (e.g. caps=[\"reviewer\"] while every agent carries [\"general\"]) so the claim gate stops refusing the whole pool. Only that case is repaired: a row some role CAN claim is refused, because relaxing it would override a planner's routing rather than fix a strand. Every repair leaves a board entry and a caps.repair event naming what changed and who asked, so a relaxed label is never mistaken for the original one.",
+		parameters: repairCapsSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const before = store.capsBefore(params.task_id) ?? [];
+			const result = store.repairCaps(params.task_id, identity.id, { config, reason: params.reason });
+			onChange?.();
+			if (!result.ok) return err(`repair refused: ${result.reason}`, { repaired: false });
+			const row = result.task;
+			const stranded = store.strandedTasks(config);
+			return ok(
+				[
+					`${params.task_id} repaired: required capability ${JSON.stringify(row?.requiredCapabilities ?? [])} (was ${JSON.stringify(before)})`,
+					`recorded on the board + a caps.repair event, requested by ${identity.id}`,
+					stranded.length > 0
+						? `still stranded: ${stranded.map((t) => `${t.id} (needs ${t.missingCapabilities.join(",")})`).join(", ")}`
+						: "no stranded rows remain",
+				].join("\n"),
+				{ repaired: true, task: row },
+			);
+		},
+	};
+
 	const postSchema = z.object({
 		type: z.string(),
 		content: z.string(),
@@ -985,6 +1026,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		voteTool,
 		scaleTool,
 		retryTool,
+		repairCapsTool,
 		integrateTool,
 		postTool,
 		searchTool,
@@ -1014,6 +1056,7 @@ export const SWARM_TOOL_NAMES = [
 	"swarm_vote",
 	"swarm_scale",
 	"swarm_task_retry",
+	"swarm_repair_caps",
 	"swarm_integrate",
 	"board_post",
 	"board_search",
