@@ -24,16 +24,157 @@ export function goalTag(goalId: string): string {
 }
 
 /**
- * The scribe's dedupe key, in one place because the policy text, the tool descriptions and the
- * merged DECISION all have to state the same rule: two proposals that name the same deliverable
- * (same normalized title) become ONE task, with files/capabilities/dependencies unioned into it.
+ * The scribe's dedupe rule, in one place because the policy text, the tool descriptions and the
+ * merged DECISION all have to state the same rule.
+ *
+ * A deliverable is identified by WHAT IS PRODUCED (the artifact paths a proposal declares, else the
+ * file names in its title) and by the KIND of work (write / verify / fix / document / remove /
+ * refactor) - never by the wording of its title. Two proposals phrasing the same deliverable
+ * differently are ONE task, with files, capabilities and dependencies unioned into the survivor.
  */
 export const DEDUPE_KEY_TEXT =
-	"the dedupe key is the normalized title (lowercase, whitespace collapsed, trailing punctuation stripped): two proposals naming the same deliverable become ONE task, with files, capabilities and dependencies unioned and the longest description kept";
+	"a deliverable is keyed by its TARGET ARTIFACT (the `files` it declares, else the file names in its title) plus the KIND of work (write/verify/fix/document/remove/refactor), not by its wording: identical titles always collapse, two proposals declaring the same artifact with the same kind collapse when one is a section of the other or their wording is close enough, and two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner) so they never both become tasks. Files, capabilities and dependencies are unioned into the survivor and the longest description is kept";
 
 /** Stable name of a deliverable: the same title in any casing/spacing is the same deliverable. */
 export function deliverableKey(title: string): string {
 	return title.trim().toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:,!?]+$/, "");
+}
+
+/** What kind of work a deliverable is. Different kinds on one artifact are different deliverables. */
+export type DeliverableIntent = "write" | "verify" | "fix" | "document" | "remove" | "refactor" | "other";
+
+/**
+ * How a deliverable is recognised across phrasings: its kind, its target artifacts, the significant
+ * words of its wording, and whether it names a PART of the artifact rather than the whole of it.
+ */
+export interface DeliverableShape {
+	intent: DeliverableIntent;
+	artifacts: string[];
+	words: string[];
+	section: boolean;
+}
+
+/**
+ * The verb families a title can open with, most specific first. The FIRST token of a title that
+ * matches any family decides the kind, so "Write tests for x" is `write` (the object, not the verb
+ * family of "tests"), while "Verify x" is `verify`.
+ */
+const INTENT_VERBS: ReadonlyArray<readonly [DeliverableIntent, readonly string[]]> = [
+	["verify", ["verify", "verifies", "validate", "validates", "check", "checks", "confirm", "confirms", "audit", "review", "assert", "ensure", "inspect"]],
+	["fix", ["fix", "fixes", "repair", "correct", "corrects", "patch", "resolve", "resolves"]],
+	["remove", ["delete", "delete", "removes", "remove", "drop", "purge"]],
+	["refactor", ["refactor", "rename", "move", "extract", "split", "simplify"]],
+	["document", ["document", "documents", "describe", "describes"]],
+	[
+		"write",
+		["write", "writes", "create", "creates", "author", "authors", "implement", "implements", "add", "adds", "append", "appends", "produce", "produces", "generate", "generates", "build", "builds", "make", "makes", "draft", "drafts", "scaffold"],
+	],
+];
+
+/** A title that names a PART of an artifact is a fragment of it, not a deliverable of its own. */
+const SECTION_WORDS: Record<string, true> = {
+	section: true,
+	sections: true,
+	subsection: true,
+	subsections: true,
+	chapter: true,
+	chapters: true,
+};
+
+/** Words that carry no deliverable identity; dropping them is what survives a rephrasing. */
+const STOPWORDS: Record<string, true> = {
+	a: true, an: true, and: true, the: true, to: true, of: true, in: true, on: true, at: true, by: true, for: true, from: true,
+	into: true, with: true, as: true, is: true, are: true, be: true, been: true, it: true, its: true, this: true, that: true,
+	these: true, those: true, has: true, have: true, had: true, do: true, does: true, each: true, one: true, all: true,
+	any: true, then: true, than: true, so: true, but: true, or: true, if: true, when: true, not: true, no: true, up: true,
+	out: true, about: true, per: true, via: true,
+};
+
+/** A file-name-ish token inside a title, used only when a proposal declares no `files`. */
+const ARTIFACT_IN_TITLE = /[A-Za-z0-9_@][A-Za-z0-9_@./\\-]*\.[A-Za-z0-9]{1,8}/g;
+
+/** How close two non-writer wordings of one artifact must be to count as the same deliverable. */
+export const SAME_DELIVERABLE_SIMILARITY = 0.6;
+
+function words(text: string): string[] {
+	return text.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word !== "");
+}
+
+/** One artifact path, in the single form two proposals can be compared in. */
+function canonicalArtifact(raw: string): string {
+	return raw.trim().toLowerCase().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+const isAbsoluteArtifact = (path: string): boolean => path.startsWith("/") || /^[a-z]:\//.test(path);
+const artifactName = (path: string): string => path.split("/").pop() ?? path;
+
+/** Same artifact: identical paths, or an absolute and a bare path naming the same file. */
+function sameArtifact(left: string, right: string): boolean {
+	if (left === right) return true;
+	return isAbsoluteArtifact(left) !== isAbsoluteArtifact(right) && artifactName(left) === artifactName(right);
+}
+
+function artifactsEqual(left: string[], right: string[]): boolean {
+	if (left.length === 0 || left.length !== right.length) return false;
+	const pool = [...right];
+	for (const path of left) {
+		const at = pool.findIndex((candidate) => sameArtifact(path, candidate));
+		if (at < 0) return false;
+		pool.splice(at, 1);
+	}
+	return true;
+}
+
+/** Jaccard over the significant words. An empty either side is 0: no evidence is not a match. */
+function wordingSimilarity(left: string[], right: string[]): number {
+	if (left.length === 0 || right.length === 0) return 0;
+	const other = new Set(right);
+	const shared = left.filter((word) => other.has(word)).length;
+	return shared / new Set([...left, ...right]).size;
+}
+
+/**
+ * Read a deliverable out of a title (and the artifact paths a proposal declared for it). Everything
+ * here is pure and total: a title that names no artifact yields an empty artifact list, which the
+ * matcher then refuses to pair with anything.
+ */
+export function describeDeliverable(title: string, files: string[] = [], deliverable = ""): DeliverableShape {
+	const tokens = words(`${title} ${deliverable}`);
+	let intent: DeliverableIntent = "other";
+	for (const token of tokens) {
+		const family = INTENT_VERBS.find(([, verbs]) => verbs.includes(token));
+		if (family !== undefined) {
+			intent = family[0];
+			break;
+		}
+	}
+	const declared = files.map(canonicalArtifact).filter((path) => path !== "");
+	const fromTitle = title.match(ARTIFACT_IN_TITLE) ?? [];
+	const artifacts = [...new Set((declared.length > 0 ? declared : fromTitle.map(canonicalArtifact)).filter((path) => path !== ""))].sort();
+	const artifactWords = new Set(words(artifacts.join(" ")));
+	const verbs = new Set(INTENT_VERBS.flatMap(([, family]) => family));
+	return {
+		intent,
+		artifacts,
+		words: [...new Set(tokens.filter((token) => STOPWORDS[token] !== true && !artifactWords.has(token) && !verbs.has(token)))].sort(),
+		section: tokens.some((token) => SECTION_WORDS[token] === true),
+	};
+}
+
+/**
+ * Whether two proposal shapes are the same deliverable.
+ *
+ * Conservative by construction: an unknown kind (`other`) or a deliverable with no identifiable
+ * artifact never matches anything, because a false merge loses work while a false split only costs
+ * a duplicate task. On one artifact, two WRITERS are always one deliverable - an artifact has one
+ * owner, so the reservation collisions of the live counterexample cannot happen by plan.
+ */
+export function isSameDeliverable(left: DeliverableShape, right: DeliverableShape): boolean {
+	if (left.intent !== right.intent || left.intent === "other") return false;
+	if (!artifactsEqual(left.artifacts, right.artifacts)) return false;
+	if (left.intent === "write") return true;
+	if (left.section !== right.section) return true;
+	return wordingSimilarity(left.words, right.words) >= SAME_DELIVERABLE_SIMILARITY;
 }
 
 export interface ProposedTask {
@@ -139,14 +280,19 @@ export function parseProposal(entry: BlackboardEntry): Proposal | undefined {
 /**
  * Merge every proposal of one round into the deduped deliverable list.
  *
- * First proposal wins the title; a later one for the same key only adds (files, capabilities,
- * dependencies, a longer description, review_required). Dependency references are resolved by the
- * same key, so an agent may depend on a deliverable another agent proposed; a reference to an
- * unknown or to the task's own title is dropped and reported.
+ * First proposal wins the title; a later one for the same deliverable only adds (files,
+ * capabilities, dependencies, a longer description, review_required). "The same deliverable" is the
+ * exact key when the phrasing matches and the shape rule ({@link isSameDeliverable}) when it does
+ * not - so four agents writing one file in four phrasings yield one task, while two genuinely
+ * different deliverables on one file (different kinds of work, or work that is not close enough)
+ * stay apart. Dependency references are resolved the same way, so an agent may depend on a
+ * deliverable another agent proposed under different wording; a reference to an unknown or to the
+ * task's own title is dropped and reported.
  */
 export function mergeProposals(proposals: Proposal[]): MergeResult {
 	const order: string[] = [];
 	const byKey = new Map<string, MergedTask>();
+	const shapeByKey = new Map<string, DeliverableShape>();
 	const rawDeps = new Map<string, string[]>();
 	const folded: string[] = [];
 	const unresolved: MergeDep[] = [];
@@ -162,10 +308,15 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 				empty += 1;
 				continue;
 			}
-			const known = byKey.get(key);
+			const shape = describeDeliverable(proposed.title, proposed.files ?? [], proposed.deliverable ?? "");
+			const target = byKey.has(key)
+				? key
+				: order.find((seen) => isSameDeliverable(shapeByKey.get(seen) as DeliverableShape, shape));
+			const mergeKey = target ?? key;
+			const known = byKey.get(mergeKey);
 			if (known === undefined) {
-				byKey.set(key, {
-					key,
+				byKey.set(mergeKey, {
+					key: mergeKey,
 					title: proposed.title,
 					deliverable: proposed.deliverable?.trim() || undefined,
 					capabilities: [...(proposed.capabilities ?? [])],
@@ -174,9 +325,16 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 					reviewRequired: proposed.reviewRequired === true,
 					agents: [proposal.agentId],
 				});
-				order.push(key);
+				shapeByKey.set(mergeKey, shape);
+				order.push(mergeKey);
 			} else {
-				if (!folded.includes(key)) folded.push(key);
+				if (!folded.includes(mergeKey)) folded.push(mergeKey);
+				const seen = shapeByKey.get(mergeKey) as DeliverableShape;
+				// A section title must not stand for the whole artifact once the whole one is proposed.
+				if (seen.section && !shape.section) {
+					known.title = proposed.title;
+					shapeByKey.set(mergeKey, { ...seen, section: false, words: shape.words });
+				}
 				const deliverable = proposed.deliverable?.trim() ?? "";
 				if (deliverable.length > (known.deliverable?.length ?? 0)) known.deliverable = deliverable;
 				known.capabilities = [...new Set([...known.capabilities, ...(proposed.capabilities ?? [])])];
@@ -184,16 +342,21 @@ export function mergeProposals(proposals: Proposal[]): MergeResult {
 				if (proposed.reviewRequired === true) known.reviewRequired = true;
 				if (!known.agents.includes(proposal.agentId)) known.agents.push(proposal.agentId);
 			}
-			rawDeps.set(key, [...(rawDeps.get(key) ?? []), ...(proposed.dependsOn ?? [])]);
+			rawDeps.set(mergeKey, [...(rawDeps.get(mergeKey) ?? []), ...(proposed.dependsOn ?? [])]);
 		}
 	}
 	for (const key of order) {
 		const deps: string[] = [];
 		for (const raw of rawDeps.get(key) ?? []) {
-			const dep = deliverableKey(raw);
+			const exact = deliverableKey(raw);
+			let dep: string | undefined = exact !== "" && byKey.has(exact) ? exact : undefined;
+			if (dep === undefined) {
+				const wanted = describeDeliverable(raw);
+				dep = order.find((seen) => isSameDeliverable(shapeByKey.get(seen) as DeliverableShape, wanted));
+			}
 			// A dependency inside the same round can only be a reference to another deliverable of
 			// this round; anything else (own title, a typo, a stale id) is dropped and reported.
-			if (dep === "" || dep === key || !byKey.has(dep)) {
+			if (dep === undefined || dep === key) {
 				unresolved.push({ task: key, dep: raw });
 				continue;
 			}

@@ -5,12 +5,15 @@ import {
 	MIN_PROPOSALS,
 	PROPOSAL_TAG,
 	deliverableKey,
+	describeDeliverable,
 	goalTag,
+	isSameDeliverable,
 	mergeProposals,
 	orderForCreation,
 	parseProposal,
 	planningTaskBrief,
 	peakParallelism,
+	type DeliverableShape,
 	type MergedTask,
 	type Proposal,
 } from "./planning";
@@ -927,9 +930,18 @@ export class SwarmStore {
 			recommended = options.ceiling === undefined || options.ceiling <= 0 ? peak : Math.min(peak, options.ceiling);
 			// A `failed` row is not a deliverable the pool holds: only live/finished work dedupes.
 			const keys = new Map<string, string>();
-			for (const task of this.listTasks({ limit: 1000 })) if (task.status !== "failed") keys.set(deliverableKey(task.title), task.id);
+			const heldShapes: { shape: DeliverableShape; id: string }[] = [];
+			for (const task of this.listTasks({ limit: 1000 })) {
+				if (task.status === "failed") continue;
+				keys.set(deliverableKey(task.title), task.id);
+				heldShapes.push({ shape: describeDeliverable(task.title, task.files), id: task.id });
+			}
 			for (const merged of orderForCreation(merge.tasks).ordered) {
-				const existing = keys.get(merged.key);
+				// The pool dedupes by the same deliverable rule the round does, so a re-takeover after a
+				// scribe dies recognises work an earlier round already created under other wording.
+				const shape = describeDeliverable(merged.title, merged.files);
+				const existing =
+					keys.get(merged.key) ?? heldShapes.find((held) => isSameDeliverable(held.shape, shape))?.id;
 				if (existing !== undefined) {
 					skipped.push({ title: merged.title, id: existing });
 					continue;

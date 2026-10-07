@@ -9,7 +9,9 @@ import {
 	GOAL_DEADLINE_MS,
 	PROPOSAL_TAG,
 	deliverableKey,
+	describeDeliverable,
 	goalTag,
+	isSameDeliverable,
 	mergeProposals,
 	orderForCreation,
 	parseProposal,
@@ -228,5 +230,150 @@ describe("planningTaskBrief", () => {
 
 	test("a custom bound is the one the brief states", () => {
 		expect(planningTaskBrief({ id: "goal-2", goal: "g", agents: 1, createdBy: "main" }, 120_000)).toContain("2 minute(s)");
+	});
+});
+
+describe("describeDeliverable", () => {
+	test("the kind of work comes from the first verb, the artifact from files, else from the title", () => {
+		expect(describeDeliverable("Verify NOTES.md", ["NOTES.md"]).intent).toBe("verify");
+		expect(describeDeliverable("Write tests for the parser", ["src/parser.ts"]).intent).toBe("write");
+		expect(describeDeliverable("Author NOTES.md").artifacts).toEqual(["notes.md"]);
+		expect(describeDeliverable("Ship the thing").artifacts).toEqual([]);
+	});
+
+	test("an unknown kind is `other`, which pairs with nothing at all", () => {
+		const shape = describeDeliverable("Improve the error handling", ["src/errors.ts"]);
+		expect(shape.intent).toBe("other");
+		expect(isSameDeliverable(shape, shape)).toBe(false);
+	});
+
+	test("a title naming a part of the artifact is marked as a fragment, the artifact itself is not", () => {
+		expect(describeDeliverable("Write NOTES.md Alpha section", ["NOTES.md"]).section).toBe(true);
+		expect(describeDeliverable("Write NOTES.md", ["NOTES.md"]).section).toBe(false);
+		expect(describeDeliverable("Write NOTES.md chapter", ["NOTES.md"]).section).toBe(true);
+	});
+
+	test("an absolute and a bare path name the same artifact; two different directories do not", () => {
+		expect(
+			isSameDeliverable(
+				describeDeliverable("Write NOTES.md", ["C:/repo/docs/NOTES.md"]),
+				describeDeliverable("Write NOTES.md", ["NOTES.md"]),
+			),
+		).toBe(true);
+		expect(
+			isSameDeliverable(describeDeliverable("Wire the API", ["src/api.ts"]), describeDeliverable("Wire the API", ["lib/api.ts"])),
+		).toBe(false);
+	});
+});
+
+describe("the deliverable key: a rephrasing is the same task, a different deliverable is not", () => {
+	test("the stated dedupe rule is the implemented one", () => {
+		expect(DEDUPE_KEY_TEXT).toContain("TARGET ARTIFACT");
+		expect(DEDUPE_KEY_TEXT).toContain("WRITERS");
+		expect(DEDUPE_KEY_TEXT).not.toContain("normalized title");
+	});
+
+	test("the four rephrasings of one artifact from the live counterexample (FAIL #396) become ONE task", () => {
+		const merged = mergeProposals([
+			proposal("BrightTiger", { goal: "goal-1", tasks: [{ title: "Write NOTES.md with exactly three headings Alpha, Beta, Gamma", files: ["NOTES.md"] }] }, 1),
+			proposal("CalmTiger", { goal: "goal-1", tasks: [{ title: "Create NOTES.md with Alpha, Beta, Gamma headings", files: ["NOTES.md"] }] }, 2),
+			proposal("SwiftTiger", { goal: "goal-1", tasks: [{ title: "Author NOTES.md with Alpha/Beta/Gamma headings", files: ["NOTES.md"] }] }, 3),
+			proposal("BrightTiger", { goal: "goal-1", tasks: [{ title: "Author NOTES.md with three headings Alpha, Beta, Gamma", files: ["NOTES.md"] }] }, 4),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.tasks[0]?.title).toBe("Write NOTES.md with exactly three headings Alpha, Beta, Gamma");
+		expect(merged.tasks[0]?.agents).toEqual(["BrightTiger", "CalmTiger", "SwiftTiger"]);
+		expect(merged.folded).toEqual([deliverableKey("Write NOTES.md with exactly three headings Alpha, Beta, Gamma")]);
+	});
+
+	test("the whole live round (5 proposals, 10 tasks, 1 file) plans 4 tasks: one writer, three genuinely different checks", () => {
+		const merged = mergeProposals([
+			proposal("BrightTiger", { goal: "goal-1", tasks: [
+				{ title: "Write NOTES.md with exactly three headings Alpha, Beta, Gamma", files: ["NOTES.md"] },
+				{ title: "Author NOTES.md with three headings Alpha, Beta, Gamma", files: ["NOTES.md"] },
+			] }, 1),
+			proposal("CalmTiger", { goal: "goal-1", tasks: [
+				{ title: "Create NOTES.md with Alpha, Beta, Gamma headings", files: ["NOTES.md"] },
+				{ title: "Write NOTES.md Alpha section", files: ["NOTES.md"] },
+			] }, 2),
+			proposal("SwiftTiger", { goal: "goal-1", tasks: [
+				{ title: "Author NOTES.md with Alpha/Beta/Gamma headings", files: ["NOTES.md"] },
+				{ title: "Append Notes Beta section", files: ["NOTES.md"] },
+				{ title: "Append Notes Gamma section", files: ["NOTES.md"] },
+				{ title: "Verify NOTES.md has exactly Alpha, Beta, Gamma", files: ["NOTES.md"] },
+				{ title: "Verify NOTES.md has exactly three headings and one line each", files: ["NOTES.md"] },
+				{ title: "Verify NOTES.md headings and content shape", files: ["NOTES.md"] },
+			] }, 3),
+		]);
+		expect(merged.tasks.length).toBe(4); // was 10 before the deliverable key
+		const writers = merged.tasks.filter((task) => task.key === deliverableKey("Write NOTES.md with exactly three headings Alpha, Beta, Gamma"));
+		expect(writers.length).toBe(1);
+		expect(writers[0]?.agents).toEqual(["BrightTiger", "CalmTiger", "SwiftTiger"]);
+		expect(writers[0]?.files).toEqual(["NOTES.md"]);
+		expect(merged.tasks.filter((task) => /^verify/i.test(task.title)).length).toBe(3);
+		expect(merged.folded).toEqual([deliverableKey("Write NOTES.md with exactly three headings Alpha, Beta, Gamma")]);
+	});
+
+	test("the four rephrasings also carry a dependency: one depends_on another under different wording", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Write NOTES.md with exactly three headings Alpha, Beta, Gamma", files: ["NOTES.md"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Verify NOTES.md has exactly Alpha, Beta, Gamma", files: ["NOTES.md"], depends_on: ["Author NOTES.md with Alpha/Beta/Gamma headings"] }] }, 2),
+		]);
+		const verify = merged.tasks.find((task) => /^verify/i.test(task.title));
+		const write = merged.tasks[0];
+		expect(merged.tasks.length).toBe(2);
+		expect(verify?.dependsOn).toEqual([write?.key]);
+		expect(merged.unresolved).toEqual([]);
+	});
+
+	test("two writers of one artifact are ONE deliverable, whichever way each phrases it", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Add the retry logic to src/client.ts", files: ["src/client.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Implement the retry logic in src/client.ts", files: ["src/client.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+	});
+
+	test("the same file with genuinely different work stays two deliverables", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix the retry storm in src/client.ts", files: ["src/client.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Fix the timeout default in src/client.ts", files: ["src/client.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+	});
+
+	test("different artifacts never collapse", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Implement src/parser.ts", files: ["src/parser.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Write README.md", files: ["README.md"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+	});
+
+	test("a deliverable that names no artifact never merges on wording alone", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Improve the error handling" }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Improve the error messages" }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+		expect(merged.folded).toEqual([]);
+	});
+
+	test("writing an artifact and verifying it are different deliverables", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Write NOTES.md", files: ["NOTES.md"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Verify NOTES.md", files: ["NOTES.md"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+	});
+
+	test("a section of an artifact folds into the whole-artifact deliverable, and the whole title wins", () => {
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Write NOTES.md Alpha section", files: ["NOTES.md"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Write NOTES.md", files: ["NOTES.md"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(1);
+		expect(merged.tasks[0]?.title).toBe("Write NOTES.md");
+		expect(merged.tasks[0]?.agents).toEqual(["A", "B"]);
 	});
 });
