@@ -550,7 +550,7 @@ export class SwarmDriver {
 		// Seed the edge with the state the bootstrap prompt is about to describe (it is issued right after
 		// this returns), so the worker's FIRST tick is a real comparison: a row that appears between the
 		// spawn and that tick still wakes it. Leaving the signature unset would swallow exactly that wake.
-		const seed = this.#workerState(store.liveGoals(), spec.name, spec.capabilities);
+		const seed = this.#workerState(spec.name, spec.capabilities);
 		const runtime: WorkerRuntime = {
 			spec,
 			session,
@@ -559,7 +559,7 @@ export class SwarmDriver {
 			turns: 0,
 			lastTickAt: 0,
 			idle: {
-				signature: promptSignature(seed.goals, seed.messages, seed.mine, seed.ready, seed.reviews),
+				signature: promptSignature(store.liveGoals(), seed.messages, seed.mine, seed.ready, seed.reviews),
 				empty: 0,
 				parked: false,
 				nextAt: Date.now() + Math.max(1, config.idleTickSeconds) * 1000,
@@ -617,11 +617,7 @@ export class SwarmDriver {
 	 * The state one worker can be prompted FOR, read exactly the way the tick reads it. One helper so the
 	 * spawn-time seed and the tick can never disagree about what "a change" means.
 	 */
-	#workerState(
-		goals: SwarmGoal[],
-		name: string,
-		capabilities: string[],
-	): { goals: SwarmGoal[]; messages: SwarmMessage[]; mine: SwarmTask[]; ready: SwarmTask[]; reviews: SwarmTask[] } {
+	#workerState(name: string, capabilities: string[]): { messages: SwarmMessage[]; mine: SwarmTask[]; ready: SwarmTask[]; reviews: SwarmTask[] } {
 		const { store, config } = this.#deps;
 		const messages = store.inbox(name, 5);
 		const mine = store.listTasks({ status: "claimed", agent: name, limit: 5 });
@@ -629,7 +625,7 @@ export class SwarmDriver {
 			.listTasks({ status: "ready", limit: 50 })
 			.filter((t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => capabilities.includes(cap)));
 		const reviews = config.review ? store.listTasks({ status: "review", limit: 20 }).filter((t) => t.claimedBy !== name) : [];
-		return { goals, messages, mine, ready, reviews };
+		return { messages, mine, ready, reviews };
 	}
 
 	async #tick(): Promise<void> {
@@ -641,7 +637,7 @@ export class SwarmDriver {
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
 			const now = Date.now();
-			const { messages, mine, ready, reviews } = this.#workerState(goals, worker.spec.name, worker.identity.capabilities);
+			const { messages, mine, ready, reviews } = this.#workerState(worker.spec.name, worker.identity.capabilities);
 			const scribe = goals.find((goal) => mine.some((task) => task.id === goal.planningTask));
 			// Everything this worker can be prompted FOR, as ONE signature over the ID SETS — a different row
 			// set is a change even when the counts hold still. It replaces the two state-blind branches that
