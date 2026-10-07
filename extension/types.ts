@@ -140,7 +140,29 @@ export interface PlanResult {
 	folded: string[];
 	/** Dependency references that could not be resolved (dropped). */
 	unresolved: { task: string; dep: string }[];
+	/** The widest set of the round's deliverables that can run at the same time. */
+	peak: number;
+	/** The agent count that peak implies, capped by the ceiling the caller passed (0 = unknown). */
+	recommended: number;
 	reason?: string;
+}
+
+/**
+ * One agent's ask for a different pool size (`swarm_scale`). ADVISORY: it only records the ask — the
+ * AutoController is the single writer of the pool size, and it reconciles the pending asks each tick.
+ */
+export interface ScaleRequest {
+	id: number;
+	agentId: string;
+	/** The size the agent asked for, as it asked (before the ceiling/floor clamp). */
+	requested: number;
+	reason: string;
+	/** The pool size when the ask was made, so the record reads as a delta later. */
+	current: number;
+	createdAt: number;
+	decidedAt?: number;
+	decidedAction?: string;
+	decidedSize?: number;
 }
 
 export interface ClaimResult {

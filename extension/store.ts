@@ -10,6 +10,7 @@ import {
 	orderForCreation,
 	parseProposal,
 	planningTaskBrief,
+	peakParallelism,
 	type MergedTask,
 	type Proposal,
 } from "./planning";
@@ -21,6 +22,7 @@ import type {
 	GoalStatus,
 	PlanResult,
 	Reservation,
+	ScaleRequest,
 	SwarmAgent,
 	SwarmGoal,
 	SwarmMessage,
@@ -116,6 +118,32 @@ interface GoalRow {
 	planner: string | null;
 	planned_at: number | null;
 	result: string | null;
+}
+
+interface ScaleRow {
+	id: number;
+	agent_id: string;
+	reason: string;
+	requested: number;
+	current: number;
+	created_at: number;
+	decided_at: number | null;
+	decided_action: string | null;
+	decided_size: number | null;
+}
+
+function toScaleRequest(row: ScaleRow): ScaleRequest {
+	return {
+		id: row.id,
+		agentId: row.agent_id,
+		requested: row.requested,
+		reason: row.reason,
+		current: row.current,
+		createdAt: row.created_at,
+		decidedAt: row.decided_at ?? undefined,
+		decidedAction: row.decided_action ?? undefined,
+		decidedSize: row.decided_size ?? undefined,
+	};
 }
 
 function parseList(raw: string): string[] {
@@ -862,15 +890,17 @@ export class SwarmStore {
 	 * - creation is idempotent against the pool: a deliverable a live task already carries is
 	 *   skipped (and reported), so a scribe that dies mid-merge cannot duplicate the rows it wrote.
 	 */
-	planGoal(goalId: string, agentId: string): PlanResult {
+	planGoal(goalId: string, agentId: string, options: { ceiling?: number } = {}): PlanResult {
 		const now = Date.now();
 		const created: string[] = [];
 		const skipped: { title: string; id: string }[] = [];
 		let proposals = 0;
 		let folded: string[] = [];
 		let unresolved: { task: string; dep: string }[] = [];
+		let peak = 0;
+		let recommended = 0;
 		const outcome = this.#db.transaction((): PlanResult => {
-			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, unresolved, reason });
+			const refuse = (reason: string): PlanResult => ({ ok: false, created, skipped, proposals, folded, unresolved, peak, recommended, reason });
 			const goal = this.getGoal(goalId);
 			if (goal === undefined) return refuse(`unknown goal ${goalId}`);
 			if (goal.status !== "open") return refuse(`goal ${goalId} is ${goal.status}`);
@@ -890,6 +920,11 @@ export class SwarmStore {
 			folded = merge.folded;
 			unresolved = merge.unresolved;
 			if (merge.tasks.length === 0) return refuse(`the ${round.length} proposal(s) for ${goalId} carry no usable task`);
+			// The plan states its own size: how wide the round can run, and the agent count that
+			// implies (capped by the caller's ceiling). That is the answer to "N was wrong" before
+			// anyone starts working, and it is what an agent can point at when asking to rescale.
+			peak = peakParallelism(merge.tasks);
+			recommended = options.ceiling === undefined || options.ceiling <= 0 ? peak : Math.min(peak, options.ceiling);
 			// A `failed` row is not a deliverable the pool holds: only live/finished work dedupes.
 			const keys = new Map<string, string>();
 			for (const task of this.listTasks({ limit: 1000 })) if (task.status !== "failed") keys.set(deliverableKey(task.title), task.id);
@@ -927,13 +962,14 @@ export class SwarmStore {
 				proposals: round.length,
 				folded: folded.length,
 			});
-			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, unresolved };
+			return { ok: true, goal: this.getGoal(goalId) as SwarmGoal, created, skipped, proposals, folded, unresolved, peak, recommended };
 		});
 		// The merged split is announced AFTER the write: the DECISION is the round's public record,
 		// never a correctness dependency of the plan itself.
 		if (outcome.ok && outcome.goal !== undefined) {
 			const lines = [
 				`${outcome.goal.id} planned by ${agentId}: ${created.length} task(s) from ${proposals} proposal(s).`,
+				`SIZE: peak parallelism ${peak} of ${created.length} task(s) can run at once; recommended agents ${recommended}${options.ceiling === undefined || options.ceiling <= 0 ? "" : ` (ceiling ${options.ceiling})`}. Ask for a different size with swarm_scale({ agents, reason }) if the shape changes.`,
 				DEDUPE_KEY_TEXT,
 				...created.map((id) => {
 					const task = this.getTask(id) as SwarmTask;
@@ -994,6 +1030,54 @@ export class SwarmStore {
 			this.postBoard({ type: "FAIL", agentId: goal.createdBy, taskId: goal.planningTask, content: reason, tags: ["failure", goalTag(goal.id)] });
 		}
 		return closed.map((entry) => entry.goal);
+	}
+
+	// --------------------------------------------------------------- scaling
+
+	/**
+	 * Record an agent's ask for a different pool size. Advisory on purpose: the row IS the audit trail
+	 * (who asked, why, what the pool looked like when they asked), and the AutoController remains the
+	 * only actor that ever changes the pool. The event is written in the same transaction, so the
+	 * record and the trail cannot diverge.
+	 */
+	recordScaleRequest(input: { agentId: string; requested: number; reason: string; current: number }): ScaleRequest {
+		return this.#db.transaction(() => {
+			const now = Date.now();
+			const inserted = this.#db.run(
+				"INSERT INTO scale_requests (agent_id, reason, requested, current, created_at) VALUES (?, ?, ?, ?, ?)",
+				input.agentId,
+				input.reason,
+				input.requested,
+				input.current,
+				now,
+			);
+			const id = Number(inserted.lastInsertRowid);
+			this.#log("scale.request", input.agentId, undefined, { id, requested: input.requested, current: input.current });
+			return this.#scaleRequest(id) as ScaleRequest;
+		});
+	}
+
+	#scaleRequest(id: number): ScaleRequest | undefined {
+		const row = this.#db.get<ScaleRow>("SELECT * FROM scale_requests WHERE id=?", id);
+		return row ? toScaleRequest(row) : undefined;
+	}
+
+	/** Asks the controller has not decided yet, oldest first. */
+	pendingScaleRequests(): ScaleRequest[] {
+		return this.#db.all<ScaleRow>("SELECT * FROM scale_requests WHERE decided_at IS NULL ORDER BY created_at, id").map(toScaleRequest);
+	}
+
+	/** Record what the controller did about these asks, so no tick ever applies one twice. */
+	decideScaleRequests(ids: number[], action: string, size: number): number {
+		if (ids.length === 0) return 0;
+		const changed = this.#db.run(
+			`UPDATE scale_requests SET decided_at=?, decided_action=?, decided_size=? WHERE id IN (${ids.map(() => "?").join(",")}) AND decided_at IS NULL`,
+			Date.now(),
+			action,
+			size,
+			...ids,
+		);
+		return changed.changes;
 	}
 
 	// ---------------------------------------------------------------- review

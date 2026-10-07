@@ -152,3 +152,38 @@ describe("swarm_plan", () => {
 		store.close();
 	});
 });
+
+describe("swarm_scale", () => {
+	test("records the ask with its author and reason and reports the clamp, leaving the resize to the controller", async () => {
+		const store = makeStore();
+		const { call, names } = workerTools(store, "w1", { workers: 4 });
+		expect(names).toContain("swarm_scale");
+		store.registerAgent({ id: "w1", role: "general", capabilities: ["general"] });
+		store.registerAgent({ id: "w2", role: "general", capabilities: ["general"] });
+		store.createTask({ title: "a", createdBy: "main" });
+		const accepted = await call("swarm_scale", { agents: 3, reason: "the queue is deeper than the pool" });
+		expect(accepted).toContain("scale request #1 accepted: 2 -> 3");
+		expect(accepted).toContain("Ask size 3 of ceiling 4");
+		expect(accepted).toContain("controller reconciles the pool on its next tick");
+		const pending = store.pendingScaleRequests();
+		expect(pending.length).toBe(1);
+		expect(pending[0]).toMatchObject({ agentId: "w1", requested: 3, reason: "the queue is deeper than the pool", current: 2 });
+		expect(store.searchBoard({ tags: ["scale"] }).length).toBe(1);
+
+		const clamped = await call("swarm_scale", { agents: 9, reason: "as many as possible" });
+		expect(clamped).toContain("clamped: asked for 9, the operator's ceiling is config.workers=4");
+		expect(store.pendingScaleRequests().length).toBe(2);
+		expect(store.recentEvents(20).filter((event) => event.type === "scale.request").length).toBe(2);
+		store.close();
+	});
+
+	test("refuses an empty reason and an unusable count, and never silently", async () => {
+		const store = makeStore();
+		const { call } = workerTools(store, "w1");
+		expect(await call("swarm_scale", { agents: 3, reason: "   " })).toContain("needs a reason");
+		expect(await call("swarm_scale", { agents: 0, reason: "shrink to nothing" })).toContain("at least 1");
+		expect(store.pendingScaleRequests()).toEqual([]);
+		expect(store.searchBoard({ tags: ["scale"] })).toEqual([]);
+		store.close();
+	});
+});

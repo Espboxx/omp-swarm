@@ -12,6 +12,7 @@
  * and tests call it directly.
  */
 import type { SwarmStore } from "./store";
+import { reconcilePool } from "./scaling";
 import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
 
 export type AutoPhase = "off" | "idle" | "planning" | "nudging" | "running" | "done" | "stalled";
@@ -22,11 +23,15 @@ export interface AutoDeps {
 	isDriverRunning(): boolean;
 	/** Live workers in the pool (sessions that came up), regardless of what they are doing. */
 	workerCount(): number;
+	/** Live workers holding NO claim, review lease or reservation: the only stoppable ones. */
+	poolIdle(): number;
 	/**
 	 * Bring up `count` workers with this role shape. Callers pass the roster for the *new* workers
 	 * only; the host decides whether that means starting a pool or adding to a running one.
 	 */
 	startSwarm(roles: RoleConfig[], count: number): Promise<string[]>;
+	/** Stop up to `count` workers that hold nothing; returns the names it actually stopped. */
+	shrinkSwarm(count: number): Promise<string[]>;
 	stopSwarm(reason: string): Promise<void>;
 	/** `ctx.isIdle() === false`: the main session is streaming a turn right now. */
 	isMainBusy(): boolean;
@@ -47,6 +52,10 @@ export interface AutoOptions {
 	pendingWindowMs?: number;
 	/** Quiet period after the last new task before the pool is assembled. */
 	settleMs?: number;
+	/** Minimum gap between two pool resizes (the thrash guard). */
+	scaleCooldownMs?: number;
+	/** An agent's scale request older than this is stale and is dropped, never applied later. */
+	scaleWindowMs?: number;
 }
 
 export const AUTO_TICK_MS = 2000;
@@ -54,6 +63,13 @@ const PLAN_NUDGE_MS = 90_000;
 const PLAN_GIVEUP_MS = 180_000;
 const STALL_MS = 90_000;
 const PENDING_TURN_WINDOW_MS = 10_000;
+/**
+ * The pool resizes at most once per cooldown window, and an agent's ask expires after the request
+ * window: several agents sensing the same shortage collapse into ONE resize (the largest ask), and a
+ * stale ask can never resize a pool minutes after the shape that motivated it has gone.
+ */
+const SCALE_COOLDOWN_MS = 30_000;
+const SCALE_WINDOW_MS = 60_000;
 /**
  * A coordinator publishes its tasks one tool call at a time, and `isIdle()` is briefly true
  * between those calls. Starting on the first task would size the whole pool to a partial plan,
@@ -188,6 +204,10 @@ export class AutoController {
 	 */
 	#lastGrowthReady = 0;
 	#plannedWorkers = 0;
+	/** When the pool last changed size, for the resize cooldown. */
+	#lastResizeAt = 0;
+	readonly #scaleCooldownMs: number;
+	readonly #scaleWindowMs: number;
 
 	constructor(deps: AutoDeps, options: AutoOptions = {}) {
 		this.#deps = deps;
@@ -196,6 +216,8 @@ export class AutoController {
 		this.#stallMs = options.stallMs ?? STALL_MS;
 		this.#pendingWindowMs = options.pendingWindowMs ?? PENDING_TURN_WINDOW_MS;
 		this.#settleMs = options.settleMs ?? START_SETTLE_MS;
+		this.#scaleCooldownMs = options.scaleCooldownMs ?? SCALE_COOLDOWN_MS;
+		this.#scaleWindowMs = options.scaleWindowMs ?? SCALE_WINDOW_MS;
 	}
 
 	get phase(): AutoPhase {
@@ -215,6 +237,7 @@ export class AutoController {
 		this.#drained = false;
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
+		this.#lastResizeAt = 0;
 		this.#setPhase("idle");
 	}
 
@@ -222,6 +245,7 @@ export class AutoController {
 		if (this.#deps.isDriverRunning()) await this.#deps.stopSwarm("multi-agent mode disabled");
 		this.#plannedWorkers = 0;
 		this.#lastGrowthReady = 0;
+		this.#lastResizeAt = 0;
 		this.#setPhase("off");
 		this.#deps.onChange();
 	}
@@ -341,6 +365,7 @@ export class AutoController {
 				await this.#deps.stopSwarm("all tasks finished");
 				this.#plannedWorkers = 0;
 				this.#lastGrowthReady = 0;
+				this.#lastResizeAt = 0;
 				this.#setPhase("idle");
 				this.#deps.onChange();
 			}
@@ -380,6 +405,81 @@ export class AutoController {
 				}
 			}
 
+			// Pool sizing: the AutoController is the SINGLE writer of the pool size. Agents may only ask
+			// (`swarm_scale`), the asks are collapsed to the largest one in the window, and this recompute
+			// is idempotent — so N agents sensing the same shortage still produce ONE resize, and a resize
+			// that just happened defers the next one for the cooldown. Growing toward the PLAN stays the
+			// block above; this one answers the agents and prunes a pool the plan does not need.
+			if (this.#phase === "running" && !this.#drained && this.#deps.isDriverRunning()) {
+				const live = this.#deps.workerCount();
+				const desired = planRoster(tasks, config, goalAgents);
+				const pending = store.pendingScaleRequests();
+				const decision = reconcilePool({
+					ceiling: config.workers,
+					planned: this.#plannedWorkers,
+					live,
+					idle: this.#deps.poolIdle(),
+					ready: counts.ready,
+					claimed: counts.claimed,
+					review: counts.review,
+					plan: desired.reduce((n, role) => n + role.count, 0),
+					pending,
+					now: this.#deps.now(),
+					lastResizeAt: this.#lastResizeAt,
+					cooldownMs: this.#scaleCooldownMs,
+					windowMs: this.#scaleWindowMs,
+				});
+				const pool = Math.max(live, this.#plannedWorkers);
+				if (decision.action === "grow" && decision.delta > 0) {
+					const deltaRoles = takeWorkers(desired, decision.delta);
+					const short = decision.delta - deltaRoles.reduce((n, role) => n + role.count, 0);
+					// An ask for more peers is honoured past the capability shape the plan implies; the
+					// operator's ceiling is still the bound, and the request was already clamped to it.
+					if (short > 0) deltaRoles.push({ name: "general", count: short, capabilities: ["general"] });
+					this.#lastResizeAt = this.#deps.now();
+					try {
+						await this.#deps.startSwarm(deltaRoles, decision.delta);
+						this.#plannedWorkers = pool + decision.delta;
+						this.#deps.notify(`swarm grew by ${decision.delta} worker(s): ${decision.reason}`);
+						this.#deps.onEvent?.("roster.grow", {
+							workers: pool + decision.delta,
+							ready: counts.ready,
+							requested: decision.requested,
+							roles: deltaRoles.map((role) => role.name),
+						});
+					} catch (error) {
+						this.#deps.notify(`swarm growth failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+					this.#deps.onChange();
+				} else if (decision.action === "shrink" && decision.delta < 0) {
+					this.#lastResizeAt = this.#deps.now();
+					try {
+						const stopped = await this.#deps.shrinkSwarm(-decision.delta);
+						this.#plannedWorkers = Math.max(1, pool - stopped.length);
+						// The plan's own growth must not undo the shrink on the next tick: it only fires when
+						// READY work rises above what the pool was sized for, so rebind that watermark.
+						this.#lastGrowthReady = counts.ready;
+						this.#deps.notify(`swarm stopped ${stopped.length} idle worker(s): ${decision.reason}`);
+						this.#deps.onEvent?.("roster.shrink", {
+							workers: this.#plannedWorkers,
+							stopped,
+							ready: counts.ready,
+							requested: decision.requested,
+						});
+					} catch (error) {
+						this.#deps.notify(`swarm shrink failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+					this.#deps.onChange();
+				}
+				if (decision.settled && pending.length > 0) {
+					store.decideScaleRequests(
+						pending.map((request) => request.id),
+						decision.action,
+						decision.action === "hold" ? pool : decision.target,
+					);
+				}
+			}
+
 			// Stall: a running swarm with blocked work and nothing claimable. An OPEN GOAL is excluded:
 			// the planning round is work in flight, not a stall, and the bound above is what closes it.
 			if (this.#phase === "running" && this.#deps.isDriverRunning()) {
@@ -392,6 +492,7 @@ export class AutoController {
 						await this.#deps.stopSwarm("swarm stalled: tasks blocked with no claimable work");
 						this.#plannedWorkers = 0;
 						this.#lastGrowthReady = 0;
+						this.#lastResizeAt = 0;
 						this.#setPhase("stalled");
 					}
 				} else {
@@ -448,6 +549,7 @@ export class AutoController {
 		this.#drained = false;
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
+		this.#lastResizeAt = 0;
 	}
 
 	#setPhase(phase: AutoPhase, data?: Record<string, unknown>): void {

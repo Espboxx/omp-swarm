@@ -6,6 +6,7 @@ import { renderAgentInfoRows, sortAgentInfo, type AgentInfo } from "./agentinfo"
 import { MAIN_ID, moveSelection, navEntries, renderNavLines } from "./agentnav";
 import { expandWorkers, type WorkerSpec } from "./config";
 import { renderPanel, type DrainSummary } from "./render";
+import { canStop } from "./scaling";
 import type { SwarmStore } from "./store";
 import { buildSwarmTools, SWARM_TOOL_NAMES, type SwarmIdentity } from "./tools";
 import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
@@ -159,6 +160,7 @@ export function workerSystemPrompt(spec: WorkerSpec, config: SwarmConfig, root: 
 		"- Never touch a task another agent has claimed. If it is stuck (lease expired), it returns to the pool by itself.",
 		"- If a task is too large, split it with swarm_task_create (add dependencies instead of duplicating work).",
 		"- If you cannot finish, swarm_release with a reason. Never stall silently.",
+		"- If the pool is the wrong size for the work, ask with swarm_scale({ agents, reason }) — the controller applies it on its next tick; never try to spawn or stop peers yourself.",
 		"- Post a FAIL entry every time an approach fails; that is the cheapest gift you can give the swarm.",
 		"- Two agents must not edit the same file: reservations expire with your lease, so renew them while you work.",
 		"- Review tasks in `review` status are not yours to approve if you wrote them; swarm_review refuses that.",
@@ -309,6 +311,62 @@ export class SwarmDriver {
 	/** Names of the workers that actually came up. */
 	get started(): readonly string[] {
 		return this.#started;
+	}
+
+	/**
+	 * The workers that hold NOTHING: not streaming, no claimed task, no review lease, no reservation.
+	 * This is the only set a shrink may stop — a worker holding work is never touched, and the caller
+	 * defers instead.
+	 */
+	#stoppable(): WorkerRuntime[] {
+		const { store } = this.#deps;
+		const reserved = new Set(store.listReservations().map((reservation) => reservation.owner));
+		return [...this.#workers.values()].filter((worker) =>
+			canStop({
+				streaming: worker.session.isStreaming,
+				holdsClaim: store.listTasks({ status: "claimed", agent: worker.spec.name, limit: 1 }).length > 0,
+				holdsReview: store.listTasks({ status: "review", agent: worker.spec.name, limit: 1 }).length > 0,
+				holdsReservation: reserved.has(worker.spec.name),
+			}),
+		);
+	}
+
+	/** How many live workers could be stopped right now (see {@link #stoppable}). */
+	idleWorkerCount(): number {
+		return this.#stoppable().length;
+	}
+
+	/**
+	 * Stop up to `count` workers that hold nothing, the newest first, so the surviving pool is a prefix
+	 * of the spawn order — which keeps the callsign sequence (and therefore the slot list a later growth
+	 * extends) aligned. Nothing has to be released: a stoppable worker holds no claim, lease or
+	 * reservation by construction, so it is unregistered and disposed without a shutdown prompt.
+	 * Returns the names it actually stopped (fewer than asked when fewer are free).
+	 */
+	async stopIdleWorkers(count: number): Promise<string[]> {
+		if (count <= 0 || !this.#running) return [];
+		const victims = this.#stoppable().slice(-count);
+		const stopped: string[] = [];
+		for (const worker of victims) {
+			const name = worker.spec.name;
+			this.#selfTearing.add(name);
+			try {
+				await worker.session.dispose();
+			} catch (error) {
+				this.#deps.notify(`dispose of ${name} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			} finally {
+				this.#selfTearing.delete(name);
+			}
+			this.#deps.store.unregisterAgent(name);
+			this.#workers.delete(name);
+			stopped.push(name);
+			this.#trace(`shrink: stopped ${name}`);
+		}
+		// Hand the freed slots back: the pool budget is measured in slots, so a later growth step must be
+		// able to re-occupy the callsigns this shrink released.
+		this.#slots = this.#slots.slice(0, this.#workers.size);
+		this.#deps.onPanel();
+		return stopped;
 	}
 
 	/**

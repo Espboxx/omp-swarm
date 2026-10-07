@@ -364,12 +364,14 @@ export default function swarm(pi: ExtensionAPI): void {
 			config: runtime.config,
 			isDriverRunning: () => runtime.driver?.running ?? false,
 			workerCount: () => runtime.driver?.workers.length ?? 0,
+			poolIdle: () => runtime.driver?.idleWorkerCount() ?? 0,
 			startSwarm: async (roles, count) => {
 				const driver = ensureDriver(latest(), runtime);
 				// A pool that is already up takes the delta: growth must add workers, never restart a
 				// running swarm and release the work it holds.
 				return driver.running ? driver.addWorkers(count, roles) : driver.start(count, roles);
 			},
+			shrinkSwarm: async (count) => (runtime.driver === undefined ? [] : runtime.driver.stopIdleWorkers(count)),
 			stopSwarm: async (reason) => {
 				await runtime.driver?.stop(reason);
 			},

@@ -150,6 +150,8 @@ describe("the scribe merges exactly once", () => {
 		expect(decisions[0]?.taskId).toBe(opened.planningTask.id);
 		expect(decisions[0]?.content).toContain("Build the parser");
 		expect(decisions[0]?.content).toContain("Wire the CLI");
+		expect(decisions[0]?.content).toContain("SIZE: peak parallelism 1 of 2 task(s) can run at once");
+		expect(result.peak).toBe(1); // the round is a chain: Build the parser, then Wire the CLI
 
 		const goal = store.getGoal(opened.goal.id);
 		expect(goal?.status).toBe("planned");
@@ -233,6 +235,51 @@ describe("the scribe race, across processes", () => {
 		expect(deliverables.length).toBe(1);
 		expect(deliverables[0]?.files).toEqual(["src/a.ts"]);
 		expect(store.searchBoard({ type: "DECISION" }).length).toBe(1);
+		store.close();
+	});
+});
+
+describe("the plan's own size and the agents' asks", () => {
+	test("the plan states its peak parallelism and a recommended agent count, capped by the ceiling", () => {
+		const { store } = makeRoot();
+		const opened = round(store, [{ agent: "A", tasks: [{ title: "one" }, { title: "two" }, { title: "three", depends_on: ["one"] }] }]);
+		store.claim(opened.planningTask.id, "A", 300, ["general"]);
+		const result = store.planGoal(opened.goal.id, "A", { ceiling: 2 });
+		expect(result.ok).toBe(true);
+		expect(result.peak).toBe(2); // one and two run together, three follows one
+		expect(result.recommended).toBe(2); // the ceiling the caller passed binds, not the peak
+		const decision = store.searchBoard({ type: "DECISION" })[0]?.content ?? "";
+		expect(decision).toContain("peak parallelism 2 of 3 task(s) can run at once");
+		expect(decision).toContain("recommended agents 2 (ceiling 2)");
+		expect(decision).toContain("swarm_scale");
+		store.close();
+	});
+
+	test("an unknown ceiling recommends the peak as measured", () => {
+		const { store } = makeRoot();
+		const opened = round(store, [{ agent: "A", tasks: [{ title: "one" }, { title: "two" }] }]);
+		store.claim(opened.planningTask.id, "A", 300, ["general"]);
+		const result = store.planGoal(opened.goal.id, "A");
+		expect(result.peak).toBe(2);
+		expect(result.recommended).toBe(2);
+		expect(store.searchBoard({ type: "DECISION" })[0]?.content).toContain("recommended agents 2.");
+		store.close();
+	});
+
+	test("an agent's ask is recorded with its author and reason, listed while pending, and closed once decided", () => {
+		const { store } = makeRoot();
+		const first = store.recordScaleRequest({ agentId: "w1", requested: 6, reason: "the queue is deeper than the pool", current: 2 });
+		const second = store.recordScaleRequest({ agentId: "w2", requested: 5, reason: "same shortage", current: 2 });
+		expect([first.id, second.id]).toEqual([1, 2]);
+		expect(first.agentId).toBe("w1");
+		expect(first.reason).toBe("the queue is deeper than the pool");
+		expect(first.current).toBe(2);
+		expect(store.pendingScaleRequests().map((request) => request.requested)).toEqual([6, 5]);
+		expect(store.decideScaleRequests([first.id], "grow", 6)).toBe(1);
+		expect(store.decideScaleRequests([first.id], "grow", 6)).toBe(0); // already decided: never re-applied
+		const pending = store.pendingScaleRequests();
+		expect(pending.map((request) => request.id)).toEqual([second.id]);
+		expect(store.recentEvents(20).some((event) => event.type === "scale.request")).toBe(true);
 		store.close();
 	});
 });

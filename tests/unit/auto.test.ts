@@ -49,6 +49,7 @@ function task(overrides: Partial<SwarmTask> = {}): SwarmTask {
 interface Calls {
 	start: { roles: RoleConfig[]; count: number }[];
 	stop: string[];
+	shrink: number[];
 	nudge: string[];
 	main: string[];
 	notify: string[];
@@ -57,24 +58,34 @@ interface Calls {
 function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } = {}) {
 	const store = makeStore();
 	const config: SwarmConfig = { ...DEFAULT_CONFIG, ...options.config };
-	const calls: Calls = { start: [], stop: [], nudge: [], main: [], notify: [] };
+	const calls: Calls = { start: [], stop: [], shrink: [], nudge: [], main: [], notify: [] };
 	let clock = 1_000_000;
 	let busy = false;
 	let running = false;
 	let workers = 0;
+	let idle = 0;
 	let startFailure = false;
 	const deps: AutoDeps = {
 		store,
 		config,
 		isDriverRunning: () => running,
 		workerCount: () => workers,
+		poolIdle: () => idle,
 		startSwarm: async (roles, count) => {
 			calls.start.push({ roles, count });
 			if (startFailure) {
 				startFailure = false;
 				throw new Error("swarm is already running");
 			}
+			workers += count;
 			return roles.map((role) => role.name);
+		},
+		shrinkSwarm: async (count) => {
+			calls.shrink.push(count);
+			const stopped = Math.min(count, idle);
+			idle -= stopped;
+			workers -= stopped;
+			return Array.from({ length: stopped }, (_, i) => `w${workers + i + 1}`);
 		},
 		stopSwarm: async (reason) => {
 			calls.stop.push(reason);
@@ -112,6 +123,9 @@ function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } 
 		},
 		setWorkers: (value: number) => {
 			workers = value;
+		},
+		setIdle: (value: number) => {
+			idle = value;
 		},
 		failNextStart: () => {
 			startFailure = true;
@@ -633,5 +647,96 @@ describe("planning config", () => {
 
 		writeFileSync(configFile, `${JSON.stringify({ planning: "nonsense" }, null, 2)}\n`);
 		expect(loadSwarmConfig(configFile).planning).toBe("swarm");
+	});
+});
+
+describe("pool sizing from agent requests", () => {
+	/** A running pool sized for one ready task: the shape a scale request has to correct. */
+	async function pool(h: Harness, tasks = 1): Promise<void> {
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		for (let i = 0; i < tasks; i++) h.store.createTask({ title: `t${i}`, createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(true);
+	}
+
+	test("several asks for the same size collapse into ONE resize, the largest, and the asks are marked decided", async () => {
+		const h = harness({ config: { workers: 6 } });
+		await pool(h);
+		expect(h.calls.start.length).toBe(1);
+		h.store.recordScaleRequest({ agentId: "w1", requested: 5, reason: "queue is deep", current: 1 });
+		h.store.recordScaleRequest({ agentId: "w2", requested: 4, reason: "same shortage", current: 1 });
+		h.store.recordScaleRequest({ agentId: "w3", requested: 5, reason: "same shortage", current: 1 });
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(2);
+		expect(h.calls.start[1]).toMatchObject({ count: 4 });
+		expect(h.calls.notify.some((line) => line.includes("grew by 4"))).toBe(true);
+		expect(h.store.pendingScaleRequests()).toEqual([]); // consumed: the ask produced the resize
+	});
+
+	test("an ask above config.workers is clamped by the operator's ceiling", async () => {
+		const h = harness({ config: { workers: 3 } });
+		await pool(h);
+		h.store.recordScaleRequest({ agentId: "w1", requested: 99, reason: "as many as possible", current: 1 });
+		await h.controller.tick();
+		expect(h.calls.start[1]?.count).toBe(2); // 3 - 1, never 98
+		expect(h.calls.start.reduce((n, call) => n + call.count, 0)).toBe(3);
+	});
+
+	test("a shrink stops idle peers only and leaves the ask pending when nobody is idle", async () => {
+		const h = harness({ config: { workers: 6 } });
+		await pool(h, 4);
+		h.setWorkers(4);
+		h.setIdle(0);
+		h.store.recordScaleRequest({ agentId: "w1", requested: 1, reason: "over-provisioned", current: 4 });
+		await h.controller.tick();
+		expect(h.calls.shrink).toEqual([]); // nothing idle: deferred, never a worker holding work
+		expect(h.store.pendingScaleRequests().length).toBe(1);
+		h.setIdle(2);
+		h.advance(30_001);
+		await h.controller.tick();
+		expect(h.calls.shrink).toEqual([2]);
+		expect(h.store.pendingScaleRequests()).toEqual([]);
+	});
+
+	test("an over-provisioned pool prunes itself toward the plan with no ask at all", async () => {
+		const h = harness({ config: { workers: 4 } });
+		await pool(h, 4);
+		h.setWorkers(4);
+		h.setIdle(3);
+		// three of the four tasks finish, so the plan is one task and two workers (held + free + ready)
+		for (const task of h.store.listTasks({ limit: 10 }).slice(1)) {
+			h.store.claim(task.id, "w9", 300, ["general"]);
+			h.store.complete(task.id, "w9", { summary: "done" });
+		}
+		await h.controller.tick();
+		expect(h.calls.shrink).toEqual([2]);
+		expect(h.calls.notify.some((line) => line.includes("stopped 2 idle worker"))).toBe(true);
+	});
+
+	test("a resize inside the cooldown is deferred, and applied once the window passes", async () => {
+		const h = harness({ config: { workers: 6 }, auto: { scaleCooldownMs: 1000 } });
+		await pool(h);
+		h.store.recordScaleRequest({ agentId: "w1", requested: 3, reason: "more peers", current: 1 });
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(2);
+		h.store.recordScaleRequest({ agentId: "w2", requested: 5, reason: "even more", current: 3 });
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(2); // still cooling down
+		expect(h.store.pendingScaleRequests().length).toBe(1);
+		h.advance(1001);
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(3);
+		expect(h.calls.start[2]?.count).toBe(2);
+	});
+
+	test("an ask the pool already satisfies is consumed, never retried forever", async () => {
+		const h = harness({ config: { workers: 6 } });
+		await pool(h, 2);
+		h.store.recordScaleRequest({ agentId: "w1", requested: 2, reason: "we are fine as we are", current: 2 });
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(1);
+		expect(h.calls.shrink).toEqual([]);
+		expect(h.store.pendingScaleRequests()).toEqual([]); // decided as satisfied
 	});
 });

@@ -14,6 +14,7 @@ import {
 	orderForCreation,
 	parseProposal,
 	parseProposedTask,
+	peakParallelism,
 	planningTaskBrief,
 	type Proposal,
 } from "../../extension/planning";
@@ -186,6 +187,30 @@ describe("orderForCreation", () => {
 		const order = orderForCreation([mergedTask("a", ["b"]), mergedTask("b", ["a"])]);
 		expect(order.ordered.map((task) => task.title)).toEqual(["a", "b"]);
 		expect(order.deferred).toEqual([{ task: "a", dep: "b" }]);
+	});
+});
+
+describe("peakParallelism", () => {
+	function merged(title: string, dependsOn: string[] = []) {
+		return { key: deliverableKey(title), title, deliverable: undefined, capabilities: [], files: [], dependsOn, reviewRequired: false, agents: ["A"] };
+	}
+
+	test("independent work runs as wide as it is", () => {
+		expect(peakParallelism([merged("a"), merged("b"), merged("c"), merged("d")])).toBe(4);
+	});
+
+	test("a chain is one worker wide, and the widest wave is what counts", () => {
+		expect(peakParallelism([merged("a"), merged("b", ["a"]), merged("c", ["b"])])).toBe(1);
+		// two roots, then their two children: the widest wave is 2
+		expect(peakParallelism([merged("a"), merged("b"), merged("c", ["a"]), merged("d", ["b"])])).toBe(2);
+	});
+
+	test("an empty round wants nobody", () => {
+		expect(peakParallelism([])).toBe(0);
+	});
+
+	test("a cycle asks for one worker, because creation drops the edge that cannot resolve", () => {
+		expect(peakParallelism([merged("a", ["b"]), merged("b", ["a"])])).toBe(1);
 	});
 });
 

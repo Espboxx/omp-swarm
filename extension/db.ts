@@ -103,6 +103,19 @@ CREATE TABLE IF NOT EXISTS goals (
 );
 CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
 
+CREATE TABLE IF NOT EXISTS scale_requests (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id       TEXT NOT NULL,
+  reason         TEXT NOT NULL,
+  requested      INTEGER NOT NULL,
+  current        INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL,
+  decided_at     INTEGER,
+  decided_action TEXT,
+  decided_size   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_scale_pending ON scale_requests(decided_at, created_at);
+
 CREATE TABLE IF NOT EXISTS reservations (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   pattern     TEXT NOT NULL,

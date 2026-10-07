@@ -3,6 +3,7 @@ import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-
 import type { TSchema } from "@oh-my-pi/pi-ai";
 import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgents, renderBoard, renderInbox, renderTaskDetail, renderTasks } from "./render";
+import { poolFloor } from "./scaling";
 import type { SwarmStore } from "./store";
 import type { BoardType, SwarmConfig, SwarmMessage, SwarmTask, TaskStatus } from "./types";
 
@@ -115,6 +116,10 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 						})
 						.join("; ")}`,
 				);
+			}
+			const asks = store.pendingScaleRequests();
+			if (asks.length > 0) {
+				lines.push(`scale ask(s) pending: ${asks.map((ask) => `${ask.agentId} -> ${ask.requested} agent(s) ("${ask.reason}")`).join("; ")}`);
 			}
 			return ok(lines.join("\n"), { counts: snapshot.counts, agents: snapshot.agents.length, goals: goals.length });
 		},
@@ -414,7 +419,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 					{ planned: false },
 				);
 			}
-			const result = store.planGoal(goal.id, identity.id);
+			const result = store.planGoal(goal.id, identity.id, { ceiling: config.workers });
 			if (!result.ok) return err(`plan refused: ${result.reason}`, { planned: false });
 			const done = store.complete(goal.planningTask, identity.id, {
 				summary: `planned ${goal.id}: ${result.created.length} task(s) from ${result.proposals} proposal(s)`,
@@ -424,6 +429,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			return ok(
 				[
 					`${goal.id} planned: ${result.created.length} task(s) created${result.skipped.length > 0 ? `, ${result.skipped.length} skipped (already in the pool)` : ""}${result.folded.length > 0 ? `, ${result.folded.length} duplicate deliverable(s) folded` : ""}.`,
+					`SIZE: peak parallelism ${result.peak} task(s) at once; recommended agents ${result.recommended} (ceiling ${config.workers}). Any agent can ask for a different size with swarm_scale({ agents, reason }).`,
 					done.ok ? `planning task ${goal.planningTask} completed; the DECISION with the merged split is on the board.` : `planning task ${goal.planningTask} could not be completed (${done.reason}); release it.`,
 					...result.created.map((id) => {
 						const task = store.getTask(id);
@@ -431,6 +437,51 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 					}),
 				].join("\n"),
 				{ planned: true, created: result.created, goal: goal.id },
+			);
+		},
+	};
+
+	const scaleSchema = z.object({ agents: z.number(), reason: z.string() });
+	const scaleTool: CustomTool<typeof scaleSchema> = {
+		name: "swarm_scale",
+		label: "Request Pool Size",
+		description:
+			"Ask for a different pool size when the task graph needs more or fewer peers than the pool has: `agents` is the size you want and `reason` is why (recorded verbatim). It is ADVISORY and auditable, never a direct spawn — the controller is the only writer and applies it on its next tick (~2 s); several agents asking at once collapse to ONE resize (the largest ask). config.workers is the operator's ceiling: a larger ask is clamped and reported, never refused silently, and workers holding work are never stopped (a shrink stops idle peers only).",
+		parameters: scaleSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const reason = params.reason.trim();
+			if (reason === "") return err("a scale request needs a reason: it is recorded verbatim for the audit trail", { recorded: false });
+			const requested = Number.isFinite(params.agents) ? Math.floor(params.agents) : 0;
+			if (requested < 1) return err(`agents must be at least 1 (asked for ${params.agents}); a pool of zero is /swarm off, not a scale request`, { recorded: false });
+			const ceiling = config.workers;
+			const counts = store.counts();
+			const current = store.listAgents().filter((agent) => agent.status !== "offline").length;
+			const floor = poolFloor(counts);
+			const target = Math.min(Math.max(requested, floor), ceiling);
+			const request = store.recordScaleRequest({ agentId: identity.id, requested, reason, current });
+			store.postBoard({
+				type: "OBSERVATION",
+				agentId: identity.id,
+				content: `asked for ${requested} agent(s) (pool ${current}); reason: ${reason}`,
+				tags: ["scale"],
+			});
+			onChange?.();
+			const verdict =
+				requested > ceiling
+					? `clamped: asked for ${requested}, the operator's ceiling is config.workers=${ceiling}`
+					: target > requested
+						? `raised to ${target}: the live work shape (${counts.claimed} claimed + ${counts.review} in review + ${counts.ready} ready) keeps at least ${floor} worker(s)`
+						: target === current
+							? `recorded, but the pool is already ${current}`
+							: `accepted: ${current} -> ${target}`;
+			return ok(
+				[
+					`scale request #${request.id} ${verdict}.`,
+					`the controller reconciles the pool on its next tick (~2 s); a resize cooldown can defer it, and only idle peers are ever stopped. Ask size ${target} of ceiling ${ceiling}.`,
+				].join("\n"),
+				{ recorded: true, id: request.id, requested, target, current, floor, ceiling },
 			);
 		},
 	};
@@ -690,6 +741,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		goalTool,
 		proposeTool,
 		planTool,
+		scaleTool,
 		retryTool,
 		integrateTool,
 		postTool,
@@ -717,6 +769,7 @@ export const SWARM_TOOL_NAMES = [
 	"swarm_goal",
 	"swarm_propose",
 	"swarm_plan",
+	"swarm_scale",
 	"swarm_task_retry",
 	"swarm_integrate",
 	"board_post",

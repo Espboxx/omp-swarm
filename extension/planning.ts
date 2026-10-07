@@ -230,6 +230,28 @@ export function orderForCreation(tasks: MergedTask[]): { ordered: MergedTask[]; 
 	return { ordered, deferred };
 }
 
+/**
+ * The widest set of the round's deliverables that can run at the same time: the round's peak
+ * parallelism, as a wave simulation over the dependency graph. Tasks left un-waved (a forced,
+ * reported edge — a cycle) can only run once a wave has finished, so they add one worker, and a
+ * round that is entirely cyclic is one worker wide because creation drops the edges that cannot
+ * resolve to an already-created task.
+ */
+export function peakParallelism(tasks: MergedTask[]): number {
+	const done = new Set<string>();
+	let peak = 0;
+	let remaining = [...tasks];
+	while (remaining.length > 0) {
+		const wave = remaining.filter((task) => task.dependsOn.every((dep) => done.has(dep)));
+		if (wave.length === 0) break;
+		peak = Math.max(peak, wave.length);
+		for (const task of wave) done.add(task.key);
+		remaining = remaining.filter((task) => !wave.includes(task));
+	}
+	if (peak === 0) return tasks.length > 0 ? 1 : 0;
+	return remaining.length > 0 ? peak + 1 : peak;
+}
+
 /** The brief the goal's single planning task carries: what the round is, who does what, the bound. */
 export function planningTaskBrief(goal: { id: string; goal: string; agents: number; createdBy: string }, deadlineMs = GOAL_DEADLINE_MS): string {
 	return [
