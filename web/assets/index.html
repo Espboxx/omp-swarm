@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>omp-swarm dashboard</title>
+		<!--
+			Read-only view of one `.swarm/swarm.db`: agents, tasks, collaboration, progress.
+			Everything visible is rendered by app.js from GET /api/snapshot (or ./fixtures/snapshot.json
+			with ?fixture=1). No framework, no CDN, no build step.
+		-->
+		<!-- No icon file, and no CDN: the empty data URL stops the browser's implicit /favicon.ico request. -->
+		<link rel="icon" href="data:," />
+		<link rel="stylesheet" href="./style.css" />
+	</head>
+	<body>
+		<noscript>
+			<p style="padding: 16px; font: 15px system-ui">
+				This dashboard renders its data with JavaScript. Enable JavaScript, then reload the page.
+			</p>
+		</noscript>
+		<script type="module" src="./app.js"></script>
+	</body>
+</html>

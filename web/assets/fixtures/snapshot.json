@@ -1,0 +1,446 @@
+{
+  "now": 1791417600000,
+  "swarmRoot": "C:/work/demo-project",
+  "counts": {
+    "ready": 1,
+    "claimed": 2,
+    "review": 1,
+    "blocked": 2,
+    "done": 2,
+    "failed": 2,
+    "total": 10
+  },
+  "agents": [
+    {
+      "id": "SwiftTiger",
+      "role": "general",
+      "status": "working",
+      "currentTask": "task-101",
+      "capabilities": ["general"],
+      "worktree": null,
+      "heartbeatAgeMs": 3200,
+      "leaseUntilMs": 1791420000000,
+      "isMain": false
+    },
+    {
+      "id": "CalmTiger",
+      "role": "reviewer",
+      "status": "reviewing",
+      "currentTask": "task-97",
+      "capabilities": ["reviewer", "general"],
+      "worktree": null,
+      "heartbeatAgeMs": 9100,
+      "leaseUntilMs": 1791419400000,
+      "isMain": false
+    },
+    {
+      "id": "VividTiger",
+      "role": "general",
+      "status": "working",
+      "currentTask": "task-94",
+      "capabilities": ["general"],
+      "worktree": "C:/work/demo-project/.swarm/worktrees/VividTiger",
+      "heartbeatAgeMs": 44000,
+      "leaseUntilMs": 1791417960000,
+      "isMain": false
+    },
+    {
+      "id": "BrightTiger",
+      "role": "general",
+      "status": "idle",
+      "currentTask": null,
+      "capabilities": ["general"],
+      "worktree": null,
+      "heartbeatAgeMs": 1200,
+      "leaseUntilMs": null,
+      "isMain": false
+    },
+    {
+      "id": "main",
+      "role": "coordinator",
+      "status": "idle",
+      "currentTask": null,
+      "capabilities": ["general", "reviewer", "integrator"],
+      "worktree": null,
+      "heartbeatAgeMs": 600,
+      "leaseUntilMs": null,
+      "isMain": true
+    },
+    {
+      "id": "QuietRaven",
+      "role": "general",
+      "status": "offline",
+      "currentTask": null,
+      "capabilities": ["general"],
+      "worktree": null,
+      "heartbeatAgeMs": 486000,
+      "leaseUntilMs": 1791417000000,
+      "isMain": false
+    }
+  ],
+  "tasks": [
+    {
+      "id": "task-94",
+      "title": "Swarm-side planning: the coordinator only sizes the pool, the workers split the goal",
+      "status": "claimed",
+      "priority": 0,
+      "claimedBy": "VividTiger",
+      "attempts": 1,
+      "createdAtMs": 1791355427000,
+      "updatedAtMs": 1791417000000,
+      "claimedAtMs": 1791417000000,
+      "leaseUntilMs": 1791417960000,
+      "ageMs": 600000,
+      "dependencies": [],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["extension/**", "tests/unit/**"],
+      "reviewRequired": true,
+      "reviewStatus": "pending",
+      "result": null,
+      "commit": null
+    },
+    {
+      "id": "task-101",
+      "title": "Web dashboard backend: a standalone read-only server over the swarm DB",
+      "status": "claimed",
+      "priority": 0,
+      "claimedBy": "SwiftTiger",
+      "attempts": 1,
+      "createdAtMs": 1791417294000,
+      "updatedAtMs": 1791417360000,
+      "claimedAtMs": 1791417360000,
+      "leaseUntilMs": 1791420000000,
+      "ageMs": 240000,
+      "dependencies": [],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["web/server.ts", "web/snapshot.ts"],
+      "reviewRequired": true,
+      "reviewStatus": "pending",
+      "result": null,
+      "commit": null
+    },
+    {
+      "id": "task-102",
+      "title": "Web dashboard frontend: one page that shows collaboration, tasks and progress",
+      "status": "ready",
+      "priority": 0,
+      "claimedBy": null,
+      "attempts": 0,
+      "createdAtMs": 1791417294000,
+      "updatedAtMs": 1791417294000,
+      "claimedAtMs": null,
+      "leaseUntilMs": null,
+      "ageMs": 306000,
+      "dependencies": [],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["web/assets/**"],
+      "reviewRequired": true,
+      "reviewStatus": null,
+      "result": null,
+      "commit": null
+    },
+    {
+      "id": "task-97",
+      "title": "Document swarm-side planning in README EN + ZH",
+      "status": "review",
+      "priority": 0,
+      "claimedBy": "CalmTiger",
+      "attempts": 1,
+      "createdAtMs": 1791355427000,
+      "updatedAtMs": 1791415800000,
+      "claimedAtMs": 1791380000000,
+      "leaseUntilMs": null,
+      "ageMs": 1800000,
+      "dependencies": ["task-94"],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["README.md", "README.zh-CN.md"],
+      "reviewRequired": true,
+      "reviewStatus": "pending",
+      "result": "Both READMEs updated, headings 1:1.",
+      "commit": "0f3c9ab"
+    },
+    {
+      "id": "task-96",
+      "title": "Live proof: one goal, N agents, and a split the agents produce themselves",
+      "status": "blocked",
+      "priority": 0,
+      "claimedBy": null,
+      "attempts": 0,
+      "createdAtMs": 1791355461000,
+      "updatedAtMs": 1791355461000,
+      "claimedAtMs": null,
+      "leaseUntilMs": null,
+      "ageMs": 62139000,
+      "dependencies": ["task-94"],
+      "blockedReason": "waiting for dependencies: task-94",
+      "requiredCapabilities": ["general"],
+      "files": [],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": null,
+      "commit": null
+    },
+    {
+      "id": "task-99",
+      "title": "Verify the self-adjusting pool: a wrong N gets corrected live",
+      "status": "blocked",
+      "priority": 0,
+      "claimedBy": null,
+      "attempts": 0,
+      "createdAtMs": 1791416900000,
+      "updatedAtMs": 1791416900000,
+      "claimedAtMs": null,
+      "leaseUntilMs": null,
+      "ageMs": 700000,
+      "dependencies": ["task-98"],
+      "blockedReason": "waiting for dependencies: task-98",
+      "requiredCapabilities": ["reviewer"],
+      "files": [],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": null,
+      "commit": null
+    },
+    {
+      "id": "task-30",
+      "title": "Rollback: remove the agent-list panel, restore the previous layout",
+      "status": "done",
+      "priority": 4,
+      "claimedBy": "SwiftTiger",
+      "attempts": 1,
+      "createdAtMs": 1791275000000,
+      "updatedAtMs": 1791390000000,
+      "claimedAtMs": 1791389000000,
+      "leaseUntilMs": null,
+      "ageMs": 27600000,
+      "dependencies": [],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["extension/render.ts"],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": "Panel removed, iteration-2 layout restored.",
+      "commit": "c1a2b3d"
+    },
+    {
+      "id": "task-44",
+      "title": "Fix: the drained-summary marker overflows the widget cap",
+      "status": "done",
+      "priority": 2,
+      "claimedBy": "CalmTiger",
+      "attempts": 2,
+      "createdAtMs": 1791300000000,
+      "updatedAtMs": 1791400000000,
+      "claimedAtMs": 1791399000000,
+      "leaseUntilMs": null,
+      "ageMs": 17600000,
+      "dependencies": ["task-43"],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["extension/render.ts"],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": "Marker bounded against the 10-line cap.",
+      "commit": "9e8f7a1"
+    },
+    {
+      "id": "task-22",
+      "title": "Fix the panel geometry: it must never paint over the editor",
+      "status": "failed",
+      "priority": 2,
+      "claimedBy": null,
+      "attempts": 3,
+      "createdAtMs": 1791260000000,
+      "updatedAtMs": 1791350000000,
+      "claimedAtMs": null,
+      "leaseUntilMs": null,
+      "ageMs": 67600000,
+      "dependencies": [],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["extension/panel-page.ts"],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": "CLOSED AS SUPERSEDED: the operator ordered a rollback of the panel work.",
+      "commit": null
+    },
+    {
+      "id": "task-23",
+      "title": "Panel interaction: stop the warning spam, add key handling",
+      "status": "failed",
+      "priority": 2,
+      "claimedBy": null,
+      "attempts": 2,
+      "createdAtMs": 1791260000000,
+      "updatedAtMs": 1791351000000,
+      "claimedAtMs": null,
+      "leaseUntilMs": null,
+      "ageMs": 66600000,
+      "dependencies": ["task-22"],
+      "blockedReason": null,
+      "requiredCapabilities": ["general"],
+      "files": ["extension/panel-page.ts"],
+      "reviewRequired": false,
+      "reviewStatus": null,
+      "result": "CLOSED AS SUPERSEDED (dependency task-22 is failed).",
+      "commit": null
+    }
+  ],
+  "board": [
+    {
+      "id": 372,
+      "type": "DECISION",
+      "taskId": null,
+      "author": "main",
+      "createdAtMs": 1791417194000,
+      "content": "WEB DASHBOARD - FROZEN API CONTRACT (v1): a read-only Bun process over .swarm/swarm.db, a static page + JSON, bind 127.0.0.1 only."
+    },
+    {
+      "id": 371,
+      "type": "OBSERVATION",
+      "taskId": null,
+      "author": "SwiftTiger",
+      "createdAtMs": 1791416900000,
+      "content": "CORROBORATION + FORWARD PREDICTION: the reviewer capability gate is all-required at claim time, so a verify task can end up unclaimable."
+    },
+    {
+      "id": 369,
+      "type": "FAIL",
+      "taskId": "task-95",
+      "author": "CalmTiger",
+      "createdAtMs": 1791416400000,
+      "content": "FAIL / PLAN DEFECT: task-95 needs the reviewer capability and the only reviewer authored task-94, so no online agent can claim it."
+    },
+    {
+      "id": 368,
+      "type": "DECISION",
+      "taskId": null,
+      "author": "main",
+      "createdAtMs": 1791415900000,
+      "content": "task-94..97 - SPLIT: one implementation owner, two independent checkers (static and live), docs in parallel."
+    },
+    {
+      "id": 367,
+      "type": "FACT",
+      "taskId": null,
+      "author": "SwiftTiger",
+      "createdAtMs": 1791415000000,
+      "content": "FACT: the pool end state is ready 0, blocked 0, claimed 0, review 0, done 80, failed 13 - the residue saga is closed."
+    },
+    {
+      "id": 366,
+      "type": "REVIEW",
+      "taskId": "task-92",
+      "author": "SwiftTiger",
+      "createdAtMs": 1791414000000,
+      "content": "APPROVED: the seven rows are really closed; verified independently against the live DB, not against the summary."
+    },
+    {
+      "id": 365,
+      "type": "QUESTION",
+      "taskId": "task-95",
+      "author": "CalmTiger",
+      "createdAtMs": 1791413000000,
+      "content": "QUESTION for the coordinator: re-file task-95 with required_capabilities [general], or accept that the auditor authored the implementation?"
+    },
+    {
+      "id": 364,
+      "type": "CLAIM",
+      "taskId": "task-101",
+      "author": "SwiftTiger",
+      "createdAtMs": 1791412800000,
+      "content": "CLAIM task-101 (web dashboard backend); reserving web/server.ts and web/snapshot.ts."
+    }
+  ],
+  "messages": [
+    {
+      "id": 143,
+      "from": "main",
+      "to": "all",
+      "taskId": null,
+      "urgent": true,
+      "createdAtMs": 1791417300000,
+      "read": false,
+      "content": "Dashboard v1 contract is frozen on the board (#372). Backend and frontend can start now; do not rename the fields."
+    },
+    {
+      "id": 142,
+      "from": "CalmTiger",
+      "to": "SwiftTiger",
+      "taskId": "task-95",
+      "urgent": false,
+      "createdAtMs": 1791416400000,
+      "read": true,
+      "content": "Can you re-derive the claim gate before the coordinator re-files task-95? I want a second pair of eyes on the capability check."
+    },
+    {
+      "id": 141,
+      "from": "VividTiger",
+      "to": "BrightTiger",
+      "taskId": "task-102",
+      "urgent": false,
+      "createdAtMs": 1791415000000,
+      "read": true,
+      "content": "The fixture is the contract here - make it a realistic snapshot, not three toy rows."
+    }
+  ],
+  "reservations": [
+    {
+      "path": "extension/**",
+      "agentId": "VividTiger",
+      "taskId": "task-94",
+      "leaseUntilMs": 1791417960000
+    },
+    {
+      "path": "web/server.ts",
+      "agentId": "SwiftTiger",
+      "taskId": "task-101",
+      "leaseUntilMs": 1791420000000
+    },
+    {
+      "path": "web/assets/**",
+      "agentId": "BrightTiger",
+      "taskId": "task-102",
+      "leaseUntilMs": 1791418500000
+    }
+  ],
+  "events": [
+    {
+      "createdAtMs": 1791417360000,
+      "type": "task.claim",
+      "content": "SwiftTiger claimed task-101"
+    },
+    {
+      "createdAtMs": 1791417294000,
+      "type": "task.create",
+      "content": "main created task-102 (Web dashboard frontend)"
+    },
+    {
+      "createdAtMs": 1791417000000,
+      "type": "task.claim",
+      "content": "VividTiger claimed task-94"
+    },
+    {
+      "createdAtMs": 1791416920000,
+      "type": "roster.grow",
+      "content": "swarm grew by 1 worker toward 3 ready task(s)"
+    },
+    {
+      "createdAtMs": 1791415800000,
+      "type": "review.start",
+      "content": "CalmTiger started the review of task-97"
+    },
+    {
+      "createdAtMs": 1791415600000,
+      "type": "task.reclaim",
+      "content": "task lease expired for QuietRaven; task-102 returned to ready"
+    }
+  ],
+  "feed": {
+    "limit": 200
+  }
+}
