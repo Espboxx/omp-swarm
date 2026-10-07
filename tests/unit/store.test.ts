@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { openDatabase, swarmPaths, type SwarmPaths } from "../../extension/db";
+import { findStarvation } from "../../extension/starvation";
 import { SwarmStore, UNROUTABLE_GRACE_MS, patternsConflict } from "../../extension/store";
 
 const CHILD = join(import.meta.dir, "..", "helpers", "swarm-child.ts");
@@ -743,6 +744,90 @@ describe("event log", () => {
 		expect(JSON.parse(rows[0]?.data ?? "{}")).toEqual({ workers: 3, stopped: ["A"], ready: 10, requested: 1 });
 		const lines = readFileSync(paths.eventsFile, "utf8").trim().split("\n");
 		expect(JSON.parse(lines.at(-1) ?? "{}").type).toBe("roster.shrink");
+		store.close();
+	});
+});
+
+describe("the offline marker is a read-side judgement, not a sentence", () => {
+	/** Age every heartbeat by `seconds`, the way a stopped beat loop or a long turn does. */
+	function age(paths: SwarmPaths, seconds: number): void {
+		const clock = openDatabase(paths);
+		clock.run("UPDATE agents SET heartbeat_at=?", Date.now() - seconds * 1000);
+		clock.close();
+	}
+
+	test("a beat revives a stale offline row — and says 'working' when it still holds", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "BrightTiger", role: "general", capabilities: ["general"], status: "working" });
+		store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"], status: "idle" });
+		const task = store.createTask({ title: "held work", createdBy: "main" });
+		expect(store.claim(task.id, "BrightTiger", 300, ["general"]).ok).toBe(true);
+
+		age(paths, 120);
+		store.snapshot(60, true); // ANY status read writes the corpse marker
+		expect(store.listAgents().every((a) => a.status === "offline")).toBe(true);
+
+		// The call shape that used to make the marker permanent: the beat passes the STORED status back.
+		for (const agent of store.listAgents()) store.heartbeat(agent.id, agent.status ?? "idle", undefined, 300);
+
+		const after = new Map(store.listAgents().map((a) => [a.id, a]));
+		expect(after.get("BrightTiger")?.status).toBe("working");
+		expect(after.get("SwiftTiger")?.status).toBe("idle");
+		store.close();
+	});
+
+	test("a corpse stays unavailable: the row nobody beats is still offline, and starvation sees it", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "BrightTiger", role: "general", capabilities: ["general"], status: "working" });
+		store.registerAgent({ id: "CalmTiger", role: "reviewer", capabilities: ["reviewer"], status: "working" });
+		age(paths, 120);
+		store.snapshot(60, true);
+
+		// Only BrightTiger is still in the beat set (the other session was released/disposed): a beat
+		// revives it, and nothing beats CalmTiger, so its marker stands.
+		const stored = store.listAgents().find((a) => a.id === "BrightTiger")?.status ?? "idle";
+		store.heartbeat("BrightTiger", stored, undefined, 300);
+		const agents = store.listAgents();
+		expect(agents.find((a) => a.id === "BrightTiger")?.status).not.toBe("offline");
+		expect(agents.find((a) => a.id === "CalmTiger")?.status).toBe("offline");
+
+		// Acceptance (b): the pool's own availability logic must NOT have gained the corpse.
+		const needsReviewer = store.createTask({ title: "needs a reviewer", createdBy: "main", requiredCapabilities: ["reviewer"] });
+		const report = findStarvation({
+			ready: [needsReviewer],
+			agents: store.listAgents(),
+			now: Date.now(),
+			offlineAfterMs: 60_000,
+		});
+		expect(report?.missing).toEqual(["reviewer"]);
+		store.close();
+	});
+
+	test("a worker whose beat is fresh is never swept, so a busy worker keeps its status", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "BrightTiger", role: "general", capabilities: ["general"], status: "working" });
+		age(paths, 20); // one beat ago: heartbeatSeconds is 20
+		store.snapshot(60, true);
+		expect(store.listAgents()[0]?.status).toBe("working");
+		store.close();
+	});
+
+	test("a transition reports what the agent still holds instead of hard-coding idle + NULL", () => {
+		const { store } = makeRoot();
+		store.registerAgent({ id: "BrightTiger", role: "general", capabilities: ["general"], status: "idle" });
+		const one = store.createTask({ title: "one", createdBy: "main" });
+		const two = store.createTask({ title: "two", createdBy: "main" });
+		expect(store.claim(one.id, "BrightTiger", 300, ["general"]).ok).toBe(true);
+		expect(store.claim(two.id, "BrightTiger", 300, ["general"]).ok).toBe(true);
+
+		expect(store.complete(one.id, "BrightTiger", { summary: "done" }).ok).toBe(true);
+		const agent = store.listAgents()[0];
+		expect(agent?.status).toBe("working");
+		expect(agent?.currentTask).toBe(two.id);
+
+		expect(store.release(two.id, "BrightTiger", "nothing left")).toBe(true);
+		expect(store.listAgents()[0]?.status).toBe("idle");
+		expect(store.listAgents()[0]?.currentTask).toBeFalsy();
 		store.close();
 	});
 });

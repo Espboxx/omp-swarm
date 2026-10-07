@@ -400,14 +400,56 @@ export class SwarmStore {
 		this.#log("agent.leave", id);
 	}
 
+	/** Does this agent still hold a claim? The one question that decides whether an idle-looking row is true. */
+	#holdsClaim(agentId: string): boolean {
+		return this.#db.get<{ id: string }>("SELECT id FROM tasks WHERE claimed_by=? AND status='claimed' LIMIT 1", agentId) !== null;
+	}
+
+	/**
+	 * Put an agent row back in step with what it still holds. The four transitions below used to write
+	 * `idle` + a NULL `current_task` unconditionally, which is how a row could read `idle` while `tasks`
+	 * still showed a row claimed by it — the contradiction behind "/swarm status says 0 working while four
+	 * rows are claimed", and part of why the operator could not tell who was burning.
+	 */
+	#settleAgent(agentId: string, now: number): void {
+		const claimed = this.#db.get<{ id: string }>(
+			"SELECT id FROM tasks WHERE claimed_by=? AND status='claimed' ORDER BY priority DESC, created_at ASC LIMIT 1",
+			agentId,
+		);
+		const reviewing =
+			claimed === null
+				? this.#db.get<{ id: string }>(
+						"SELECT id FROM tasks WHERE reviewer=? AND status='review' ORDER BY priority DESC, created_at ASC LIMIT 1",
+						agentId,
+					)
+				: null;
+		const status: AgentStatus = claimed !== null ? "working" : reviewing !== null ? "reviewing" : "idle";
+		this.#db.run(
+			"UPDATE agents SET status=?, current_task=?, heartbeat_at=? WHERE id=?",
+			status,
+			claimed?.id ?? reviewing?.id ?? null,
+			now,
+			agentId,
+		);
+	}
+
 	heartbeat(id: string, status?: AgentStatus, currentTask?: string | null, leaseSeconds = 300): void {
 		const now = Date.now();
-		const agent = this.#db.get<{ current_task: string | null }>("SELECT current_task FROM agents WHERE id=?", id);
+		const agent = this.#db.get<{ status: AgentStatus; current_task: string | null }>("SELECT status, current_task FROM agents WHERE id=?", id);
 		if (!agent) return;
+		// A beat IS liveness, so it can never conclude in the corpse marker. `offline` is a read-side
+		// judgement (`markStaleAgentsOffline`) — not something a beating worker re-asserts. The old
+		// `COALESCE(status, …)` let the driver echo the stored 'offline' straight back, so every beat
+		// re-wrote it and the marker became permanent: the session was alive and burning while
+		// `/swarm status` said nobody was online. An explicit non-offline status still wins; a beat that
+		// reaches an offline row revives it to what the row really is, which is what the pool's own
+		// claimability and starvation logic read.
+		const requested = status === "offline" ? undefined : status;
+		const next = requested ?? (agent.status === "offline" ? (this.#holdsClaim(id) ? "working" : "idle") : agent.status);
 		this.#db.run(
-			"UPDATE agents SET heartbeat_at=?, status=COALESCE(?, status), current_task=? WHERE id=?",
+			"UPDATE agents SET heartbeat_at=?, status=?, current_task=? WHERE id=?",
 			now,
-			status ?? null,
+			next,
 			currentTask === undefined ? agent.current_task : currentTask,
 			id,
 		);
@@ -733,7 +775,7 @@ export class SwarmStore {
 				agentId,
 			);
 			if (result.changes !== 1) return false;
-			this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
+			this.#settleAgent(agentId, now);
 			this.#log("task.release", agentId, taskId, { reason });
 			return true;
 		});
@@ -765,7 +807,7 @@ export class SwarmStore {
 				now,
 				taskId,
 			);
-			this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
+			this.#settleAgent(agentId, now);
 			const promoted = needsReview ? [] : this.#promoteLocked(now);
 			this.#log("task.complete", agentId, taskId, { review: needsReview, promoted });
 			return { ok: true, task: this.getTask(taskId) };
@@ -805,7 +847,7 @@ export class SwarmStore {
 			);
 			// Only the holder goes idle: closing someone else's dead residue must not clear the
 			// caller's own current_task.
-			if (held) this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
+			if (held) this.#settleAgent(agentId, now);
 			this.#log("task.fail", agentId, taskId, { reason, closed: !held, deadDependencies: dead, stranded });
 			return { ok: true, task: this.getTask(taskId) };
 		});
@@ -1211,7 +1253,7 @@ export class SwarmStore {
 					taskId,
 				);
 			}
-			this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, reviewer);
+			this.#settleAgent(reviewer, now);
 			const promoted = approved ? this.#promoteLocked(now) : [];
 			this.#log(approved ? "review.approve" : "review.reject", reviewer, taskId, { notes, promoted });
 			return { ok: true, task: this.getTask(taskId) };
