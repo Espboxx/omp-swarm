@@ -49,9 +49,10 @@ extension/
   index.ts     extension entry: tool registration, /swarm commands, status panel, lazy runtimes
   auto.ts      multi-agent mode: roster derivation (incl. the goal budget), mid-run growth + the auto-assemble/self-stop state machine + the planning round's bound
   driver.ts    worker lifecycle: spawn sessions, add workers to a running pool, tick, heartbeat, wake, worktrees, shutdown
-  tools.ts     the 22 agent tools (shared by workers and the main session)
+  tools.ts     the 23 agent tools (shared by workers and the main session)
   store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages, goals and the scribe's merge
   planning.ts  the planning round's pure rules: proposal parsing, the dedupe key, the merge and the creation order
+  scaling.ts   the pool-size rule: collapsing the agents' asks into one resize, the ceiling clamp, the shrink floor and who may be stopped
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
@@ -61,10 +62,11 @@ extension/
   types.ts     domain types
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            38 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        17 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
-  unit/goals.test.ts           11 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
-  unit/goal-tools.test.ts       7 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
+  unit/auto.test.ts            44 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        21 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/scaling.test.ts         14 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
+  unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -260,6 +262,24 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 # → setStatus statusText=MULTI-AGENT ON · idle after "on"; no MULTI-AGENT frame after "off"
 ```
 
+### 池子大小：协调者给的 `N` 只是一个起点
+
+你在 `swarm_goal` 里给出的 agent 数量只决定池子启动时的大小，没有任何东西被冻结在那里。上面说的「计划的自行成长」会随着 `ready` 工作出现把池子撑大，所以一个低估了工作量的目标是在运行中被纠正的，而不是用偏少的人手跑完整个批次。
+
+任何 agent 也可以主动请求一个大小，而请求是池子成长的唯一另一条路：
+
+```
+swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
+```
+
+- 它是**建议性的、且留痕的**，从不是直接拉起 agent。请求会记录谁提的、为什么、改前的大小以及最后发生了什么，并在黑板上以带 `scale` 标签的 `OBSERVATION` 发布。返回值会说明四种结果里的哪一种发生了：`accepted`、`clamped`（请求高于上限）、`raised to N`（当前工作形态保住了下限），或 `recorded, but the pool is already N`。
+- **controller 是池子大小的唯一写者**，它在本来就在跑的 tick 上（每 2 秒）重算。同一个 60 秒窗口里多个 agent 感到同样的短缺，会塌缩成**一次**改尺寸：决策每个 tick 都从头重算，且取最大的那个请求，所以 N 个 agent 各要一个，结果是一个，而不是 N 个。超过 60 秒的请求会被当作过期丢弃，而不会在促成它的工作形态早已消失之后才被应用。
+- `config.workers` 是**操作者的上限**，它在改尺寸发生的地方强制生效，而不是靠约定：更大的请求会被钳制执行，并且返回值会说明这一点。任何 agent 无论要多少，都无法花超过操作者设定的预算。
+- 池子现在也会**收缩**，这是以前完全没有的。收缩只会停掉**什么都没拿**的 worker —— 没有认领、没有评审租约、没有文件预留，也不在回合中间。其他情况一律推迟这次收缩，而被推迟的请求会留在待处理状态，下一个 tick 仍可应用。大小的下限由当前工作形态决定（每个被持有的任务保住自己的工作 worker，留一个空闲 worker 接下一次认领，有 `ready` 工作时再多留一个），并且只要还有可做的事就绝不降到 1 以下 —— 停掉整个池子是 `/swarm off` 或排空路径的事，不是 scaler 的事。
+- 计划本身会说出它认为需要的大小：`swarm_plan` 会报告**峰值并行度**（新建的任务里能同时跑几个）和一个**建议的 agent 数量**，连同上限一起给出，所以「N 猜对了吗」在任何人开始干活之前就有答案。
+
+代价：把池子撑大是真的开新会话、花真实的 token，所以上限是限制，不是目标。改尺寸是限速的，不是即时的 —— 两次改尺寸之间至少隔 30 秒，请求 60 秒后过期 —— 所以错的 `N` 会在一两个 tick 内被纠正，但绝不会越过 `config.workers`。
+
 ## 工具（worker 与主会话都可用）
 
 | 工具 | 用途 |
@@ -275,6 +295,7 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_goal` | 开一个目标的规划轮：你只选它需要多少个 agent（`agents`），永远不写任务清单 —— 拆分由 worker 自己做 |
 | `swarm_propose` | 把你**自己**的拆分发布到一个 open 目标上（打 `proposal` 标签、限定在该目标下），交给 scribe 合并 |
 | `swarm_plan` | scribe 的合并：先认领目标的规划任务，然后由它把这一轮去重成真正的任务图、发布 DECISION 并把目标标记为 planned |
+| `swarm_scale` | 请求改变池子大小（`agents`、`reason`）—— 仅供建议并留痕；controller 会把它钳制到 `config.workers`，在下一个 tick 应用，并且只会停掉空闲的同伴 |
 | `swarm_task_retry` | 复活 `failed`/`blocked` 任务（全新尝试、清空认领），以便其依赖项被提升；当它自身的依赖尚未解决时保持 `blocked` |
 | `swarm_integrate` | 创建一个需要 `integrator` 能力的集成任务 |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
@@ -312,7 +333,7 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 262 unit tests in the 11 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 312 unit tests in the 14 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

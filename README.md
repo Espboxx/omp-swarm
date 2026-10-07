@@ -58,9 +58,10 @@ extension/
   index.ts     extension entry: tool registration, /swarm commands, status panel, lazy runtimes
   auto.ts      multi-agent mode: roster derivation (incl. the goal budget), mid-run growth + the auto-assemble/self-stop state machine + the planning round's bound
   driver.ts    worker lifecycle: spawn sessions, add workers to a running pool, tick, heartbeat, wake, worktrees, shutdown
-  tools.ts     the 22 agent tools (shared by workers and the main session)
+  tools.ts     the 23 agent tools (shared by workers and the main session)
   store.ts     the reliability core: atomic claim, lease, review, reservations, board, messages, goals and the scribe's merge
   planning.ts  the planning round's pure rules: proposal parsing, the dedupe key, the merge and the creation order
+  scaling.ts   the pool-size rule: collapsing the agents' asks into one resize, the ceiling clamp, the shrink floor and who may be stopped
   db.ts        SQLite schema, WAL setup, typed facade over bun:sqlite
   config.ts    `.swarm/config.json` loading + role expansion
   render.ts    text rendering for the panel, task table, summary, task progress and the batch-completion summary
@@ -70,10 +71,11 @@ extension/
   types.ts     domain types
 tests/
   unit/store.test.ts           37 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations and messaging
-  unit/auto.test.ts            38 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
-  unit/planning.test.ts        17 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
-  unit/goals.test.ts           11 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
-  unit/goal-tools.test.ts       7 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
+  unit/auto.test.ts            44 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/planning.test.ts        21 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/scaling.test.ts         14 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
+  unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
+  unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -414,6 +416,45 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 # → setStatus statusText=MULTI-AGENT ON · idle after "on"; no MULTI-AGENT frame after "off"
 ```
 
+### Pool size: the coordinator's `N` is only a starting budget
+
+The agent count you give `swarm_goal` sizes the pool at the start; nothing is frozen there. The plan's
+own growth path above raises it as `ready` work appears, so a goal that under-counted the work is
+corrected while it runs instead of running the whole batch with too few peers.
+
+Any agent can also ask for a size, and an ask is the only other way the pool grows:
+
+```
+swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
+```
+
+- **Advisory and auditable**, never a direct spawn. The request is recorded with who asked, why, the
+  size before and what happened, and it is posted on the board as an `OBSERVATION` tagged `scale`. The
+  answer says which of four things occurred: `accepted`, `clamped` (the ask was above the ceiling),
+  `raised to N` (the live work shape keeps a floor), or `recorded, but the pool is already N`.
+- The **controller is the single writer** of the pool size, and it reconciles on the tick that already
+  runs (every 2 s). Several agents sensing the same shortage inside one 60 s window collapse into ONE
+  resize: the decision is recomputed from scratch on every tick and the largest ask wins, so N agents
+  asking for one more is one more — never N more. An ask older than 60 s is dropped as stale rather
+  than applied minutes after the shape that motivated it is gone.
+- `config.workers` is the **operator's ceiling**, enforced where the resize happens rather than by
+  convention: a larger ask is applied clamped, and the answer says so. No agent can spend past the
+  budget the operator set, whatever it asks for.
+- The pool now **shrinks** as well, which it never used to. A shrink stops only workers holding
+  **nothing** — no claim, no review lease, no file reservation, and not mid-turn. Anything else defers
+  the shrink, and the deferred ask stays pending so a later tick still applies it. Sizing is floored by
+  the live work shape (every held task keeps a worker, one worker stays free for the next claim, one
+  more while `ready` work exists) and never drops below 1 while anything is actionable — stopping the
+  whole pool is `/swarm off` or the drain path, not the scaler.
+- The plan states the size it believes the work needs: `swarm_plan` reports the **peak parallelism**
+  (how many of the created tasks can run at once) and a **recommended agent count**, with the ceiling,
+  so "was `N` right?" has an answer before anyone starts working.
+
+What it costs: growing the pool spawns real sessions and spends real tokens, so the ceiling is a limit
+rather than a target. A resize is rate-limited instead of instant — two resizes are at least 30 s
+apart and an ask expires after 60 s — so a wrong `N` is corrected within a tick or two, and never
+beyond `config.workers`.
+
 ## Tools (available to workers and to the main session)
 
 | Tool | Purpose |
@@ -429,6 +470,7 @@ bun run rpc:dump -- --ui --installed --command "/swarm on" --command "/swarm off
 | `swarm_goal` | open a goal's planning round: you choose only HOW MANY agents it needs (`agents`), never the task list — the workers split it themselves |
 | `swarm_propose` | post YOUR OWN split of an open goal onto the board (tagged `proposal`, scoped to the goal) for the scribe to merge |
 | `swarm_plan` | the scribe's merge: claim the goal's planning task first, then this dedupes the round into the real task graph, posts the DECISION and marks the goal planned |
+| `swarm_scale` | ask for a different pool size (`agents`, `reason`) — advisory and auditable; the controller clamps it to `config.workers`, applies it on its next tick and only ever stops idle peers |
 | `swarm_task_retry` | revive a `failed`/`blocked` task (fresh attempt, cleared claim) so its dependents can be promoted; stays `blocked` while its own dependencies are unresolved |
 | `swarm_integrate` | create an integration task requiring the `integrator` capability |
 | `board_post` | FACT / FAIL / OBSERVATION / CLAIM / RESULT / QUESTION / REVIEW / DECISION |
@@ -488,7 +530,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 262 unit tests in the 11 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
+bun run test                   # 312 unit tests in the 14 tracked files under tests/unit (incl. a 3-process claim race and a 3-process scribe race)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
