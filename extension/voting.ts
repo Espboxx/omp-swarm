@@ -45,10 +45,9 @@
  * failed / pending, with what tally" for a given roster and ballot set, and the caller owns the event,
  * the board entry and the wake-up.
  */
-import type { SwarmAgent } from "./types";
+import type { DecisionKind, SwarmAgent } from "./types";
 
-/** The pool-internal decisions that need a round. Anything else is a seed (rule 2). */
-export type DecisionKind = "create-task" | "close-task" | "spawn" | "stop" | "scale";
+export type { DecisionKind };
 
 export interface VotingConfig {
 	/** The yes share a decision must STRICTLY beat. 0.75 by default; 1 reads as unanimity (rule 5). */

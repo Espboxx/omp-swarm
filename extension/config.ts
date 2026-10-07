@@ -41,6 +41,15 @@ export function loadSwarmConfig(configFile: string): SwarmConfig {
 		auto: typeof raw.auto === "boolean" ? raw.auto : DEFAULT_CONFIG.auto,
 		planning: raw.planning === "coordinator" ? "coordinator" : DEFAULT_CONFIG.planning,
 		worktrees: typeof raw.worktrees === "boolean" ? raw.worktrees : DEFAULT_CONFIG.worktrees,
+		voteEnabled: typeof raw.voteEnabled === "boolean" ? raw.voteEnabled : DEFAULT_CONFIG.voteEnabled,
+		voteThreshold:
+			typeof raw.voteThreshold === "number" && raw.voteThreshold > 0 ? raw.voteThreshold : DEFAULT_CONFIG.voteThreshold,
+		voteMinBase:
+			typeof raw.voteMinBase === "number" && raw.voteMinBase > 0 ? Math.floor(raw.voteMinBase) : DEFAULT_CONFIG.voteMinBase,
+		voteTimeoutSeconds:
+			typeof raw.voteTimeoutSeconds === "number" && raw.voteTimeoutSeconds > 0
+				? Math.floor(raw.voteTimeoutSeconds)
+				: DEFAULT_CONFIG.voteTimeoutSeconds,
 		model: typeof raw.model === "string" ? raw.model : undefined,
 		thinkingLevel: typeof raw.thinkingLevel === "string" ? raw.thinkingLevel : undefined,
 		roles: roles.length > 0 ? roles : DEFAULT_CONFIG.roles,

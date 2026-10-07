@@ -183,7 +183,9 @@ describe("swarm_plan", () => {
 describe("swarm_scale", () => {
 	test("records the ask with its author and reason and reports the clamp, leaving the resize to the controller", async () => {
 		const store = makeStore();
-		const { call, names } = workerTools(store, "w1", { workers: 4 });
+		// The cluster-level vote gate is pinned in vote-store.test.ts; these cases are about the request
+		// itself, so they run with the operator's constraint off.
+		const { call, names } = workerTools(store, "w1", { workers: 4, voteEnabled: false });
 		expect(names).toContain("swarm_scale");
 		store.registerAgent({ id: "w1", role: "general", capabilities: ["general"] });
 		store.registerAgent({ id: "w2", role: "general", capabilities: ["general"] });
@@ -206,7 +208,7 @@ describe("swarm_scale", () => {
 
 	test("refuses an empty reason and an unusable count, and never silently", async () => {
 		const store = makeStore();
-		const { call } = workerTools(store, "w1");
+		const { call } = workerTools(store, "w1", { voteEnabled: false });
 		expect(await call("swarm_scale", { agents: 3, reason: "   " })).toContain("needs a reason");
 		expect(await call("swarm_scale", { agents: 0, reason: "shrink to nothing" })).toContain("at least 1");
 		expect(store.pendingScaleRequests()).toEqual([]);

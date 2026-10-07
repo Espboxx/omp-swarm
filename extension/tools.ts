@@ -5,7 +5,8 @@ import type * as zod from "@oh-my-pi/omptype/zod";
 import { renderAgents, renderBoard, renderInbox, renderTaskDetail, renderTasks } from "./render";
 import { poolFloor } from "./scaling";
 import { patternsConflict, type SwarmStore } from "./store";
-import type { BoardType, SwarmConfig, SwarmMessage, SwarmTask, TaskStatus } from "./types";
+import type { BoardType, DecisionKind, SwarmConfig, SwarmMessage, SwarmTask, SwarmVote, TaskStatus } from "./types";
+import { resolveVotingConfig, type VoteOutcome, type VotingConfig } from "./voting";
 
 export interface SwarmIdentity {
 	id: string;
@@ -298,16 +299,21 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
-	const failSchema = z.object({ task_id: z.string(), reason: z.string() });
+	const failSchema = z.object({ task_id: z.string(), reason: z.string(), vote_id: z.string().optional() });
 	const failTool: CustomTool<typeof failSchema> = {
 		name: "swarm_fail",
 		label: "Fail Task",
 		description:
-			"Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end. Also closes a task you do NOT hold, in two cases, since the pool has no delete or archive: (1) a dependency of it can never reach done (a `failed`/missing/cyclic dependency) — permanently-blocked residue; (2) it is `ready` or `blocked` with every dependency satisfied but NO online agent holds the capabilities it declares, and it has sat that way for at least ten minutes — a row nothing could claim would otherwise keep the batch from ever draining. A row any online agent could still claim is refused exactly as before.",
+			"Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end. Closing a task you do NOT hold is a CLUSTER-LEVEL decision: when the swarm has voting on it needs a passed `close-task` round (`vote_id`), because two cases exist and both close someone else's row, since the pool has no delete or archive: (1) a dependency of it can never reach done (a `failed`/missing/cyclic dependency) — permanently-blocked residue; (2) it is `ready` or `blocked` with every dependency satisfied but NO online agent holds the capabilities it declares, and it has sat that way for at least ten minutes — a row nothing could claim would otherwise keep the batch from ever draining. A row any online agent could still claim is refused exactly as before.",
 		parameters: failSchema,
 		approval: "write",
 		async execute(_id, params) {
 			touch();
+			const target = store.getTask(params.task_id);
+			if (target !== undefined && target.claimedBy !== identity.id) {
+				const refusal = voteGate("close-task", params.vote_id);
+				if (refusal !== undefined) return err(refusal, { failed: false, gated: true });
+			}
 			// The unroutable close needs the window the config owns; the store never reads policy itself.
 			const result = store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
 			onChange?.();
@@ -325,16 +331,19 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		required_capabilities: z.array(z.string()).optional(),
 		files: z.array(z.string()).optional(),
 		review_required: z.boolean().optional(),
+		vote_id: z.string().optional(),
 	});
 	const createTool: CustomTool<typeof createSchema> = {
 		name: "swarm_task_create",
 		label: "Create Task",
 		description:
-			"Add work to the shared pool. Use it to split an oversized task, or to record a dependency you discovered. Tasks with unfinished dependencies start blocked.",
+			"Add work to the shared pool. Use it to split an oversized task, or to record a dependency you discovered. Tasks with unfinished dependencies start blocked. Creating a task is a CLUSTER-LEVEL decision: when the swarm has voting on, a regular agent must pass a vote first (swarm_vote with kind `create-task` — the round creates the task itself when it passes, so a passed round usually means you do not need this call at all; `vote_id` is for acting on a round someone else passed). The coordinator's own goal round and an operator instruction are seeds and never vote.",
 		parameters: createSchema,
 		approval: "write",
 		async execute(_id, params) {
 			touch();
+			const refusal = voteGate("create-task", params.vote_id);
+			if (refusal !== undefined) return err(refusal, { created: false, gated: true });
 			let task: SwarmTask;
 			try {
 				task = store.createTask({
@@ -482,16 +491,18 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
-	const scaleSchema = z.object({ agents: z.number(), reason: z.string() });
+	const scaleSchema = z.object({ agents: z.number(), reason: z.string(), vote_id: z.string().optional() });
 	const scaleTool: CustomTool<typeof scaleSchema> = {
 		name: "swarm_scale",
 		label: "Request Pool Size",
 		description:
-			"Ask for a different pool size when the task graph needs more or fewer peers than the pool has: `agents` is the size you want and `reason` is why (recorded verbatim). It is ADVISORY and auditable, never a direct spawn — the controller is the only writer and applies it on its next tick (~2 s); several agents asking at once collapse to ONE resize (the largest ask). config.workers is the operator's ceiling: a larger ask is clamped and reported, never refused silently, and workers holding work are never stopped (a shrink stops idle peers only).",
+			"Ask for a different pool size when the task graph needs more or fewer peers than the pool has: `agents` is the size you want and `reason` is why (recorded verbatim). Resizing the pool is a CLUSTER-LEVEL decision: when the swarm has voting on, a regular agent must pass a `scale` round first (`swarm_vote` with kind `scale`, then re-issue with `vote_id`) — the coordinator's own resize is a seed. It is ADVISORY and auditable, never a direct spawn — the controller is the only writer and applies it on its next tick (~2 s); several agents asking at once collapse to ONE resize (the largest ask). config.workers is the operator's ceiling: a larger ask is clamped and reported, never refused silently, and workers holding work are never stopped (a shrink stops idle peers only).",
 		parameters: scaleSchema,
 		approval: "write",
 		async execute(_id, params) {
 			touch();
+			const refusal = voteGate("scale", params.vote_id);
+			if (refusal !== undefined) return err(refusal, { recorded: false, gated: true });
 			const reason = params.reason.trim();
 			if (reason === "") return err("a scale request needs a reason: it is recorded verbatim for the audit trail", { recorded: false });
 			const requested = Number.isFinite(params.agents) ? Math.floor(params.agents) : 0;
@@ -778,6 +789,138 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
+	/**
+	 * The operator's voting policy, with an optional agent request TIGHTENED onto it (rule 6): a caller
+	 * may raise the threshold, never lower it, so no request can talk the pool below the operator's line.
+	 */
+	function votePolicyFor(requestedThreshold?: number): VotingConfig {
+		return resolveVotingConfig(
+			{ threshold: requestedThreshold },
+			{ threshold: config.voteThreshold, minBase: config.voteMinBase, timeoutMs: config.voteTimeoutSeconds * 1000 },
+		);
+	}
+
+	/**
+	 * The gate every cluster-level decision point passes through (goal-8). `undefined` means "the caller
+	 * may act": with voting off, or for the coordinator's own seed, or against a PASSED round of the
+	 * matching kind. Anything else gets the refusal text — which names the arithmetic, so the caller can
+	 * see exactly why and what to do instead of guessing.
+	 */
+	function voteGate(kind: DecisionKind, voteId: string | undefined): string | undefined {
+		if (!config.voteEnabled || identity.isMain) return undefined;
+		if (store.passedVote(kind, voteId) !== undefined) return undefined;
+		return [
+			`this is a cluster-level decision (${kind}): the pool must pass a vote first.`,
+			`open one with swarm_vote({ kind: "${kind}", question: "...", payload_json: "..." }) and let the eligible agents ballot it (swarm_vote({ decision_id, approve })).`,
+			`a round needs strictly more than ${config.voteThreshold} of the eligible base — at least ${config.voteMinBase} voters — within ${config.voteTimeoutSeconds}s.`,
+			kind === "create-task"
+				? "a passed create-task round creates the task itself, so you usually do not need this call at all."
+				: "then re-issue this call with vote_id set to the PASSED round.",
+			"short of that the round is denied at its bound with vote_failed and the full tally, and NOTHING is executed.",
+		].join(" ");
+	}
+
+	/** One round as the caller reads it: the arithmetic first, then who is missing. */
+	function renderVote(vote: SwarmVote, outcome: VoteOutcome): string {
+		const list = (ids: string[]) => (ids.length === 0 ? "-" : ids.join(", "));
+		return [
+			`${vote.id} (${vote.kind}) ${vote.status}: ${vote.question}`,
+			outcome.reason,
+			`eligible ${outcome.base} [${list(outcome.eligible)}]; for ${outcome.approvals.length} [${list(outcome.approvals)}]; against ${outcome.rejections.length} [${list(outcome.rejections)}]; absent ${outcome.absent.length} [${list(outcome.absent)}]`,
+			`needs ${outcome.needed} of ${outcome.base} at >${vote.threshold}${outcome.ignored.length > 0 ? `; ignored ${list(outcome.ignored.map((ballot) => ballot.voter))}` : ""}`,
+		].join("\n");
+	}
+
+	const VOTE_KINDS: Record<DecisionKind, true> = {
+		"create-task": true,
+		"close-task": true,
+		spawn: true,
+		stop: true,
+		scale: true,
+	};
+
+	const voteSchema = z.object({
+		kind: z.string().optional(),
+		question: z.string().optional(),
+		payload_json: z.string().optional(),
+		decision_id: z.string().optional(),
+		approve: z.boolean().optional(),
+		threshold: z.number().optional(),
+	});
+	const voteTool: CustomTool<typeof voteSchema> = {
+		name: "swarm_vote",
+		label: "Vote",
+		description:
+			"A cluster-level decision (create-task / close-task / spawn / stop / scale) is VOTED ON, not assumed. Open a round with `kind` + `question` (plus `payload_json` for create-task, in swarm_task_create's own field names); read one with `decision_id` alone; cast a ballot with `decision_id` + `approve`. The decision executes only if the yes share is STRICTLY above the threshold — 3 of 4 (exactly 75%) does not pass. The deadline DENIES by default: at its bound the not-yet-voted count as absent and `vote_failed` goes to the events AND the board with the full tally (for / against / absent), never a silent failure and never an infinite retry. One agent, one ballot (a repeat is refused); an offline agent drops out of the base instead of vetoing. The coordinator's own goal and an operator instruction are seeds and never vote. `threshold` is optional and can only RAISE the operator's threshold.",
+		parameters: voteSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const offlineAfterSeconds = config.offlineAfterSeconds;
+			if (params.decision_id !== undefined) {
+				if (params.approve === undefined) {
+					const tally = store.tallyVote(params.decision_id, offlineAfterSeconds);
+					if (tally === undefined) return err(`unknown vote ${params.decision_id}`, { found: false });
+					return ok(renderVote(tally.vote, tally.outcome), { vote: tally.vote.id, status: tally.vote.status, settled: tally.outcome.settled });
+				}
+				const cast = store.castBallot(params.decision_id, identity.id, params.approve);
+				if (!cast.ok) return err(`ballot refused: ${cast.reason}`, { cast: false });
+				const settled = store.settleVote(params.decision_id, offlineAfterSeconds);
+				if (settled === undefined) return err(`${params.decision_id} vanished while settling`, { cast: true });
+				onChange?.();
+				return ok(
+					[
+						`${identity.id} voted ${params.approve ? "FOR" : "AGAINST"} ${settled.vote.id}${settled.outcome.settled ? " (round settled)" : ""}`,
+						renderVote(settled.vote, settled.outcome),
+						settled.vote.result === undefined ? "" : `result: ${settled.vote.result}`,
+					].join("\n"),
+					{ vote: settled.vote.id, status: settled.vote.status, settled: settled.outcome.settled, cast: true },
+				);
+			}
+			const kind = params.kind ?? "";
+			if (!(kind in VOTE_KINDS)) return err(`opening a round needs a kind: one of ${Object.keys(VOTE_KINDS).join(", ")}`, { opened: false });
+			const question = (params.question ?? "").trim();
+			if (question === "") return err("opening a round needs the question: one line saying what is being decided", { opened: false });
+			let payload: Record<string, unknown> = {};
+			if (params.payload_json !== undefined) {
+				try {
+					payload = JSON.parse(params.payload_json) as Record<string, unknown>;
+				} catch (error) {
+					return err(`payload_json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`, { opened: false });
+				}
+			}
+			// The coordinator's own round is a seed (rule 2): it executes without a ballot, which is what
+			// stops the cold start from deadlocking on a pool that does not exist yet.
+			const seed = identity.isMain;
+			const vote = store.openVote({
+				kind: kind as DecisionKind,
+				question,
+				payload,
+				openedBy: identity.id,
+				policy: votePolicyFor(params.threshold),
+				seed,
+			});
+			onChange?.();
+			if (seed) {
+				const executed = store.executeSeededVote(vote.id);
+				if (executed === undefined) return err(`seed ${vote.id} vanished`, { opened: true, seeded: true });
+				return ok(`seeded ${executed.id} (${executed.kind}): no ballot — the coordinator's own decision.\n${executed.result ?? ""}`, {
+					vote: executed.id,
+					status: executed.status,
+					seeded: true,
+				});
+			}
+			return ok(
+				[
+					`opened ${vote.id} (${vote.kind}): ${vote.question}`,
+					`needs strictly more than ${vote.threshold} of the eligible base, at least ${vote.minBase} voters, within ${config.voteTimeoutSeconds}s — denied by default at the bound.`,
+					`ballot it with swarm_vote({ decision_id: "${vote.id}", approve: true | false })${vote.kind === "create-task" ? "; a passed round creates the task itself" : ""}.`,
+				].join("\n"),
+				{ vote: vote.id, status: vote.status, opened: true },
+			);
+		},
+	};
+
 	const tools: CustomTool[] = [
 		statusTool,
 		tasksTool,
@@ -790,6 +933,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		goalTool,
 		proposeTool,
 		planTool,
+		voteTool,
 		scaleTool,
 		retryTool,
 		integrateTool,
@@ -818,6 +962,7 @@ export const SWARM_TOOL_NAMES = [
 	"swarm_goal",
 	"swarm_propose",
 	"swarm_plan",
+	"swarm_vote",
 	"swarm_scale",
 	"swarm_task_retry",
 	"swarm_integrate",

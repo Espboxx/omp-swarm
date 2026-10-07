@@ -22,6 +22,7 @@ import type {
 	BlackboardEntry,
 	BoardType,
 	ClaimResult,
+	DecisionKind,
 	GoalStatus,
 	MergeFold,
 	PlanResult,
@@ -31,9 +32,12 @@ import type {
 	SwarmGoal,
 	SwarmMessage,
 	SwarmTask,
+	SwarmVote,
 	TaskCounts,
 	TaskStatus,
+	VoteState,
 } from "./types";
+import { decide, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
 
 interface TaskRow {
 	id: string;
@@ -71,6 +75,21 @@ interface AgentRow {
 	pid: number | null;
 	joined_at: number;
 	heartbeat_at: number;
+}
+
+interface VoteRow {
+	id: string;
+	kind: DecisionKind;
+	question: string;
+	payload: string;
+	opened_by: string;
+	opened_at: number;
+	deadline_at: number;
+	threshold: number;
+	min_base: number;
+	status: VoteState;
+	result: string | null;
+	updated_at: number;
 }
 
 interface BoardRow {
@@ -713,8 +732,13 @@ export class SwarmStore {
 		return promoted;
 	}
 
-	/** Housekeeping: expire leases, stale reservations, stale agents, promote unblocked work. */
-	sweep(offlineAfterSeconds = 60): { reclaimed: string[]; promoted: string[] } {
+	/**
+	 * Housekeeping: expire leases, stale reservations, stale agents, promote unblocked work, and settle
+	 * every vote round whose bound has passed. Vote settlement rides THIS clock on purpose: the beat
+	 * already pays for the sweep every `heartbeatSeconds`, so a timed-out decision is denied with no extra
+	 * wake, no poll and no model call (goal-8 rule 3).
+	 */
+	sweep(offlineAfterSeconds = 60): { reclaimed: string[]; promoted: string[]; settledVotes: string[] } {
 		const now = Date.now();
 		const result = this.#db.transaction(() => {
 			const reclaimed = this.#reclaimExpiredLocked(now);
@@ -723,7 +747,8 @@ export class SwarmStore {
 			return { reclaimed, promoted };
 		});
 		this.markStaleAgentsOffline(offlineAfterSeconds);
-		return result;
+		const settledVotes = this.settleVotes(offlineAfterSeconds, now).map((vote) => vote.id);
+		return { ...result, settledVotes };
 	}
 
 	/**
@@ -1291,6 +1316,243 @@ export class SwarmStore {
 		return changed.changes;
 	}
 
+	// ----------------------------------------------------------------- votes
+
+	/**
+	 * Open a round (goal-8). The operator's policy is FROZEN onto the row, so the arithmetic a decision is
+	 * judged by cannot move under it and a later config change can never flip a settled round. A `seed` —
+	 * the coordinator's own goal, or an operator instruction — is terminal at once: it never voted
+	 * (rule 2), which is what keeps the first task from needing a pool that does not exist yet.
+	 */
+	openVote(input: {
+		kind: DecisionKind;
+		question: string;
+		payload?: Record<string, unknown>;
+		openedBy: string;
+		/** The policy in force. A caller may only tighten it, via `resolveVotingConfig` (rule 6). */
+		policy: VotingConfig;
+		seed?: boolean;
+	}): SwarmVote {
+		return this.#db.transaction(() => {
+			const now = Date.now();
+			const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM votes");
+			const id = `vote-${next?.n ?? 1}`;
+			this.#db.run(
+				`INSERT INTO votes (id, kind, question, payload, opened_by, opened_at, deadline_at, threshold, min_base, status, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				id,
+				input.kind,
+				input.question,
+				JSON.stringify(input.payload ?? {}),
+				input.openedBy,
+				now,
+				now + input.policy.timeoutMs,
+				input.policy.threshold,
+				input.policy.minBase,
+				input.seed === true ? "seeded" : "open",
+				now,
+			);
+			this.#log("vote.open", input.openedBy, undefined, {
+				vote: id,
+				kind: input.kind,
+				question: input.question,
+				threshold: input.policy.threshold,
+				minBase: input.policy.minBase,
+				timeoutMs: input.policy.timeoutMs,
+				seeded: input.seed === true,
+			});
+			return this.getVote(id) as SwarmVote;
+		});
+	}
+
+	getVote(id: string): SwarmVote | undefined {
+		const row = this.#db.get<VoteRow>("SELECT * FROM votes WHERE id=?", id);
+		return row === null ? undefined : this.#toVote(row);
+	}
+
+	listVotes(filter: { status?: VoteState; limit?: number } = {}): SwarmVote[] {
+		const limit = Math.max(1, Math.min(filter.limit ?? 50, 500));
+		const rows =
+			filter.status === undefined
+				? this.#db.all<VoteRow>("SELECT * FROM votes ORDER BY opened_at DESC LIMIT ?", limit)
+				: this.#db.all<VoteRow>("SELECT * FROM votes WHERE status=? ORDER BY opened_at DESC LIMIT ?", filter.status, limit);
+		return rows.map((row) => this.#toVote(row));
+	}
+
+	#toVote(row: VoteRow): SwarmVote {
+		return {
+			id: row.id,
+			kind: row.kind,
+			question: row.question,
+			payload: JSON.parse(row.payload) as Record<string, unknown>,
+			openedBy: row.opened_by,
+			openedAt: row.opened_at,
+			deadlineAt: row.deadline_at,
+			threshold: row.threshold,
+			minBase: row.min_base,
+			status: row.status,
+			result: row.result ?? undefined,
+			updatedAt: row.updated_at,
+		};
+	}
+
+	/** The ballots cast on a round, oldest first, exactly as `decide()` wants them. */
+	ballots(decisionId: string): Vote[] {
+		return this.#db
+			.all<{ voter: string; approve: number; created_at: number }>(
+				"SELECT voter, approve, created_at FROM vote_ballots WHERE decision_id=? ORDER BY created_at, voter",
+				decisionId,
+			)
+			.map((row) => ({ voter: row.voter, approve: row.approve === 1, at: row.created_at }));
+	}
+
+	/**
+	 * Cast one ballot. One agent, one ballot is the table's primary key, so a repeat is neither a second
+	 * vote nor an exception: it is reported and ignored (rule 4).
+	 */
+	castBallot(decisionId: string, voter: string, approve: boolean): { ok: boolean; reason?: string } {
+		return this.#db.transaction(() => {
+			const vote = this.getVote(decisionId);
+			if (vote === undefined) return { ok: false, reason: `unknown vote ${decisionId}` };
+			if (vote.status !== "open") return { ok: false, reason: `${decisionId} is already ${vote.status}` };
+			const inserted = this.#db.run(
+				"INSERT OR IGNORE INTO vote_ballots (decision_id, voter, approve, created_at) VALUES (?, ?, ?, ?)",
+				decisionId,
+				voter,
+				approve ? 1 : 0,
+				Date.now(),
+			);
+			if (inserted.changes !== 1) return { ok: false, reason: `${voter} already voted on ${decisionId}: one agent, one ballot` };
+			this.#log("vote.ballot", voter, undefined, { vote: decisionId, kind: vote.kind, approve });
+			return { ok: true };
+		});
+	}
+
+	/**
+	 * Tally a round against the policy frozen on its own row, using the SAME pure rule the unit tests pin
+	 * (extension/voting.ts): the store cannot drift from the arithmetic, and an offline voter drops out of
+	 * the base instead of vetoing forever.
+	 */
+	tallyVote(decisionId: string, offlineAfterSeconds: number, now = Date.now()): { vote: SwarmVote; outcome: VoteOutcome } | undefined {
+		const vote = this.getVote(decisionId);
+		if (vote === undefined) return undefined;
+		const outcome = decide({
+			decision: {
+				id: vote.id,
+				kind: vote.kind,
+				question: vote.question,
+				openedBy: vote.openedBy,
+				openedAt: vote.openedAt,
+				seed: vote.status === "seeded",
+			},
+			votes: this.ballots(decisionId),
+			agents: this.listAgents(),
+			now,
+			offlineAfterMs: offlineAfterSeconds * 1000,
+			policy: { threshold: vote.threshold, minBase: vote.minBase, timeoutMs: vote.deadlineAt - vote.openedAt },
+		});
+		return { vote, outcome };
+	}
+
+	/**
+	 * Settle every open round whose outcome is already terminal — the bound expired, the base shrank past
+	 * the approvals, or the last ballot decided it. Called from `sweep()`, which the driver's beat already
+	 * runs every `heartbeatSeconds`, so a timed-out round is denied ON A SCHEDULE THE POOL ALREADY PAYS
+	 * FOR: no extra wake, no poll, no model call (rule 3).
+	 */
+	settleVotes(offlineAfterSeconds: number, now = Date.now()): SwarmVote[] {
+		const settled: SwarmVote[] = [];
+		for (const row of this.#db.all<{ id: string }>("SELECT id FROM votes WHERE status='open' ORDER BY opened_at")) {
+			const tally = this.tallyVote(row.id, offlineAfterSeconds, now);
+			if (tally === undefined || !tally.outcome.settled) continue;
+			const finished = this.#finishVote(tally.vote, tally.outcome, now);
+			if (finished !== undefined) settled.push(finished);
+		}
+		return settled;
+	}
+
+	/** Settle ONE round (the ballot path calls this) and execute it when it passed. */
+	settleVote(decisionId: string, offlineAfterSeconds: number, now = Date.now()): { vote: SwarmVote; outcome: VoteOutcome } | undefined {
+		const tally = this.tallyVote(decisionId, offlineAfterSeconds, now);
+		if (tally === undefined || !tally.outcome.settled) return tally;
+		const finished = this.#finishVote(tally.vote, tally.outcome, now);
+		return finished === undefined ? undefined : { vote: finished, outcome: tally.outcome };
+	}
+
+	/**
+	 * The ONE place a decision becomes action. `create-task` is the only kind with an executor here: the
+	 * others are performed by their own path once it sees a passed round (`close-task` -> `fail`, `scale`
+	 * -> the controller), so a passed round can never silently execute something nobody asked for. A failed
+	 * round is NEVER silent (rule 3): the tally (for / against / absent) goes to the events, the board and
+	 * the opener's inbox — the inbox entry is also what wakes the opener.
+	 */
+	#finishVote(vote: SwarmVote, outcome: VoteOutcome, now: number): SwarmVote | undefined {
+		if (vote.status !== "open") return undefined;
+		const passed = outcome.status === "passed";
+		const tally = `for ${outcome.approvals.length}/${outcome.base} [${outcome.approvals.join(", ") || "-"}]; against ${outcome.rejections.length} [${outcome.rejections.join(", ") || "-"}]; absent ${outcome.absent.length} [${outcome.absent.join(", ") || "-"}]`;
+		let status: VoteState = passed ? "passed" : "failed";
+		let result = outcome.reason;
+		if (passed && vote.kind === "create-task") {
+			try {
+				// The payload was written by the vote tool in CreateTaskInput's own shape; a malformed one
+				// fails the decision rather than creating a half-row.
+				const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
+				result = `${outcome.reason}; executed: created ${task.id}`;
+			} catch (error) {
+				status = "failed";
+				result = `${outcome.reason}; execution failed: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
+		const changed = this.#db.run("UPDATE votes SET status=?, result=?, updated_at=? WHERE id=? AND status='open'", status, result, now, vote.id);
+		if (changed.changes !== 1) return undefined;
+		this.#log(status === "passed" ? "vote.passed" : "vote.failed", vote.openedBy, undefined, {
+			vote: vote.id,
+			kind: vote.kind,
+			question: vote.question,
+			for: outcome.approvals,
+			against: outcome.rejections,
+			absent: outcome.absent,
+			reason: outcome.reason,
+		});
+		const headline = `${status === "passed" ? "vote_passed" : "vote_failed"} ${vote.id} (${vote.kind}): ${vote.question}`;
+		this.postBoard({
+			type: status === "passed" ? "DECISION" : "FAIL",
+			agentId: vote.openedBy,
+			content: `${headline}\n${result}\ntally: ${tally}`,
+			tags: status === "passed" ? ["vote_passed", "decision"] : ["vote_failed", "failure"],
+		});
+		this.sendMessage({ to: vote.openedBy, from: "main", body: `${headline}\n${result}\ntally: ${tally}` });
+		return this.getVote(vote.id);
+	}
+
+	/**
+	 * Run a SEEDED round's decision (rule 2): the coordinator's own goal or an operator instruction
+	 * executes without a ballot, and this records what it executed so the audit row is not silent either.
+	 * Only `create-task` has an executor here; the other kinds act inside their own path.
+	 */
+	executeSeededVote(decisionId: string): SwarmVote | undefined {
+		const vote = this.getVote(decisionId);
+		if (vote === undefined || vote.status !== "seeded") return undefined;
+		if (vote.kind !== "create-task") return vote;
+		try {
+			const task = this.#createTaskLocked({ ...(vote.payload as unknown as CreateTaskInput), createdBy: vote.openedBy });
+			this.#db.run("UPDATE votes SET result=?, updated_at=? WHERE id=?", `seeded: created ${task.id}`, Date.now(), vote.id);
+			this.#log("vote.executed", vote.openedBy, undefined, { vote: vote.id, kind: vote.kind, task: task.id, seeded: true });
+		} catch (error) {
+			const reason = `seeded execution failed: ${error instanceof Error ? error.message : String(error)}`;
+			this.#db.run("UPDATE votes SET status='failed', result=?, updated_at=? WHERE id=?", reason, Date.now(), vote.id);
+			this.#log("vote.failed", vote.openedBy, undefined, { vote: vote.id, kind: vote.kind, reason, seeded: true });
+		}
+		return this.getVote(vote.id);
+	}
+
+	/** The passed round of `kind` a gated decision point may act on, or undefined. The gate's whole test. */
+	passedVote(kind: DecisionKind, voteId: string | undefined): SwarmVote | undefined {
+		if (voteId === undefined) return undefined;
+		const vote = this.getVote(voteId);
+		return vote !== undefined && vote.status === "passed" && vote.kind === kind ? vote : undefined;
+	}
+
 	// ---------------------------------------------------------------- review
 
 	/** Atomically take the review slot for a task in `review`. */
@@ -1540,6 +1802,27 @@ export class SwarmStore {
 	}
 
 	// --------------------------------------------------------------- events
+
+	/**
+	 * The events of one type, newest first, WITH their `data` — the audit reader `recentEvents` deliberately
+	 * is not (it feeds panels that only need labels). A vote's tally lives in its event, so the proof that
+	 * `vote_failed` publishes for/against/absent needs this one.
+	 */
+	eventsOfType(type: string, limit = 50): { id: number; agentId?: string; taskId?: string; data: Record<string, unknown>; createdAt: number }[] {
+		return this.#db
+			.all<{ id: number; agent_id: string | null; task_id: string | null; data: string; created_at: number }>(
+				"SELECT id, agent_id, task_id, data, created_at FROM events WHERE type=? ORDER BY id DESC LIMIT ?",
+				type,
+				limit,
+			)
+			.map((row) => ({
+				id: row.id,
+				agentId: row.agent_id ?? undefined,
+				taskId: row.task_id ?? undefined,
+				data: JSON.parse(row.data) as Record<string, unknown>,
+				createdAt: row.created_at,
+			}));
+	}
 
 	recentEvents(limit = 30): { id: number; type: string; agentId?: string; taskId?: string; createdAt: number }[] {
 		return this.#db

@@ -159,6 +159,30 @@ CREATE TABLE IF NOT EXISTS events (
   data       TEXT NOT NULL DEFAULT '{}',
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS votes (
+  id          TEXT PRIMARY KEY,
+  kind        TEXT NOT NULL,
+  question    TEXT NOT NULL,
+  payload     TEXT NOT NULL DEFAULT '{}',
+  opened_by   TEXT NOT NULL,
+  opened_at   INTEGER NOT NULL,
+  deadline_at INTEGER NOT NULL,
+  threshold   REAL NOT NULL,
+  min_base    INTEGER NOT NULL,
+  status      TEXT NOT NULL,
+  result      TEXT,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_votes_status ON votes(status, deadline_at);
+
+CREATE TABLE IF NOT EXISTS vote_ballots (
+  decision_id TEXT NOT NULL,
+  voter       TEXT NOT NULL,
+  approve     INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (decision_id, voter)
+);
 `;
 
 export interface OpenOptions {

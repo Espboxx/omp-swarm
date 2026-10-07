@@ -189,6 +189,40 @@ export interface RoleConfig {
 	capabilities?: string[];
 }
 
+/**
+ * The pool-internal decisions that need a vote (goal-8). `spawn`/`stop` are the controller's roster
+ * changes, so they are settled by the same store round the tools use.
+ */
+export type DecisionKind = "create-task" | "close-task" | "spawn" | "stop" | "scale";
+
+/** The round's terminal states. `seeded` is the cold-start authority: it never voted (see voting.ts). */
+export type VoteState = "open" | "passed" | "failed" | "seeded";
+
+/**
+ * One cluster-level decision put to the pool, with its own policy frozen at open time: the threshold
+ * and the minimum base are recorded on the row, so the arithmetic a round is judged by cannot move
+ * under it and a later policy change can never retroactively flip a decision.
+ */
+export interface SwarmVote {
+	id: string;
+	kind: DecisionKind;
+	/** What is being decided, in one line: the board and the events read from this. */
+	question: string;
+	/** What the decision acts on (e.g. the task fields for `create-task`). */
+	payload: Record<string, unknown>;
+	openedBy: string;
+	openedAt: number;
+	/** `openedAt + timeoutMs`: past this the round is denied by default. */
+	deadlineAt: number;
+	/** The policy in force when the round opened. */
+	threshold: number;
+	minBase: number;
+	status: VoteState;
+	/** What a passed round executed, when it executed something (e.g. the created task id). */
+	result?: string;
+	updatedAt: number;
+}
+
 export interface SwarmConfig {
 	workers: number;
 	leaseSeconds: number;
@@ -206,6 +240,17 @@ export interface SwarmConfig {
 	 */
 	planning: "swarm" | "coordinator";
 	worktrees: boolean;
+	/**
+	 * Cluster-level decisions (create-task, close-task, scale) need a PASSED vote before they act; the
+	 * operator can switch the constraint off here. The three numbers are the operator's POLICY and a
+	 * request can only make them stricter (extension/voting.ts, rule 6): `voteThreshold` is the yes share
+	 * a round must STRICTLY beat, `voteMinBase` is the smallest pool allowed to decide at all, and
+	 * `voteTimeoutSeconds` is the round's bound — past it the not-yet-voted are absent and the round fails.
+	 */
+	voteEnabled: boolean;
+	voteThreshold: number;
+	voteMinBase: number;
+	voteTimeoutSeconds: number;
 	model?: string;
 	thinkingLevel?: string;
 	roles: RoleConfig[];
@@ -222,6 +267,10 @@ export const DEFAULT_CONFIG: SwarmConfig = {
 	auto: false,
 	planning: "swarm",
 	worktrees: false,
+	voteEnabled: true,
+	voteThreshold: 0.75,
+	voteMinBase: 2,
+	voteTimeoutSeconds: 90,
 	roles: [{ name: "general", count: 4, capabilities: ["general"] }],
 	tools: ["read", "grep", "glob", "edit", "write", "bash", "ast_grep", "ast_edit", "todo"],
 };
