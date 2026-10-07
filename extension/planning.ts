@@ -277,13 +277,18 @@ interface ArtifactMatch {
  * with its own counterpart. A narrower declaration folds into a wider one (`brake/` into
  * `brake/ + .swarm/config.json`) because the union keeps every declared file and the extra artifacts
  * are reported in the reason - the difference is visible, never lost.
+ *
+ * The spelling evidence is looked for across the WHOLE cross product, not only in the pairs the
+ * coverage rule used: a stored row's `files` is the union of every spelling that folded into it, so
+ * the pair that proves the two declarations name one artifact need not be the pair that covered the
+ * narrower side - and demanding the wording agree on top of it would undo the merge the row records.
  */
 function artifactsRelation(left: string[], right: string[]): ArtifactMatch | undefined {
 	const [fewer, more] = left.length <= right.length ? [left, right] : [right, left];
 	if (fewer.length === 0) return undefined;
 	const pool = [...more];
 	const matched: string[] = [];
-	let spelled = false;
+	let written = false;
 	for (const path of fewer) {
 		const at = pool.findIndex(
 			(candidate) => sameArtifact(path, candidate) || (artifactName(path) !== artifactName(candidate) && namesShareAToken(path, candidate)),
@@ -291,13 +296,14 @@ function artifactsRelation(left: string[], right: string[]): ArtifactMatch | und
 		if (at < 0) return undefined;
 		const hit = pool[at] as string;
 		if (path !== hit) {
-			spelled = true;
+			written = true;
 			matched.push(`${path} ~ ${hit}`);
 		} else {
 			matched.push(path);
 		}
 		pool.splice(at, 1);
 	}
+	const spelled = written || left.some((a) => right.some((b) => artifactName(a) !== artifactName(b) && namesShareAToken(a, b)));
 	return {
 		detail: pool.length > 0 ? `${matched.join(", ")} (+${pool.join(", ")})` : matched.join(", "),
 		spelled,

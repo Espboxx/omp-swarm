@@ -601,3 +601,39 @@ describe("the goal-3 false merge: a fix must never swallow a verification", () =
 		expect(merged.folds).toEqual([]);
 	});
 });
+
+describe("a merged row's union shape, and what must still not fold into it", () => {
+	// `store.planGoal` skips a deliverable the pool already holds by re-describing the held row's
+	// title + files and asking the merge predicate. A held row's files are the UNION of every spelling
+	// that folded into it, so the predicate has to keep recognising those spellings - otherwise a
+	// LATER round re-proposing one of them mints a duplicate row, which is the goal-6 complaint one
+	// round on. BrightTiger's cross-check found two that were no longer recognised; this pins them.
+	test("every spelling a survivor absorbed is still recognised through its stored shape", () => {
+		const merged = mergeProposals(
+			GOAL5_ENTRIES.map((entry) => proposal(entry.agentId, { goal: "goal-1", tasks: entry.tasks }, entry.id)),
+		);
+		const originals = GOAL5_ENTRIES.flatMap((entry) => entry.tasks);
+		let checked = 0;
+		for (const survivor of merged.tasks) {
+			const held = describeDeliverable(survivor.title, survivor.files, survivor.deliverable ?? "");
+			for (const fold of merged.folds.filter((candidate) => candidate.into === survivor.key)) {
+				const original = originals.find((candidate) => candidate.title === fold.title);
+				if (original === undefined) throw new Error(`no original task for ${fold.title}`);
+				expect(isSameDeliverable(held, describeDeliverable(original.title, original.files, original.deliverable))).toBe(true);
+				checked += 1;
+			}
+		}
+		expect(checked).toBe(16); // every folded row of the five-entry round
+	});
+
+	test("two different deliverables whose file lists NEST stay two rows", () => {
+		// The spelling evidence now reaches across both lists, so the guard has to hold: `parser` and
+		// `lexer` share no compound, and a narrower file list is not a respelling of a wider one.
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [{ title: "Fix the parser crash", files: ["src/parser.ts", "src/lexer.ts"] }] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [{ title: "Fix the timeout", files: ["src/parser.ts"] }] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+		expect(merged.folded).toEqual([]);
+	});
+});
