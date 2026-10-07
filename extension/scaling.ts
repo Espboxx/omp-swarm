@@ -56,6 +56,12 @@ export interface ReconcileResult {
 	 * stop, a drained pool) leaves them pending on purpose, so the next tick can still apply them.
 	 */
 	settled: boolean;
+	/**
+	 * Set when the operator's ceiling is BELOW the live work shape this tick: the work wants more workers
+	 * than the budget allows. The rule holds at the ceiling either way; this is the fact the caller reports,
+	 * so an under-budgeted pool is never silent about it.
+	 */
+	underBudgeted?: { floor: number; ceiling: number };
 	reason: string;
 }
 
@@ -127,15 +133,36 @@ export function reconcilePool(input: ReconcileInput): ReconcileResult {
 	const requested = usable.length === 0 ? undefined : Math.max(...usable.map((request) => Math.max(1, request.requested)));
 	const floor = poolFloor(input);
 	const shape = shapeTarget(input);
+	// The operator's ceiling is ABSOLUTE: it wins over the work-shape floor. When the live work needs more
+	// workers than the budget allows, the honest outcome is to hold AT the ceiling and say so — never to
+	// plan a pool the operator did not pay for. (Without this bound the floor lifted a target above the
+	// ceiling in every under-budgeted shape, e.g. 4 claimed + 1 ready under `workers: 4` -> floor 6.)
+	const ceiling = Math.max(1, input.ceiling);
+	/** The operator budgeted less than the live work shape wants: worth saying out loud, never worth overspending. */
+	const underBudgeted = floor > ceiling;
 	// An ASK is the only thing that can grow the pool: without one the plan's own growth path stays the
 	// single grower (and this rule only prunes what is too big). The floor and the ceiling always bind.
 	const wanted =
 		requested === undefined
 			? Math.min(current, shape)
-			: Math.max(Math.min(requested, Math.max(1, input.ceiling)), floor);
-	const base: Pick<ReconcileResult, "requested" | "clamped" | "stale"> = { requested, clamped, stale };
+			: Math.min(Math.max(Math.min(requested, ceiling), floor), ceiling);
+	const base: Pick<ReconcileResult, "requested" | "clamped" | "stale" | "underBudgeted"> = {
+		requested,
+		clamped,
+		stale,
+		underBudgeted: underBudgeted ? { floor, ceiling } : undefined,
+	};
 	if (wanted === current) {
-		return { action: "hold", target: current, delta: 0, ...base, settled: true, reason: `the pool already matches the shape (${current})` };
+		return {
+			action: "hold",
+			target: current,
+			delta: 0,
+			...base,
+			settled: true,
+			reason: `the pool already matches the shape (${current})${
+				underBudgeted ? `; the live work shape wants ${floor}, but the operator's ceiling is ${ceiling}` : ""
+			}`,
+		};
 	}
 
 	const cooling = input.now - input.lastResizeAt < input.cooldownMs;
@@ -156,7 +183,7 @@ export function reconcilePool(input: ReconcileInput): ReconcileResult {
 			delta: wanted - current,
 			...base,
 			settled: true,
-			reason: `an agent asked for ${requested} worker(s)${clamped.length > 0 ? ` (clamped from above by the ceiling ${input.ceiling})` : ""}`,
+			reason: `an agent asked for ${requested} worker(s)${clamped.length > 0 ? ` (clamped from above by the ceiling ${ceiling})` : ""}`,
 		};
 	}
 	// Shrink: only a worker that holds NO claim/lease/reservation may be stopped; anything else defers.

@@ -213,6 +213,11 @@ export class AutoController {
 	 * occurrence — or a different row set — is reported again.
 	 */
 	#unclaimableKey: string | undefined;
+	/**
+	 * Identity of the last reported under-budget shape (`floor:ceiling`), so the operator is told once
+	 * that the work wants more workers than `config.workers` allows, and told again only if it changes.
+	 */
+	#underBudgetedKey: string | undefined;
 	readonly #scaleCooldownMs: number;
 	readonly #scaleWindowMs: number;
 
@@ -246,6 +251,7 @@ export class AutoController {
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
 		this.#unclaimableKey = undefined;
+		this.#underBudgetedKey = undefined;
 		this.#setPhase("idle");
 	}
 
@@ -446,11 +452,14 @@ export class AutoController {
 					if (short > 0) deltaRoles.push({ name: "general", count: short, capabilities: ["general"] });
 					this.#lastResizeAt = this.#deps.now();
 					try {
-						await this.#deps.startSwarm(deltaRoles, decision.delta);
-						this.#plannedWorkers = pool + decision.delta;
-						this.#deps.notify(`swarm grew by ${decision.delta} worker(s): ${decision.reason}`);
+						const started = await this.#deps.startSwarm(deltaRoles, decision.delta);
+						// The host clamps at the operator's ceiling and can bring up fewer than we asked for, so
+						// the recorded size is what actually started — never a number only the request knew.
+						const grew = started.length;
+						this.#plannedWorkers = Math.min(pool + grew, config.workers);
+						this.#deps.notify(`swarm grew by ${grew} worker(s): ${decision.reason}`);
 						this.#deps.onEvent?.("roster.grow", {
-							workers: pool + decision.delta,
+							workers: this.#plannedWorkers,
 							ready: counts.ready,
 							requested: decision.requested,
 							roles: deltaRoles.map((role) => role.name),
@@ -485,6 +494,22 @@ export class AutoController {
 						decision.action,
 						decision.action === "hold" ? pool : decision.target,
 					);
+				}
+				// An under-budgeted pool is never silent: the work shape wants more workers than the operator
+				// allowed, and the rule holds at the ceiling instead of planning past it. One notice per
+				// distinct (floor, ceiling) pair, cleared when the budget catches up, so it cannot spam a tick.
+				const budget = decision.underBudgeted;
+				if (budget === undefined) {
+					this.#underBudgetedKey = undefined;
+				} else {
+					const budgetKey = `${budget.floor}:${budget.ceiling}`;
+					if (budgetKey !== this.#underBudgetedKey) {
+						this.#underBudgetedKey = budgetKey;
+						const text = `[swarm] the live work shape wants ${budget.floor} worker(s) but the operator's ceiling is ${budget.ceiling}: the pool holds at ${decision.target} and will not plan past the budget. Raise config.workers for more.`;
+						this.#deps.notify(text, "warning");
+						this.#deps.notifyMain(text);
+						this.#deps.onEvent?.("pool.underBudgeted", { floor: budget.floor, ceiling: budget.ceiling, pool: decision.target });
+					}
 				}
 			}
 
@@ -595,6 +620,7 @@ export class AutoController {
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
 		this.#unclaimableKey = undefined;
+		this.#underBudgetedKey = undefined;
 	}
 
 	#setPhase(phase: AutoPhase, data?: Record<string, unknown>): void {

@@ -136,3 +136,83 @@ describe("reconcilePool", () => {
 		expect(second).toMatchObject({ action: "hold", target: 3, delta: 0, settled: true });
 	});
 });
+
+describe("the operator's ceiling is absolute", () => {
+	test("the work-shape floor can never lift a target above the ceiling", () => {
+		// The saturated shape under the operator's DEFAULT budget: four workers each holding a task and one
+		// more ready, so the live work shape wants 6. Every ask — including one exactly at the ceiling — must
+		// stay at the ceiling, and the reason must say why the shape is not being served.
+		const saturated = shape({ ceiling: 4, planned: 4, live: 4, idle: 0, ready: 1, claimed: 4, review: 0, plan: 4 });
+		expect(poolFloor(saturated)).toBe(6);
+
+		for (const requested of [1, 4, 5, 99]) {
+			const decision = reconcilePool(input({ ...saturated, pending: [ask(1, requested)] }));
+			expect(decision.target).toBeLessThanOrEqual(saturated.ceiling);
+			expect(decision.target).toBe(4);
+			expect(decision.action).toBe("hold");
+			expect(decision.delta).toBe(0);
+			expect(decision.reason).toContain("the operator's ceiling is 4");
+			// The controller needs the fact, not just the prose: it reports an under-budgeted shape once.
+			expect(decision.underBudgeted).toEqual({ floor: 6, ceiling: 4 });
+		}
+		// A budget the work fits under carries no such warning.
+		expect(reconcilePool(input({ ...shape({ ceiling: 8, claimed: 4, ready: 1, plan: 8 }), pending: [ask(1, 8)] })).underBudgeted).toBeUndefined();
+	});
+
+	test("when the budget is below the work shape the ceiling still wins (the floor is a heuristic, the budget is not)", () => {
+		// One worker allowed, one task ready: the work shape would keep two (one holding, one free), but the
+		// operator budgeted one. The prune must serve the BUDGET, not the heuristic.
+		const tiny = shape({ ceiling: 1, planned: 2, live: 2, idle: 2, ready: 1, claimed: 0, review: 0, plan: 1 });
+		expect(poolFloor(tiny)).toBe(2);
+		expect(reconcilePool(input({ ...tiny }))).toMatchObject({ action: "shrink", target: 1, delta: -1 });
+	});
+
+	test("an under-budgeted pool grows only up to the ceiling and reports the clamp", () => {
+		const under = shape({ ceiling: 3, planned: 1, live: 1, idle: 0, ready: 2, claimed: 0, review: 0, plan: 1 });
+		const decision = reconcilePool(input({ ...under, pending: [ask(1, 6)] }));
+		expect(decision).toMatchObject({ action: "grow", target: 3, delta: 2, settled: true });
+		expect(decision.clamped).toEqual([1]);
+		expect(decision.reason).toContain("clamped from above by the ceiling 3");
+	});
+
+	test("no consistent shape steers above the ceiling or reports a delta that does not match the target", () => {
+		let breaches = 0;
+		let cases = 0;
+		for (let ceiling = 1; ceiling <= 8; ceiling++) {
+			for (let holding = 0; holding <= 4; holding++) {
+				for (let idle = 0; idle <= 4; idle++) {
+					for (const ready of [0, 1, 3]) {
+						const live = holding + idle;
+						if (live === 0) continue;
+						const reviewed = Math.min(holding, 1);
+						const base = shape({
+							ceiling,
+							planned: live,
+							live,
+							idle,
+							ready,
+							claimed: holding - reviewed,
+							review: reviewed,
+							plan: Math.min(live, ceiling),
+						});
+						for (const pending of [[], [ask(1, 1)], [ask(1, ceiling)], [ask(1, 99)]]) {
+							const decision = reconcilePool(input({ ...base, pending }));
+							cases++;
+							const current = Math.max(base.planned, base.live);
+							// A decision may never CREATE a pool above the operator's ceiling. (A pool that is already
+							// above it with nothing idle to stop may only hold — that is not a decision to overspend.)
+							if (decision.action === "grow" && decision.target > ceiling) breaches++;
+							if (decision.target > Math.max(current, ceiling)) breaches++;
+							if (decision.target - current !== decision.delta) breaches++;
+							// The work-shape floor binds a shrink only as far as the operator's budget allows: with
+							// `config.workers` below the shape, the ceiling wins (see the focused test below).
+							if (decision.action === "shrink" && decision.target < Math.min(poolFloor(base), Math.max(1, ceiling))) breaches++;
+						}
+					}
+				}
+			}
+		}
+		expect(breaches).toBe(0);
+		expect(cases).toBeGreaterThan(500);
+	});
+});

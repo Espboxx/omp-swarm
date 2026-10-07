@@ -78,7 +78,9 @@ function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } 
 				throw new Error("swarm is already running");
 			}
 			workers += count;
-			return roles.map((role) => role.name);
+			// One name per WORKER, as the real host returns: `driver.start`/`addWorkers` hand back the specs
+			// they will bring up (already clamped by the operator's ceiling), not the role shape.
+			return Array.from({ length: count }, (_, i) => `w${workers - count + i + 1}`);
 		},
 		shrinkSwarm: async (count) => {
 			calls.shrink.push(count);
@@ -681,6 +683,42 @@ describe("pool sizing from agent requests", () => {
 		await h.controller.tick();
 		expect(h.calls.start[1]?.count).toBe(2); // 3 - 1, never 98
 		expect(h.calls.start.reduce((n, call) => n + call.count, 0)).toBe(3);
+	});
+
+	test("an under-budgeted pool grows only TO the ceiling, never 2 past it", async () => {
+		// Three workers, each holding a task, and a fourth task ready: the live-work floor is 5 while the
+		// operator budgeted 4. Before the fix the floor lifted the target to 5 and the controller recorded a
+		// pool of 5 it could never have (the host clamps) — and the plan's growth gate went dead with it.
+		const h = harness({ config: { workers: 4 } });
+		await pool(h, 3);
+		for (const task of h.store.listTasks({ status: "ready", limit: 10 })) h.store.claim(task.id, "w1", 300, []);
+		h.store.createTask({ title: "late", createdBy: "main" });
+		h.store.recordScaleRequest({ agentId: "w1", requested: 6, reason: "the queue is deeper than the pool", current: 3 });
+
+		const before = h.calls.start.length;
+		await h.controller.tick();
+		expect(h.calls.start.length).toBe(before + 1);
+		expect(h.calls.start.at(-1)?.count).toBe(1); // 4 - 3: to the ceiling, not to the floor (5)
+		expect(h.calls.start.reduce((n, call) => n + call.count, 0)).toBeLessThanOrEqual(4);
+		expect(h.store.pendingScaleRequests()).toEqual([]); // the ask was answered, not silently dropped
+	});
+
+	test("a saturated pool holds at the ceiling, says so, and never claims a growth it did not get", async () => {
+		const h = harness({ config: { workers: 2 } });
+		await pool(h, 2);
+		h.setWorkers(2);
+		for (const task of h.store.listTasks({ status: "ready", limit: 10 })) h.store.claim(task.id, "w1", 300, []);
+		h.store.createTask({ title: "late", createdBy: "main" });
+		h.store.recordScaleRequest({ agentId: "w1", requested: 8, reason: "much deeper than the pool", current: 2 });
+
+		const starts = h.calls.start.length;
+		const notices = h.calls.notify.length;
+		await h.controller.tick();
+		const added = h.calls.notify.slice(notices);
+		expect(h.calls.start.length).toBe(starts); // nothing spawned above the budget
+		expect(added.some((line) => line.includes("grew by"))).toBe(false); // and no false growth claim
+		expect(added.some((line) => line.includes("the operator's ceiling is 2"))).toBe(true); // the honest reason
+		expect(h.store.pendingScaleRequests()).toEqual([]);
 	});
 
 	test("a shrink stops idle peers only and leaves the ask pending when nobody is idle", async () => {
