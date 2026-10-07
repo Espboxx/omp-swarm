@@ -21,7 +21,7 @@ import {
 	type Proposal,
 } from "../../extension/planning";
 import type { BlackboardEntry } from "../../extension/types";
-import { GOAL5_ENTRIES } from "./helpers/goal5-round";
+import { GOAL3_ENTRIES, GOAL5_ENTRIES } from "./helpers/goal5-round";
 
 function entry(overrides: Partial<BlackboardEntry> = {}): BlackboardEntry {
 	return {
@@ -263,6 +263,20 @@ describe("describeDeliverable", () => {
 		expect(describeDeliverable("Write NOTES.md Alpha section", ["NOTES.md"]).section).toBe(true);
 		expect(describeDeliverable("Write NOTES.md", ["NOTES.md"]).section).toBe(false);
 		expect(describeDeliverable("Write NOTES.md chapter", ["NOTES.md"]).section).toBe(true);
+	});
+
+	test("the kind is read in Chinese too, so a fix cannot fold into a verification", () => {
+		// The tokenizer keeps no CJK word, so this is a second table matched on substrings. Without
+		// it every Chinese title was `other`, and `other` never contradicts anything - which is how
+		// goal-3's fix swallowed a verification of a different artifact.
+		expect(describeDeliverable("修复 settings.get 不是函数 运行时错误").intent).toBe("fix");
+		expect(describeDeliverable("验证：受影响路径跑通且无回归").intent).toBe("verify");
+		expect(describeDeliverable("只读审计：唤醒源清单 + 交接").intent).toBe("verify");
+		expect(describeDeliverable("实现 settings 访问接口").intent).toBe("write");
+		// A word that does not state the kind on its own must stay `other`: the live goal-5 rows are
+		// titled this way and their cross-language pairs have to keep folding.
+		expect(describeDeliverable("量化空转烧钱速率:转录记录数 x 任务持有状态(只读,可复现)").intent).toBe("other");
+		expect(describeDeliverable("落地前刹车:配置档实测与一键还原(idleTickSeconds)").intent).toBe("other");
 	});
 
 	test("an absolute and a bare path name the same artifact; two different directories do not", () => {
@@ -543,5 +557,47 @@ describe("the live counterexample: goal-5's round (3 splits, 20 rows) is 5 deliv
 		const merged = mergeProposals(round());
 		expect(merged.tasks.length).toBe(6); // 22 proposed tasks: 4 advisories + the handoff + the verifier
 		expect(merged.tasks.filter((candidate) => candidate.files.some((file) => file.startsWith("scratch/advisory-verify"))).length).toBe(1);
+	});
+
+	test("…and the same two container names under different parents are two deliverables", () => {
+		// A boundary probe on the live text: only the directory moves, and a container pair may only
+		// collapse INSIDE one scope (a rename), never across two places.
+		const moved = { ...obsCn, files: ["elsewhere/advisory-status/**"] };
+		const merged = mergeProposals([
+			proposal("A", { goal: "goal-1", tasks: [obsEn] }, 1),
+			proposal("B", { goal: "goal-1", tasks: [moved] }, 2),
+		]);
+		expect(merged.tasks.length).toBe(2);
+		expect(merged.folded).toEqual([]);
+	});
+});
+
+describe("the goal-3 false merge: a fix must never swallow a verification", () => {
+	// #499 CalmTiger proposed the fix (`src/**`), #511 BrightTiger the verification (`omp-swarm/tests/**`).
+	// The two prose blobs quote one error string, so wording overlap alone reached the container
+	// fallback and the verification lost its identity inside the fix. Both rows are real: the rule
+	// must keep them apart, and the fix's prose must never be able to absorb a CHECK of itself.
+	const round = GOAL3_ENTRIES.map((entry) =>
+		proposal(entry.agentId, { goal: "goal-1", tasks: entry.tasks }, entry.id),
+	);
+
+	test("the fix and the verification survive as two rows with their own artifacts", () => {
+		const merged = mergeProposals(round);
+		const fix = merged.tasks.find((task) => task.title.startsWith("修复 settings.get"));
+		const verify = merged.tasks.find((task) => task.title.startsWith("验证：受影响路径跑通"));
+		expect(fix?.files).toEqual(["src/**"]);
+		expect(verify?.files).toEqual(["omp-swarm/tests/**"]);
+		expect(merged.folds.map((fold) => fold.title)).not.toContain("验证：受影响路径跑通且无回归");
+		expect(merged.folds).toEqual([]);
+	});
+
+	test("the whole goal-3 round is SEVEN rows: the six the live round created included the false fold", () => {
+		// The live round created 6 rows from these 7 proposed tasks — the sixth was the false merge
+		// (the verification folded into the fix). With the pair refused, the round holds 7 distinct
+		// deliverables: two fixes and two verifications, on the two different artifacts the agents
+		// disagreed about, plus the audit, the reconnaissance and the hygiene row.
+		const merged = mergeProposals(round);
+		expect(merged.tasks.length).toBe(7);
+		expect(merged.folds).toEqual([]);
 	});
 });

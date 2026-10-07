@@ -33,7 +33,7 @@ export function goalTag(goalId: string): string {
  * differently are ONE task, with files, capabilities and dependencies unioned into the survivor.
  */
 export const DEDUPE_KEY_TEXT =
-	"a deliverable is keyed by its TARGET ARTIFACT (the `files` it declares, else the file names in its title) plus the KIND of work (write/verify/fix/document/remove/refactor), not by its wording: an artifact is normalized to one form first, so casing, separators, a trailing `/**` and the two spellings of one name (`advisory-burnrate/` vs `advisory-burn/rate-table.md`) name the same artifact; identical titles always collapse; an unknown kind (`other`) never contradicts a known one; two proposals on one artifact collapse when one is a section of the other, their wording is close enough, or one declares extra artifacts (a wording this rule reads no words out of cannot disagree either); two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner); and two container spellings of one deliverable (a directory standing for it) may still collapse on near-identical wording. Files, capabilities and dependencies are unioned into the survivor and the longest description is kept";
+	"a deliverable is keyed by its TARGET ARTIFACT (the `files` it declares, else the file names in its title) plus the KIND of work (write/verify/fix/document/remove/refactor), read from the title in English or Chinese, never from the description: an artifact is normalized to one form first, so casing, separators, a trailing `/**` and the two spellings of one name (`advisory-burnrate/` vs `advisory-burn/rate-table.md`) name the same artifact; identical titles always collapse; an unknown kind (`other`) never contradicts a known one, while two KNOWN kinds that differ (a writer and a verifier of one artifact) never fold; two proposals on one artifact collapse when one is a section of the other, their wording is close enough, or one declares extra artifacts (a wording this rule reads no words out of cannot disagree either); two WRITERS on one artifact are ALWAYS one deliverable (an artifact has one owner); and two container spellings of one deliverable (a directory standing for it) may still collapse on near-identical wording when both live under one parent directory. Files, capabilities and dependencies are unioned into the survivor and the longest description is kept";
 
 /** Stable name of a deliverable: the same title in any casing/spacing is the same deliverable. */
 export function deliverableKey(title: string): string {
@@ -70,6 +70,38 @@ const INTENT_VERBS: ReadonlyArray<readonly [DeliverableIntent, readonly string[]
 		["write", "writes", "create", "creates", "author", "authors", "implement", "implements", "add", "adds", "append", "appends", "produce", "produces", "generate", "generates", "build", "builds", "make", "makes", "draft", "drafts", "scaffold"],
 	],
 ];
+
+/**
+ * The same verb families in Chinese, matched as SUBSTRINGS because {@link words} keeps no CJK token:
+ * a Chinese title would otherwise be `other` to every rule, and the kind gate that refuses a fix and
+ * a verification of one artifact cannot refuse what it cannot read. Only words that state the kind on
+ * their own belong here - a row titled 量化/实测/普查 stays `other` and keeps pairing with its English
+ * twin, which is what the live cross-language pairs need.
+ */
+const CHINESE_INTENT_VERBS: ReadonlyArray<readonly [DeliverableIntent, readonly string[]]> = [
+	["verify", ["验证", "核验", "校验", "复核", "审计", "审查", "检查"]],
+	["fix", ["修复", "修正", "修补"]],
+	["remove", ["删除", "移除"]],
+	["refactor", ["重构", "重命名"]],
+	["document", ["文档化"]],
+	["write", ["实现", "编写", "撰写", "创建", "新增", "添加"]],
+];
+
+/** The kind a Chinese title states, or undefined: the family whose word appears earliest wins. */
+function chineseIntent(title: string): DeliverableIntent | undefined {
+	let intent: DeliverableIntent | undefined;
+	let earliest = Number.POSITIVE_INFINITY;
+	for (const [family, verbs] of CHINESE_INTENT_VERBS) {
+		for (const verb of verbs) {
+			const at = title.indexOf(verb);
+			if (at >= 0 && at < earliest) {
+				earliest = at;
+				intent = family;
+			}
+		}
+	}
+	return intent;
+}
 
 /** A title that names a PART of an artifact is a fragment of it, not a deliverable of its own. */
 const SECTION_WORDS: Record<string, true> = {
@@ -306,6 +338,7 @@ export function describeDeliverable(title: string, files: string[] = [], deliver
 			break;
 		}
 	}
+	if (intent === "other") intent = chineseIntent(title) ?? "other";
 	const declared = files.map(canonicalArtifact).filter((path) => path !== "");
 	const fromTitle = (title.match(ARTIFACT_IN_TITLE) ?? []).filter(looksLikeFileName);
 	const artifacts = [...new Set((declared.length > 0 ? declared : fromTitle.map(canonicalArtifact)).filter((path) => path !== ""))].sort();
@@ -355,12 +388,24 @@ export function sameDeliverableReason(left: DeliverableShape, right: Deliverable
 	}
 	// Neither artifact matched. A container - a directory standing for the deliverable - is the one
 	// spelling whose own name cannot carry the identity, so two of them may still be one deliverable
-	// when their wording is the same all but in length.
-	if (containerOnly(left.artifacts) && containerOnly(right.artifacts)) {
+	// when their wording is the same all but in length AND they are two names in ONE scope: a rename
+	// inside a directory is a spelling, while `src/` and `omp-swarm/tests/` are two different places.
+	if (containerOnly(left.artifacts) && containerOnly(right.artifacts) && sameContainerScope(left.artifacts, right.artifacts)) {
 		const overlap = wordingOverlap(left.words, right.words);
 		if (overlap >= SAME_DELIVERABLE_OVERLAP) return `two spellings of one container and ${percent(overlap)} of the shorter wording`;
 	}
 	return undefined;
+}
+
+/** The directory an artifact lives in (empty for a path with no parent). */
+function parentDirectory(path: string): string {
+	const at = path.lastIndexOf("/");
+	return at < 0 ? "" : path.slice(0, at);
+}
+
+/** Whether every container involved lives under ONE parent directory: two names, one scope. */
+function sameContainerScope(left: string[], right: string[]): boolean {
+	return new Set([...left, ...right].map(parentDirectory)).size === 1;
 }
 
 /** Whether every artifact a deliverable declares is a container (an empty list is not one). */

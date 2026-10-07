@@ -1,9 +1,13 @@
 /**
- * The goal-5 round, verbatim: the five board proposals (entries 552-556) that the goal-6 operator
- * caught creating 20 task rows out of 3 distinct splits. It is a FIXTURE, not prose - every field is
- * copied out of .swarm/swarm.db unchanged, including the Chinese titles and the long descriptions,
- * because the merge's hardest pairs (a terse Chinese row against a long English one, a directory
- * against the file it holds) are decided by exactly that text. Trimming it would test nothing.
+ * Live planning rounds, verbatim: the board proposals the goal-6 operator caught, copied out of
+ * .swarm/swarm.db unchanged - titles, descriptions and file lists included. They are FIXTURES, not
+ * prose. Trimming them would test nothing: the hardest pairs (a terse Chinese title against a long
+ * English one, a directory against the file it holds, a fix against a verification phrased in
+ * Chinese) are decided by exactly this text.
+ *
+ * GOAL5_ENTRIES: the 5 entries whose 3 distinct splits created the 20 task rows (149-168).
+ * GOAL3_ENTRIES: the 2 entries behind the false merge the merge rule must refuse - a fix that
+ * swallowed a verification of a different artifact.
  */
 export interface RoundTask {
 	title: string;
@@ -242,6 +246,78 @@ export const GOAL5_ENTRIES: RoundEntry[] = [
 					"可观测性缺陷:/swarm status 显示 0 online 的判定规则与 file:line 证据(只读)",
 					"落地前刹车:配置档实测与一键还原(idleTickSeconds/leaseSeconds/workers)"
 				]
+			}
+		]
+	}
+];
+
+export const GOAL3_ENTRIES: RoundEntry[] = [
+	{
+		"id": 499,
+		"agentId": "CalmTiger",
+		"tasks": [
+			{
+				"title": "修复 settings.get 不是函数 运行时错误",
+				"deliverable": "在 omp 代码库中定位并修复 `提供商配置失败: settings.get is not a function` 运行时错误：定位 settings/provider 相关调用点，改为安全的 settings 访问接口，并补充回归测试。产物：修改后的源码文件列表 + 失败复现/验证记录。",
+				"files": [
+					"src/**"
+				],
+				"depends_on": []
+			},
+			{
+				"title": "验证修复：构建/测试/类型检查",
+				"deliverable": "对修复做静态/类型验证：跑构建、类型检查与现有测试，确认没有引入回归；输出验证报告（命令 + 结果）。",
+				"files": [
+					"package.json",
+					"tsconfig.json",
+					"tests/**"
+				],
+				"depends_on": []
+			}
+		]
+	},
+	{
+		"id": 511,
+		"agentId": "BrightTiger",
+		"tasks": [
+			{
+				"title": "审计：定位全部 settings 读取点并确认真实类型/来源",
+				"deliverable": "board FACT entry: full list of every settings call site in the crash path (index.ts plus lib/store.ts and any other reader of compaction.thresholdPercent / provider config load), quoting the real type and source of the object (Settings class instance, array, or plain object) with file:line evidence, so the fix targets the root cause, not the call sites. READ-ONLY: no code edits, no tracked file touched.",
+				"files": [],
+				"depends_on": []
+			},
+			{
+				"title": "侦察：确认可修源码位置（已由 task-130 完成，仅保留证据）",
+				"deliverable": "board FACT/FAIL entry with absolute-path evidence for WHERE fixable source lives: source checkout under ~/.omp/** (already confirmed: C:/Users/93715/.omp/agent/extensions/provider-config/index.ts), operator code dirs, or plugin node_modules; omp.exe is a compiled 235MB binary. READ-ONLY. (Already delivered by task-130 in goal-2's split — proposing it here only so goal-3 has the same evidence in its own graph.)",
+				"files": [],
+				"depends_on": []
+			},
+			{
+				"title": "修复：在根因处统一修正 settings 的访问方式",
+				"deliverable": "The crash path fixed at its root with one minimal commit — no per-call-site patch, no new dependency, existing setting keys and behaviour semantics preserved; the crash point is eliminated at the source (registry handle + real settings scope), not by suppressing the error message.",
+				"files": [
+					"omp-swarm/extension/**",
+					"C:/Users/93715/.omp/agent/extensions/provider-config/index.ts"
+				],
+				"depends_on": [
+					"审计：定位全部 settings 读取点并确认真实类型/来源"
+				]
+			},
+			{
+				"title": "验证：受影响路径跑通且无回归",
+				"deliverable": "Verification report: the affected path (config load / provider init) genuinely exercised — real command or minimal repro showing `settings.get is not a function` gone — plus `cd tests/unit && bun test` full tail, `git status --short`, `git log --oneline -1`, `git ls-remote origin master` == HEAD. Report the numbers measured, never pasted.",
+				"files": [
+					"omp-swarm/tests/**"
+				],
+				"depends_on": [
+					"修复：在根因处统一修正 settings 的访问方式"
+				]
+			},
+			{
+				"title": "卫生：关闭本轮中已被先前交付取代的任务行",
+				"deliverable": "Pool of unmodified store/state hygiene for this round: any row whose deliverable is already done (by an earlier goal's task or by a live process) is closed with swarm_fail carrying the superseded reason, and the board records which prior task delivered it. No work re-executed.",
+				"files": [],
+				"depends_on": []
 			}
 		]
 	}

@@ -411,7 +411,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_propose",
 		label: "Propose A Split",
 		description:
-			"Post YOUR OWN split of an open goal (a board entry tagged `proposal`, so every worker and the scribe can read it). One entry per task you think the goal needs: title, the deliverable, optional capabilities/files/review_required, and depends_on = titles of other proposed tasks. Any number of workers may propose; the scribe merges them by DELIVERABLE (target artifact + kind of work), so phrase your tasks around the files they produce and do not re-propose work another agent already described.",
+			"Post YOUR OWN split of an open goal (a board entry tagged `proposal`, so every worker and the scribe can read it). One entry per task you think the goal needs: title, the deliverable, optional capabilities/files/review_required, and depends_on = titles of other proposed tasks. Any number of workers may propose; the scribe merges them by DELIVERABLE - the target artifact (normalized, so one artifact written several ways is one artifact) plus the kind of work read from the title, in English or Chinese - so phrase your tasks around the files they produce and do not re-propose work another agent already described.",
 		parameters: proposeSchema,
 		approval: "write",
 		async execute(_id, params) {
@@ -440,7 +440,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_plan",
 		label: "Merge The Split",
 		description:
-			"The scribe's convergence step, exactly once: claim the goal's planning task FIRST, then call this. It parses every swarm_propose split of the round, merges them by DELIVERABLE (target artifact + kind of work, not phrasing - two writers on one artifact are always one task), creates the real task graph with its dependencies, posts the merged split as a DECISION and marks the goal planned.",
+			"The scribe's convergence step, exactly once: claim the goal's planning task FIRST, then call this. It parses every swarm_propose split of the round, merges them by DELIVERABLE (the target artifact, normalized, plus the kind of work - never the phrasing: two writers on one artifact are always one task, a writer and a verifier of one artifact are two, and an unknown kind contradicts nothing), creates the real task graph with its dependencies resolved onto the surviving rows, posts the merged split and every fold with its reason as a DECISION, and marks the goal planned.",
 		parameters: planSchema,
 		approval: "write",
 		async execute(_id, params) {
