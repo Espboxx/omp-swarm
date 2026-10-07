@@ -76,8 +76,9 @@ web/
   lib/         the read-only DB handle, asset path resolution and the row types
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
-  unit/store.test.ts           45 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
-  unit/auto.test.ts            56 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/store.test.ts           46 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
+  unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/driver.test.ts           7 unit tests of the idle-wake edge: ten unchanged idle ticks cost ZERO model calls, a claimable task / a peer message / a live goal wakes the worker on the very next tick, and the empty streak's stepped window parks it until a real change
   unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
@@ -94,6 +95,7 @@ tests/
   unit/web-dashboard.test.ts    1 browser test of the page's own DOM: the newest-first feeds and a group header that cannot contradict the counts chip
   unit/web-format.test.ts       6 unit tests of the page's pure presentation helper: where a long path may break, and that the transform loses nothing
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
+  unit/provider-config-settings-api.test.ts 11 unit tests of the provider-settings API the runtime crash depended on: no string-path `settings.get`/`set` exists, the scope handles and `flush()` the fix uses, runtime overrides that outrank globals, and the operator's installed extension source
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
@@ -467,8 +469,12 @@ swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
   convention: a larger ask is applied clamped, and the answer says so. No agent can spend past the
   budget the operator set, whatever it asks for. The ceiling also **beats the work-shape floor**: when
   the live work wants more workers than the budget allows, the pool HOLDS at the ceiling instead of
-  planning past it, and says so once per distinct (wanted, ceiling) pair with a `pool.underBudgeted`
-  notice. A grow reports the workers the host **actually started**, never the requested delta.
+  planning past it, and says so **once per episode** with a `pool.underBudgeted` notice. That notice is
+  an edge, not a level: the work-shape floor it would report is pool-shape jitter (5/6/5/6/7 while
+  nothing the operator can act on moves), so the latch ignores the floor entirely and the operator is
+  told once rather than once per tick. A fresh notice needs a real edge — a ceiling the operator moved
+  (`config.workers`), or the condition going away and staying away for 60 s before it comes back. A
+  grow reports the workers the host **actually started**, never the requested delta.
 - The pool now **shrinks** as well, which it never used to. A shrink stops only workers holding
   **nothing** — no claim, no review lease, no file reservation, and not mid-turn. Anything else defers
   the shrink, and the deferred ask stays pending so a later tick still applies it. Sizing is floored by
@@ -578,8 +584,13 @@ expire with them. A crashed agent therefore cannot wedge the pool, and a live le
 stolen.
 
 **Worker loop.** After bootstrap, each idle worker is ticked only when there is something to do
-(unread message, held task, claimable task matching its capabilities, or a review it may take); with
-no work it is nudged once per `idleTickSeconds`. The tick carries *facts*, never decisions — task
+(unread message, held task, claimable task matching its capabilities, or a review it may take). Idle
+work is an edge too: a worker with nothing to do is woken by a **change** in the pool's live-goal
+round, never by the clock, so an unchanged pool costs **zero** model calls — the operator's "idle
+workers burning tokens in the background" is gone. `idleTickSeconds` now paces only the empty streak
+(1x/2x/4x …, capped at 5 minutes), after which the worker is parked; parking cannot delay real work,
+because the branches above fire on the first tick that it exists. The tick carries *facts*, never
+decisions — task
 selection, splitting, sharing and escalation stay with the agent, which loops
 `inbox → board → claim → work → verify → post → complete/ fail → wait` until the swarm stops.
 
@@ -597,7 +608,7 @@ approval promotes dependents, rejection returns the task to `ready` with the not
 ## Tests and recorded runs
 
 ```bash
-bun run test                   # 406 unit tests in the 19 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 428 unit tests in the 21 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
@@ -736,11 +747,11 @@ lines once its own settle window passed, which is the one-batch-one-alert rule a
   `config.workers`, and only while the pool is running and undrained — a task published after the
   pool stopped or drained waits for the next `/swarm start` instead. Because the trigger is the ready
   count, a worker whose spawn failed is not replaced by a later growth: only new claimable work grows
-  the pool. The trigger compares the ready count with the LIVE worker count (`auto.ts:414`), not with
+  the pool. The trigger compares the ready count with the LIVE worker count (`auto.ts:429`), not with
   capability: ready work that no live worker is able to claim does not grow the pool by itself (seen
   in the pre-fix SDK run: 1 ready `integrator`-only task against 4 live workers → 0 `roster.grow`
   events; the harness now ends such a run with a `[stuck]` line instead of waiting for the timeout).
-  The delta itself is measured against `max(live, planned)` (`auto.ts:417`).
+  The delta itself is measured against `max(live, planned)` (`auto.ts:433`).
 - The status line and widget are extension UI frames — a headless session (`--no-ui`) emits none by
   host contract; use a UI-mode session to see them.
 - The batch-completion alert is one per batch and lands `DRAIN_SETTLE_MS` (10 s) after the task

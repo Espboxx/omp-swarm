@@ -67,8 +67,9 @@ web/
   lib/         the read-only DB handle, asset path resolution and the row types
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
-  unit/store.test.ts           45 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
-  unit/auto.test.ts            56 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/store.test.ts           46 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging and the two ways an unclaimable row can be closed
+  unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
+  unit/driver.test.ts           7 unit tests of the idle-wake edge: ten unchanged idle ticks cost ZERO model calls, a claimable task / a peer message / a live goal wakes the worker on the very next tick, and the empty streak's stepped window parks it until a real change
   unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
@@ -85,6 +86,7 @@ tests/
   unit/web-dashboard.test.ts    1 browser test of the page's own DOM: the newest-first feeds and a group header that cannot contradict the counts chip
   unit/web-format.test.ts       6 unit tests of the page's pure presentation helper: where a long path may break, and that the transform loses nothing
   unit/index.test.ts            8 unit tests of the extension's optional host-module seams: the lazy key matcher and the completion alert, both branches
+  unit/provider-config-settings-api.test.ts 11 unit tests of the provider-settings API the runtime crash depended on: no string-path `settings.get`/`set` exists, the scope handles and `flush()` the fix uses, runtime overrides that outrank globals, and the operator's installed extension source
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
@@ -288,7 +290,7 @@ swarm_scale({ agents: 6, reason: "5 ready tasks and 2 in flight" })
 
 - 它是**建议性的、且留痕的**，从不是直接拉起 agent。请求会记录谁提的、为什么、改前的大小以及最后发生了什么，并在黑板上以带 `scale` 标签的 `OBSERVATION` 发布。返回值会说明四种结果里的哪一种发生了：`accepted`、`clamped`（请求高于上限）、`raised to N`（当前工作形态保住了下限），或 `recorded, but the pool is already N`。
 - **controller 是池子大小的唯一写者**，它在本来就在跑的 tick 上（每 2 秒）重算。同一个 60 秒窗口里多个 agent 感到同样的短缺，会塌缩成**一次**改尺寸：决策每个 tick 都从头重算，且取最大的那个请求，所以 N 个 agent 各要一个，结果是一个，而不是 N 个。超过 60 秒的请求会被当作过期丢弃，而不会在促成它的工作形态早已消失之后才被应用。
-- `config.workers` 是**操作者的上限**，它在改尺寸发生的地方强制生效，而不是靠约定：更大的请求会被钳制执行，并且返回值会说明这一点。任何 agent 无论要多少，都无法花超过操作者设定的预算。上限同时**压过工作形态给出的下限**：当当前工作需要的 worker 数超过预算时，池子会**停在上限**而不是越过预算去规划，并按 (需要的数量, 上限) 的不同组合各提示一次 `pool.underBudgeted`。扩编上报的是宿主**实际启动**的 worker 数，而不是请求的增量。
+- `config.workers` 是**操作者的上限**，它在改尺寸发生的地方强制生效，而不是靠约定：更大的请求会被钳制执行，并且返回值会说明这一点。任何 agent 无论要多少，都无法花超过操作者设定的预算。上限同时**压过工作形态给出的下限**：当当前工作需要的 worker 数超过预算时，池子会**停在上限**而不是越过预算去规划，并**按整个 episode 只提示一次** `pool.underBudgeted`。这条提示是**边沿**而不是电平：它要报的「需要的数量」本身就是池子形态的抖动（什么都没变也可能 5/6/5/6/7），所以 latch 现在完全忽略下限、按 episode 粘住 —— 操作者被通知一次，而不是每个 tick 一次。再次提示需要真正的边沿：操作者自己挪了上限（`config.workers`），或者条件消失并静默至少 60 秒后才重新出现。扩编上报的是宿主**实际启动**的 worker 数，而不是请求的增量。
 - 池子现在也会**收缩**，这是以前完全没有的。收缩只会停掉**什么都没拿**的 worker —— 没有认领、没有评审租约、没有文件预留，也不在回合中间。其他情况一律推迟这次收缩，而被推迟的请求会留在待处理状态，下一个 tick 仍可应用。大小的下限由当前工作形态决定（每个被持有的任务保住自己的工作 worker，留一个空闲 worker 接下一次认领，有 `ready` 工作时再多留一个），并且只要还有可做的事就绝不降到 1 以下 —— 停掉整个池子是 `/swarm off` 或排空路径的事，不是 scaler 的事。
 - 计划本身会说出它认为需要的大小：`swarm_plan` 会报告**峰值并行度**（新建的任务里能同时跑几个）和一个**建议的 agent 数量**，连同上限一起给出，所以「N 猜对了吗」在任何人开始干活之前就有答案。
 
@@ -356,7 +358,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 
 **租约 + 心跳。** 每次认领都会写入 `claimed_by`/`lease_until`。任何工具调用以及 driver 的心跳都会续租。清扫器（`sweep()`）在每次认领内部以及每个心跳上运行：租约过期的任务回到 `ready` 并产生一个 `task.reclaim` 事件，由租约支撑的文件预留也随之过期。因此崩溃的 agent 无法卡住池子，而存活的租约永远不会被抢。
 
-**Worker 循环。** 引导之后，每个空闲 worker 只有存在事情可做时才被驱动（有未读消息、持有任务、有匹配其能力的可认领任务，或有一个它可以接的评审）；无事可做时每个 `idleTickSeconds` 催一次。驱动携带的是*事实*，从不是决定 —— 任务选择、拆分、分享和上报都留在 agent 那里，它循环执行
+**Worker 循环。** 引导之后，每个空闲 worker 只有存在事情可做时才被驱动（有未读消息、持有任务、有匹配其能力的可认领任务，或有一个它可以接的评审）。空闲本身也是边沿：无事可做的 worker 只在**池子的 live-goal 轮次真的变化**时才被唤醒，绝不按时钟唤醒 —— 池子没变化就是 **0 次模型调用**，操作者看到的「空闲代理在后台白烧 token」因此消失。`idleTickSeconds` 现在只用来推进空窗口的长度（1x/2x/4x …，上限 5 分钟），若干次之后该 worker 被 park；park 不会耽误真正的唤醒，因为上面那些分支在真实工作出现后的第一个 tick 就会触发。驱动携带的是*事实*，从不是决定 —— 任务选择、拆分、分享和上报都留在 agent 那里，它循环执行
 `inbox → board → claim → work → verify → post → complete/ fail → wait`，直到集群停止。
 
 **文件预留。** 模式是路径形状的（`src/auth/**`、`src/parser.ts`）；重叠的请求会被拒绝并给出冲突的持有者。预留随租约过期，所以崩溃不会永久锁住一个文件。
@@ -369,7 +371,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 406 unit tests in the 19 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 428 unit tests in the 21 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start
@@ -454,7 +456,7 @@ UI 那次运行还断言了状态行跟随整个过程：`idle → planning → 
   `swarm_task_create` 行（模式 `"coordinator"`），什么都不会启动 —— 它会在 90 秒后催一次，然后回到 `idle` —— 而只有问题、闲聊或解释类请求会按平常方式回答。模式开启时你手工创建的任务会在下一个 tick 启动池子，手工打开的目标也一样。
 - 存活的目标算作工作：它让池子不落入停滞通知，并自己决定名册规模，所以一个没人能规划的目标会由这一轮自己的界限来报告（10 分钟后一条 `FAIL`），而不是以 `stalled` 报告。两者的延迟并不相同：如果规划任务在目标仍 open 时就已经被关闭为 `failed`，池子可以在那个界限剩下的时间里看起来毫无动静，之后 `FAIL` 才落地 —— 有报告，但比一次停滞通知要晚。
 - 名册增长以 ready 工作为键：每次 ready 计数上升最多一步，绝不超过
-  `config.workers`，且只在池子运行且未排空时发生 —— 池子停止或排空后才发布的任务会等下一次 `/swarm start`。因为触发条件是 ready 计数，启动失败的 worker 不会被后续的增长补上：只有新的可认领工作才会让池子增长。触发条件的比较对象是**存活** worker 数（`auto.ts:414`），而不是能力：没有任何存活 worker 能认领的 ready 工作不会自己让池子增长（在修复前的 SDK 运行里可见：1 个只有 `integrator` 能力的 ready 任务对上 4 个存活 worker → 0 个 `roster.grow` 事件；现在 harness 会以 `[stuck]` 行结束这类运行，而不是等超时）。增量本身以 `max(live, planned)` 为基准衡量（`auto.ts:417`）。
+  `config.workers`，且只在池子运行且未排空时发生 —— 池子停止或排空后才发布的任务会等下一次 `/swarm start`。因为触发条件是 ready 计数，启动失败的 worker 不会被后续的增长补上：只有新的可认领工作才会让池子增长。触发条件的比较对象是**存活** worker 数（`auto.ts:429`），而不是能力：没有任何存活 worker 能认领的 ready 工作不会自己让池子增长（在修复前的 SDK 运行里可见：1 个只有 `integrator` 能力的 ready 任务对上 4 个存活 worker → 0 个 `roster.grow` 事件；现在 harness 会以 `[stuck]` 行结束这类运行，而不是等超时）。增量本身以 `max(live, planned)` 为基准衡量（`auto.ts:433`）。
 - 状态行和 widget 是 extension 的 UI 帧 —— 无头会话（`--no-ui`）按宿主契约不产出；要看它们请用 UI 模式的会话。
 - 批次完成告警每批次一条，落在任务计数停止变化后的 `DRAIN_SETTLE_MS`（10 秒），而不是最后一个任务完成的瞬间：池子必须看起来空闲超过一个 tick 的时间，否则一个即将认领下一个任务的 worker 会提前结束批次。一个批次的任务是它开始时的那批加上运行期间创建的任何任务，所以稍后重启的运行不会重复报告已完成的工作。
 - 最响的那个界面是 `TERMINAL.sendNotification`，`PI_NOTIFICATIONS=off` 会抑制它，无头终端会丢弃它。常驻标记（widget + 状态行）也只存在于 UI，所以 `--no-ui` 会话只有在多 agent 模式关闭时才会以转录消息的形式拿到摘要。
