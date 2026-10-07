@@ -386,6 +386,3 @@ UI 那次运行还断言了状态行跟随整个过程：`idle → planning → 
 ## 许可证
 
 MIT —— Copyright (c) 2026 Espboxx。见 [LICENSE](LICENSE)。
-
-
-
