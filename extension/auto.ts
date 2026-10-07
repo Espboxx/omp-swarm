@@ -189,7 +189,7 @@ export const COORDINATOR_NUDGE =
 	"[swarm] no tasks exist yet for the user's request. Create them now with swarm_task_create (2-6 tasks, required_capabilities general/reviewer/integrator) so the swarm can start; if the request cannot be split, say so instead.";
 
 export const SWARM_NUDGE =
-	"[swarm] no goal exists yet for the user's request. Call swarm_goal({ goal, agents }) now - decide only how many agents; the workers evaluate the split and claim it themselves. If the request cannot be split, say so instead.";
+	"[swarm] no goal exists yet for the user's request. Call swarm_goal({ goal, agents }) now - decide only how many agents; the workers evaluate the split and claim it themselves. If you have already started the work yourself, STOP and open the goal anyway: anything that creates, changes or deletes a file is the workers' job, not yours. Only a question or a chat is answered directly, without a goal.";
 
 const drainNotice = (counts: TaskCounts): string =>
 	`[swarm] the swarm finished: ${counts.done} task(s) done, ${counts.failed} failed. Run /swarm board for details, then report the outcome to the user.`;

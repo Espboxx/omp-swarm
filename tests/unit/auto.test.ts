@@ -694,6 +694,19 @@ describe("swarm-side planning", () => {
 		expect(h.calls.nudge).toEqual([SWARM_NUDGE]);
 		expect(h.calls.nudge[0]).toContain("swarm_goal");
 	});
+
+	test("the swarm nudge tells a coordinator that already started to STOP, and has no 'cannot be split' escape", () => {
+		// The observed failure mode (task-115 run a): a spec-shaped request filed under "cannot be split"
+		// and executed by the coordinator itself — 46 turns, 68 tool calls, no goal. The nudge must
+		// interrupt that, and the ONLY escape it may offer is a question or chat.
+		expect(SWARM_NUDGE).toContain("already started the work yourself, STOP");
+		expect(SWARM_NUDGE).toContain("Only a question or a chat is answered directly");
+		expect(SWARM_NUDGE).not.toContain("cannot be split");
+		expect(SWARM_NUDGE).toContain("swarm_goal");
+		// The legacy nudge is the documented old path and keeps its own escape verbatim.
+		expect(COORDINATOR_NUDGE).toContain("cannot be split");
+		expect(COORDINATOR_NUDGE).not.toContain("already started the work yourself");
+	});
 });
 
 describe("planning config", () => {
