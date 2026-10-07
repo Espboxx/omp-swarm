@@ -79,10 +79,76 @@ interface WorkerRuntime {
 	worktree: string;
 	turns: number;
 	lastTickAt: number;
+	/** Idle-wake bookkeeping: what this worker was last woken for, and how far its backoff has gone. */
+	idle: IdleWakeState;
 	lastError?: string;
 	/** Last usage fold and its age; `#usage` refreshes it at most once per `USAGE_TTL_MS`. */
 	usage?: WorkerUsage;
 	usageAt?: number;
+}
+
+/**
+ * The idle branch's state (one per worker). `signature` is the agent-relevant world the worker was last
+ * woken for — `undefined` until the first evaluation, which only records it (a freshly bootstrapped
+ * worker was just handed the whole protocol, so there is nothing to tell it). `empty` counts the idle
+ * windows (paced by `idleTickSeconds`, stepped) that have passed since the last wake-up; after
+ * {@link IDLE_PARK_AFTER} of them the worker is `parked` — a state the operator can read — and the
+ * heartbeat keeps it online regardless, because a parked worker is idle, not dead.
+ */
+export interface IdleWakeState {
+	signature: string | undefined;
+	empty: number;
+	parked: boolean;
+	/** Earliest time the next idle window may advance. */
+	nextAt: number;
+}
+
+export interface IdleWakeDecision {
+	wake: boolean;
+	state: IdleWakeState;
+}
+
+/** Idle windows with nothing new before the worker is parked. */
+export const IDLE_PARK_AFTER = 3;
+/** Upper bound on the idle window's stepped growth. */
+export const IDLE_BACKOFF_MAX_MS = 300_000;
+
+/**
+ * The idle branch's edge, as a pure function so the contract is testable without a session: an idle
+ * worker is woken by a CHANGE in agent-relevant state, never by the clock.
+ *
+ * The branch this replaces woke every idle worker every `idleTickSeconds` (15s by default) with the
+ * same "no claimable work" prompt — a full model call per worker per window, forever, with nothing to
+ * act on, which is exactly the operator's "空闲代理在后台白烧 token". Requirement (a) of the fix is
+ * absolute: an unchanged pool must cost ZERO model calls, so no branch here ever wakes on time alone.
+ * The branches ABOVE it (unread messages, held tasks, claimable ready work, a review waiting) are still
+ * evaluated on every tick and still wake the worker the moment real work exists, so gating this one
+ * cannot delay a wake-up.
+ *
+ * The clock keeps exactly one job — the empty streak. `idleTickSeconds` after the last wake-up the
+ * streak advances (then 2x, 4x, … capped at {@link IDLE_BACKOFF_MAX_MS}), and after
+ * {@link IDLE_PARK_AFTER} of those windows the worker is parked. A change wakes it at once, parked or
+ * not: a real change is never dropped, only the no-op wake-up is gone.
+ */
+export function idleWake(state: IdleWakeState, signature: string, now: number, idleTickSeconds: number): IdleWakeDecision {
+	const gap = Math.max(1, idleTickSeconds) * 1000;
+	if (state.signature === undefined) {
+		// First evaluation: record the state the worker's own bootstrap already described, do not wake.
+		return { wake: false, state: { signature, empty: 0, parked: false, nextAt: now + gap } };
+	}
+	if (state.signature !== signature) {
+		// The world moved. Wake now — dropping a real change is the one thing this edge must never do —
+		// and give the empty streak a clean slate.
+		return { wake: true, state: { signature, empty: 0, parked: false, nextAt: now + gap } };
+	}
+	// Nothing changed. `(a)` of the fix is absolute: an unchanged pool DOES NOT cost a model call, so
+	// this branch never wakes. What the clock still drives is the empty-streak bookkeeping — the window
+	// (idleTickSeconds, then stepped 1x/2x/4x …, capped) and the park after IDLE_PARK_AFTER of them,
+	// which is the state an operator can read instead of a silent burn.
+	if (now < state.nextAt) return { wake: false, state };
+	const empty = state.empty + 1;
+	const backoff = Math.min(gap * 2 ** (empty - 1), IDLE_BACKOFF_MAX_MS);
+	return { wake: false, state: { ...state, empty, parked: empty >= IDLE_PARK_AFTER, nextAt: now + backoff } };
 }
 
 const TICK_INTERVAL_MS = 3000;
@@ -459,7 +525,15 @@ export class SwarmDriver {
 		if (modelFallbackMessage) this.#deps.notify(`worker ${spec.name}: ${modelFallbackMessage}`, "warning");
 		this.#trace(`spawn ${spec.name}: session ready id=${session.sessionId}`);
 
-		const runtime: WorkerRuntime = { spec, session, identity, worktree, turns: 0, lastTickAt: 0 };
+		const runtime: WorkerRuntime = {
+			spec,
+			session,
+			identity,
+			worktree,
+			turns: 0,
+			lastTickAt: 0,
+			idle: { signature: undefined, empty: 0, parked: false, nextAt: 0 },
+		};
 		this.#workers.set(spec.name, runtime);
 		session.subscribe((event) => {
 			if (event.type === "agent_start") {
@@ -514,14 +588,19 @@ export class SwarmDriver {
 		// The round a worker can join right now: a live goal is what the pool converges on before it
 		// has any real task to claim.
 		const goals = store.liveGoals();
+		// The state an idle worker can still be woken FOR: the other branches read their own per-worker
+		// slice of reality on every tick, so this is what is left over when they are all empty.
+		const idleSignature = this.#idleSignature(goals);
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
+			const now = Date.now();
 			const messages = store.inbox(worker.spec.name, 5);
 			const mine = store.listTasks({ status: "claimed", agent: worker.spec.name, limit: 5 });
 			const scribe = goals.find((goal) => mine.some((task) => task.id === goal.planningTask));
 			if (messages.length > 0 || mine.length > 0) {
 				await this.#prompt(worker, this.#continuationPrompt(worker, messages.length, mine.length, 0, 0, scribe, scribe !== undefined));
-				worker.lastTickAt = Date.now();
+				worker.lastTickAt = now;
+				worker.idle = this.#idleState(idleSignature, now);
 				continue;
 			}
 			const ready = store
@@ -530,14 +609,19 @@ export class SwarmDriver {
 			const reviews = config.review ? store.listTasks({ status: "review", limit: 20 }).filter((t) => t.claimedBy !== worker.spec.name) : [];
 			if (ready.length > 0 || reviews.length > 0) {
 				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, ready.length, reviews.length, goals[0]));
-				worker.lastTickAt = Date.now();
+				worker.lastTickAt = now;
+				worker.idle = this.#idleState(idleSignature, now);
 				continue;
 			}
-			const idleFor = Date.now() - worker.lastTickAt;
-			if (idleFor > config.idleTickSeconds * 1000) {
-				await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, 0, 0, goals[0]));
-				worker.lastTickAt = Date.now();
-			}
+			// Nothing actionable for this worker. The clock is NOT a reason to run a model call: the idle
+			// edge wakes it only when its signature moves, backs off, and parks it until it does.
+			const previous = worker.idle;
+			const decision = idleWake(previous, idleSignature, now, config.idleTickSeconds);
+			worker.idle = decision.state;
+			if (!previous.parked && decision.state.parked) this.#trace(`idle ${worker.spec.name}: parked until the pool state changes`);
+			if (!decision.wake) continue;
+			await this.#prompt(worker, this.#continuationPrompt(worker, 0, 0, 0, 0, goals[0]));
+			worker.lastTickAt = now;
 		}
 		this.#checkDrained();
 	}
@@ -555,6 +639,21 @@ export class SwarmDriver {
 		this.#countsKey = "";
 		this.#countsAt = Date.now();
 		this.#startedAt = Date.now();
+	}
+
+	/**
+	 * What an idle worker can still be woken FOR. Everything else it could act on — an unread message, a
+	 * task it holds, claimable ready work, a review waiting for someone else — is read on every tick by
+	 * its own branch and wakes the worker directly, so a signature over the live goal round is exactly
+	 * the "agent-relevant state" the idle edge is allowed to fire on.
+	 */
+	#idleSignature(goals: SwarmGoal[]): string {
+		return goals.map((goal) => `${goal.id}:${goal.planningTask}:${goal.status}`).join(",") || "-";
+	}
+
+	/** A worker that has just been woken for real work: its empty-wake streak starts over. */
+	#idleState(signature: string, now: number): IdleWakeState {
+		return { signature, empty: 0, parked: false, nextAt: now + Math.max(1, this.#deps.config.idleTickSeconds) * 1000 };
 	}
 
 	/**
@@ -649,7 +748,7 @@ export class SwarmDriver {
 		}
 		if (ready > 0) return `There are ${ready} claimable task(s) matching your capabilities. swarm_tasks status=ready, then swarm_claim one.`;
 		if (reviews > 0) return `There are ${reviews} task(s) waiting for review. swarm_tasks status=review and review one you did not write.`;
-		return `No claimable work right now (${worker.spec.name}). swarm_wait, then look again; if nothing useful exists, post a QUESTION or create the next task yourself.`;
+		return `No claimable work right now (${worker.spec.name}). swarm_wait, then look again; if nothing useful exists, report the idle pool as a QUESTION on the board and stop - an empty pool is a real answer, not a gap to fill with work nobody asked for.`;
 	}
 
 	async #prompt(worker: WorkerRuntime, text: string): Promise<void> {

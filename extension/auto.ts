@@ -77,6 +77,12 @@ const SCALE_WINDOW_MS = 60_000;
  * so the pool waits for a quiet period instead.
  */
 const START_SETTLE_MS = 20_000;
+/**
+ * How long the under-budget condition must stay AWAY before its return is a new episode worth a second
+ * notice. Without it a shape that dips in and out of the budget (a task finishing, another arriving
+ * seconds later) would be reported again for the same shortage the operator has already been told about.
+ */
+export const UNDER_BUDGET_COOLDOWN_MS = 60_000;
 
 /**
  * Roles the swarm needs for this work: one agent per required capability, sized to the plan.
@@ -234,10 +240,18 @@ export class AutoController {
 	 */
 	#unclaimableKey: string | undefined;
 	/**
-	 * Identity of the last reported under-budget shape (`floor:ceiling`), so the operator is told once
-	 * that the work wants more workers than `config.workers` allows, and told again only if it changes.
+	 * The ceiling the standing under-budget notice was issued for (`undefined`: no notice standing), and
+	 * when the condition last went away. The notice is an EDGE, not a level: the floor it reports is
+	 * pool-shape jitter (5/6/5/6/7 while nothing the operator can act on moves), so the old
+	 * `floor:ceiling` key changed on every tick and the latch passed every time — the operator got 25
+	 * copies of one notice. The latch is now sticky for the whole episode and ignores the floor; only a
+	 * moved ceiling (the operator's `config.workers`) or a genuine disappear-then-reappear after
+	 * {@link UNDER_BUDGET_COOLDOWN_MS} is a new edge.
 	 */
-	#underBudgetedKey: string | undefined;
+	#underBudgetedCeiling: number | undefined;
+	#underBudgetClearedAt = 0;
+	/** Whether the previous tick saw the condition at all: the edge is the appearing transition. */
+	#underBudgetedPresent = false;
 	readonly #scaleCooldownMs: number;
 	readonly #scaleWindowMs: number;
 
@@ -271,7 +285,9 @@ export class AutoController {
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
 		this.#unclaimableKey = undefined;
-		this.#underBudgetedKey = undefined;
+		this.#underBudgetedCeiling = undefined;
+		this.#underBudgetClearedAt = 0;
+		this.#underBudgetedPresent = false;
 		this.#setPhase("idle");
 	}
 
@@ -515,22 +531,10 @@ export class AutoController {
 						decision.action === "hold" ? pool : decision.target,
 					);
 				}
-				// An under-budgeted pool is never silent: the work shape wants more workers than the operator
-				// allowed, and the rule holds at the ceiling instead of planning past it. One notice per
-				// distinct (floor, ceiling) pair, cleared when the budget catches up, so it cannot spam a tick.
-				const budget = decision.underBudgeted;
-				if (budget === undefined) {
-					this.#underBudgetedKey = undefined;
-				} else {
-					const budgetKey = `${budget.floor}:${budget.ceiling}`;
-					if (budgetKey !== this.#underBudgetedKey) {
-						this.#underBudgetedKey = budgetKey;
-						const text = `[swarm] the live work shape wants ${budget.floor} worker(s) but the operator's ceiling is ${budget.ceiling}: the pool holds at ${decision.target} and will not plan past the budget. Raise config.workers for more.`;
-						this.#deps.notify(text, "warning");
-						this.#deps.notifyMain(text);
-						this.#deps.onEvent?.("pool.underBudgeted", { floor: budget.floor, ceiling: budget.ceiling, pool: decision.target });
-					}
-				}
+				// An under-budgeted pool is never silent: the work shape wants more workers than the
+				// operator allowed, and the rule holds at the ceiling instead of planning past it. The
+				// notice is an EDGE, not a level — see #noteUnderBudgeted for what may re-fire it.
+				this.#noteUnderBudgeted(decision.underBudgeted, decision.target);
 			}
 
 			// Stall: a running swarm with blocked work and nothing claimable. An OPEN GOAL is excluded:
@@ -595,6 +599,55 @@ export class AutoController {
 		}
 	}
 
+	/**
+	 * The under-budget EDGE. The notice used to key on `floor:ceiling`, and the floor is pool-shape
+	 * jitter — 5/6/5/6/7 for the SAME shortage — so the key changed on every tick and the latch passed
+	 * with it: one notice per tick, 25 copies for the operator. Modelled on the driver's drain latch —
+	 * a one-shot edge per episode, re-armed only by a real change:
+	 *
+	 * - the floor is IGNORED entirely — it is worker-count noise, not news;
+	 * - the ceiling is the coarse step: if the operator moves `config.workers` while the condition holds,
+	 *   the new budget is worth saying out loud (the budget they are being asked to raise has changed);
+	 * - otherwise the condition must genuinely go away and stay away for {@link UNDER_BUDGET_COOLDOWN_MS}
+	 *   before its return is a new episode.
+	 */
+	#noteUnderBudgeted(budget: { floor: number; ceiling: number } | undefined, target: number): void {
+		const now = this.#deps.now();
+		if (budget === undefined) {
+			// The shape fits the budget again: end the episode and start the silence clock.
+			if (this.#underBudgetedPresent) {
+				this.#underBudgetClearedAt = now;
+				this.#underBudgetedCeiling = undefined;
+			}
+			this.#underBudgetedPresent = false;
+			return;
+		}
+		const appeared = !this.#underBudgetedPresent;
+		this.#underBudgetedPresent = true;
+		if (!appeared) {
+			// The condition never went away, so the floor is still just noise. Only a ceiling the operator
+			// actually moved — the one coarse step here — is worth saying out loud again.
+			if (this.#underBudgetedCeiling !== undefined && this.#underBudgetedCeiling !== budget.ceiling) {
+				this.#announceUnderBudgeted(budget, target);
+			}
+			return;
+		}
+		// A fresh appearance. The echo of an episode that ended moments ago stays silent; a return after
+		// real silence is a new episode and reports again.
+		if (this.#underBudgetClearedAt !== 0 && now - this.#underBudgetClearedAt < UNDER_BUDGET_COOLDOWN_MS) return;
+		this.#announceUnderBudgeted(budget, target);
+	}
+
+	/** One notice, and the `pool.underBudgeted` event that must never diverge from it. */
+	#announceUnderBudgeted(budget: { floor: number; ceiling: number }, target: number): void {
+		this.#underBudgetedCeiling = budget.ceiling;
+		this.#underBudgetClearedAt = 0;
+		const text = `[swarm] the live work shape wants ${budget.floor} worker(s) but the operator's ceiling is ${budget.ceiling}: the pool holds at ${target} and will not plan past the budget. Raise config.workers for more.`;
+		this.#deps.notify(text, "warning");
+		this.#deps.notifyMain(text);
+		this.#deps.onEvent?.("pool.underBudgeted", { floor: budget.floor, ceiling: budget.ceiling, pool: target });
+	}
+
 	/** Called by the driver once the whole pool is terminal. */
 	noteDrained(): void {
 		this.#drained = true;
@@ -640,7 +693,9 @@ export class AutoController {
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
 		this.#unclaimableKey = undefined;
-		this.#underBudgetedKey = undefined;
+		this.#underBudgetedCeiling = undefined;
+		this.#underBudgetClearedAt = 0;
+		this.#underBudgetedPresent = false;
 	}
 
 	#setPhase(phase: AutoPhase, data?: Record<string, unknown>): void {

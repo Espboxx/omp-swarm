@@ -12,6 +12,7 @@ import {
 	COORDINATOR_POLICY,
 	SWARM_NUDGE,
 	SWARM_POLICY,
+	UNDER_BUDGET_COOLDOWN_MS,
 	planRoster,
 	type AutoDeps,
 	type AutoOptions,
@@ -53,12 +54,14 @@ interface Calls {
 	nudge: string[];
 	main: string[];
 	notify: string[];
+	/** The controller's own events (`pool.underBudgeted`, `roster.*`, …) in the order they were emitted. */
+	events: { type: string; data?: Record<string, unknown> }[];
 }
 
 function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } = {}) {
 	const store = makeStore();
 	const config: SwarmConfig = { ...DEFAULT_CONFIG, ...options.config };
-	const calls: Calls = { start: [], stop: [], shrink: [], nudge: [], main: [], notify: [] };
+	const calls: Calls = { start: [], stop: [], shrink: [], nudge: [], main: [], notify: [], events: [] };
 	let clock = 1_000_000;
 	let busy = false;
 	let running = false;
@@ -98,6 +101,7 @@ function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } 
 		notify: (text) => calls.notify.push(text),
 		onChange: () => {},
 		now: () => clock,
+		onEvent: (type, data) => calls.events.push({ type, data }),
 	};
 	const controller = new AutoController(deps, {
 		nudgeMs: 1000,
@@ -935,6 +939,99 @@ describe("pool starvation: ready work nobody online can claim", () => {
 		h.store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"] });
 		await h.controller.tick();
 		expect(starvationNotices(h)).toEqual([]);
+	});
+});
+
+describe("under-budget notice: an edge, not a level", () => {
+	/**
+	 * A running pool of 2 (the operator's ceiling) whose live work shape wants 4-5 workers — the shape the
+	 * operator was told about 25 times. Four rows, the first two held, so claiming and releasing the third
+	 * moves the floor between 5 (3 held, 1 ready) and 4 (2 held, 2 ready) while the shortage never changes.
+	 */
+	async function saturated(h: Harness): Promise<string[]> {
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		for (let i = 0; i < 4; i++) h.store.createTask({ title: `t${i}`, createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(true);
+		const ids = h.store.listTasks({ status: "ready", limit: 10 }).map((task) => task.id);
+		h.store.claim(ids[0], "w1", 300, []);
+		h.store.claim(ids[1], "w1", 300, []);
+		return ids;
+	}
+
+	/** The notice the operator actually reads: `main` is the sink whose text they see. */
+	const ceilingNotice = "the operator's ceiling is 2";
+
+	test("a floor oscillating 5/4/5/4/5/4 under ONE ceiling is reported exactly once", async () => {
+		const h = harness({ config: { workers: 2 } });
+		const ids = await saturated(h);
+
+		for (let i = 0; i < 6; i++) {
+			// Every step is a different `floor:ceiling` key, which is exactly why the old latch let all six
+			// through: 25 notices for one shortage, in the operator's report.
+			if (i % 2 === 0) h.store.claim(ids[2], "w1", 300, []);
+			else h.store.release(ids[2], "w1", "floor jitter");
+			await h.controller.tick();
+			h.advance(2000);
+		}
+
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+		// The event the panel reads fires WITH the notice, never on its own.
+		expect(h.calls.events.filter((event) => event.type === "pool.underBudgeted")).toHaveLength(1);
+	});
+
+	test("a ceiling the operator moves is the one coarse step that reports again", async () => {
+		const h = harness({ config: { workers: 2 } });
+		const ids = await saturated(h);
+		h.store.claim(ids[2], "w1", 300, []); // floor 5 > ceiling 2
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+
+		// The floor keeps moving under the same ceiling: still silent.
+		h.store.release(ids[2], "w1", "floor jitter");
+		h.advance(2000);
+		await h.controller.tick();
+		h.store.claim(ids[2], "w1", 300, []);
+		h.advance(2000);
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+
+		// The operator raises config.workers to 3: still over budget (floor 5), but the budget they are
+		// being asked to raise has changed, so the new one is said out loud.
+		h.config.workers = 3;
+		h.advance(2000);
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes("the operator's ceiling is 3"))).toHaveLength(1);
+		// The notice it replaces is not repeated on top of it.
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+		expect(h.calls.events.filter((event) => event.type === "pool.underBudgeted")).toHaveLength(2);
+	});
+
+	test("an echo inside the cooldown stays silent; a return after real silence reports again", async () => {
+		const h = harness({ config: { workers: 2 } });
+		const ids = await saturated(h);
+		h.store.claim(ids[2], "w1", 300, []);
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+
+		// The shortage clears: four ready rows and nothing held fits a pool of 2.
+		for (const id of ids) h.store.release(id, "w1", "done");
+		await h.controller.tick();
+		h.advance(20_000);
+		// It comes back inside the cooldown: the echo of the episode the operator already knows about.
+		for (const id of ids.slice(0, 3)) h.store.claim(id, "w1", 300, []);
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(1);
+
+		// Away again, and back only after a silence longer than the cooldown: a new episode.
+		for (const id of ids) h.store.release(id, "w1", "done");
+		await h.controller.tick();
+		h.advance(UNDER_BUDGET_COOLDOWN_MS + 1_000);
+		for (const id of ids.slice(0, 3)) h.store.claim(id, "w1", 300, []);
+		await h.controller.tick();
+		expect(h.calls.main.filter((line) => line.includes(ceilingNotice))).toHaveLength(2);
+		expect(h.calls.events.filter((event) => event.type === "pool.underBudgeted")).toHaveLength(2);
 	});
 });
 
