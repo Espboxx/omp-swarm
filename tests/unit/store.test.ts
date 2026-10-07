@@ -26,6 +26,13 @@ function makeRoot(): { store: SwarmStore; paths: SwarmPaths } {
 	return { store, paths };
 }
 
+/** Reach into the same DB from a second connection: "time passed" without a wall-clock sleep. */
+function ageDatabase(paths: SwarmPaths, sql: string, ...params: (number | string)[]): void {
+	const clock = openDatabase(paths);
+	clock.run(sql, ...params);
+	clock.close();
+}
+
 function runChild(args: string[]): Promise<ChildResult> {
 	const proc = Bun.spawn(["bun", "run", CHILD, ...args], { stdout: "pipe", stderr: "pipe" });
 	return (async () => {
@@ -828,6 +835,83 @@ describe("the offline marker is a read-side judgement, not a sentence", () => {
 		expect(store.release(two.id, "BrightTiger", "nothing left")).toBe(true);
 		expect(store.listAgents()[0]?.status).toBe("idle");
 		expect(store.listAgents()[0]?.currentTask).toBeFalsy();
+		store.close();
+	});
+});
+
+describe("an agent row cannot claim a state its holdings do not justify", () => {
+	/**
+	 * The same class as the offline marker, one member further on: `reviewing` (and `working`) were echoed
+	 * back by every beat, so a status outlived the row that caused it. LunarTiger read `reviewing` with
+	 * NO review lease in the tasks table (msg #235) and nothing could ever correct it, because the beat
+	 * passed the stored status straight back and `heartbeat()` used it verbatim.
+	 */
+	test("a review taken over by another reviewer settles the first one on its next beat", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "LunarTiger", role: "reviewer", capabilities: ["reviewer"], status: "idle" });
+		store.registerAgent({ id: "SwiftTiger", role: "reviewer", capabilities: ["reviewer"], status: "idle" });
+		const task = store.createTask({ title: "needs a look", createdBy: "main" });
+		expect(store.claim(task.id, "peer-author", 300, ["general"]).ok).toBe(true);
+		expect(store.complete(task.id, "peer-author", { summary: "done", reviewRequired: true }).ok).toBe(true);
+
+		expect(store.claimReview(task.id, "LunarTiger", 60).ok).toBe(true);
+		expect(store.listAgents().find((a) => a.id === "LunarTiger")?.status).toBe("reviewing");
+
+		// Its 60s lease lapses and another reviewer takes the slot: the tasks table no longer grants
+		// LunarTiger anything, so `reviewing` on its row is a state with no cause.
+		ageDatabase(paths, "UPDATE tasks SET review_lease_until=? WHERE id=?", Date.now() - 1_000, task.id);
+		expect(store.claimReview(task.id, "SwiftTiger", 60).ok).toBe(true);
+
+		store.heartbeat("LunarTiger", undefined, undefined, 300);
+		const row = store.listAgents().find((a) => a.id === "LunarTiger");
+		expect(row?.status).toBe("idle"); // never a review the tasks table does not grant
+		expect(row?.currentTask ?? null).toBeNull();
+		store.close();
+	});
+
+	test("a claim swept away settles a stale `working` on the next beat", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "BrightTiger", role: "general", capabilities: ["general"], status: "idle" });
+		const task = store.createTask({ title: "held work", createdBy: "main" });
+		expect(store.claim(task.id, "BrightTiger", 300, ["general"]).ok).toBe(true);
+		expect(store.listAgents()[0]?.status).toBe("working");
+
+		ageDatabase(paths, "UPDATE tasks SET lease_until=? WHERE id=?", Date.now() - 1_000, task.id);
+		store.sweep(60); // the lease lapses and the row returns to the pool
+		expect(store.getTask(task.id)?.status).toBe("ready");
+
+		store.heartbeat("BrightTiger", undefined, undefined, 300);
+		expect(store.listAgents()[0]?.status).toBe("idle");
+		expect(store.listAgents()[0]?.currentTask ?? null).toBeNull();
+		store.close();
+	});
+
+	test("the two declared states survive a beat: blocked/waiting are not derived from holdings", () => {
+		const { store } = makeRoot();
+		store.registerAgent({ id: "CalmTiger", role: "general", capabilities: ["general"], status: "idle" });
+		store.setAgentStatus("CalmTiger", "blocked");
+		store.heartbeat("CalmTiger", undefined, undefined, 300);
+		expect(store.listAgents()[0]?.status).toBe("blocked");
+
+		store.setAgentStatus("CalmTiger", "waiting");
+		store.heartbeat("CalmTiger", undefined, undefined, 300);
+		expect(store.listAgents()[0]?.status).toBe("waiting");
+		store.close();
+	});
+
+	test("a refused decision never stamps the reviewer", () => {
+		const { store } = makeRoot();
+		store.registerAgent({ id: "LunarTiger", role: "reviewer", capabilities: ["reviewer"], status: "idle" });
+		store.registerAgent({ id: "SwiftTiger", role: "reviewer", capabilities: ["reviewer"], status: "idle" });
+		const task = store.createTask({ title: "needs a look", createdBy: "main" });
+		expect(store.claim(task.id, "peer-author", 300, ["general"]).ok).toBe(true);
+		expect(store.complete(task.id, "peer-author", { summary: "done", reviewRequired: true }).ok).toBe(true);
+		expect(store.claimReview(task.id, "SwiftTiger", 60).ok).toBe(true);
+
+		const denied = store.decide(task.id, "LunarTiger", true, "notes");
+		expect(denied.ok).toBe(false);
+		expect(store.listAgents().find((a) => a.id === "LunarTiger")?.status).toBe("idle");
+		expect(store.getTask(task.id)?.status).toBe("review"); // the holder keeps it
 		store.close();
 	});
 });

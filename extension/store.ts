@@ -400,18 +400,11 @@ export class SwarmStore {
 		this.#log("agent.leave", id);
 	}
 
-	/** Does this agent still hold a claim? The one question that decides whether an idle-looking row is true. */
-	#holdsClaim(agentId: string): boolean {
-		return this.#db.get<{ id: string }>("SELECT id FROM tasks WHERE claimed_by=? AND status='claimed' LIMIT 1", agentId) !== null;
-	}
-
 	/**
-	 * Put an agent row back in step with what it still holds. The four transitions below used to write
-	 * `idle` + a NULL `current_task` unconditionally, which is how a row could read `idle` while `tasks`
-	 * still showed a row claimed by it — the contradiction behind "/swarm status says 0 working while four
-	 * rows are claimed", and part of why the operator could not tell who was burning.
+	 * What the pool can PROVE about an agent from the rows it holds — the only three statuses a beat may
+	 * re-derive. `blocked`/`waiting` are declared by a caller, not derived, so they are not here.
 	 */
-	#settleAgent(agentId: string, now: number): void {
+	#derivedState(agentId: string): { status: AgentStatus; currentTask: string | null } {
 		const claimed = this.#db.get<{ id: string }>(
 			"SELECT id FROM tasks WHERE claimed_by=? AND status='claimed' ORDER BY priority DESC, created_at ASC LIMIT 1",
 			agentId,
@@ -419,15 +412,30 @@ export class SwarmStore {
 		const reviewing =
 			claimed === null
 				? this.#db.get<{ id: string }>(
-						"SELECT id FROM tasks WHERE reviewer=? AND status='review' ORDER BY priority DESC, created_at ASC LIMIT 1",
+						`SELECT id FROM tasks WHERE reviewer=? AND status='review' AND (review_lease_until IS NULL OR review_lease_until > ?)
+						 ORDER BY priority DESC, created_at ASC LIMIT 1`,
 						agentId,
+						Date.now(),
 					)
 				: null;
-		const status: AgentStatus = claimed !== null ? "working" : reviewing !== null ? "reviewing" : "idle";
+		return {
+			status: claimed !== null ? "working" : reviewing !== null ? "reviewing" : "idle",
+			currentTask: claimed?.id ?? reviewing?.id ?? null,
+		};
+	}
+
+	/**
+	 * Put an agent row back in step with what it still holds. The four transitions used to write `idle` +
+	 * a NULL `current_task` unconditionally, which is how a row could read `idle` while `tasks` still
+	 * showed a row claimed by it — the contradiction behind "/swarm status says 0 working while four rows
+	 * are claimed", and part of why the operator could not tell who was burning.
+	 */
+	#settleAgent(agentId: string, now: number): void {
+		const derived = this.#derivedState(agentId);
 		this.#db.run(
 			"UPDATE agents SET status=?, current_task=?, heartbeat_at=? WHERE id=?",
-			status,
-			claimed?.id ?? reviewing?.id ?? null,
+			derived.status,
+			derived.currentTask,
 			now,
 			agentId,
 		);
@@ -437,20 +445,20 @@ export class SwarmStore {
 		const now = Date.now();
 		const agent = this.#db.get<{ status: AgentStatus; current_task: string | null }>("SELECT status, current_task FROM agents WHERE id=?", id);
 		if (!agent) return;
-		// A beat IS liveness, so it can never conclude in the corpse marker. `offline` is a read-side
-		// judgement (`markStaleAgentsOffline`) — not something a beating worker re-asserts. The old
-		// `COALESCE(status, …)` let the driver echo the stored 'offline' straight back, so every beat
-		// re-wrote it and the marker became permanent: the session was alive and burning while
-		// `/swarm status` said nobody was online. An explicit non-offline status still wins; a beat that
-		// reaches an offline row revives it to what the row really is, which is what the pool's own
-		// claimability and starvation logic read.
+		// `blocked`/`waiting` are DECLARED by a caller, not derived from holdings, so a beat leaves them.
+		const declared = agent.status === "blocked" || agent.status === "waiting";
+		const derived = declared ? { status: agent.status, currentTask: agent.current_task } : this.#derivedState(id);
+		// A beat IS liveness, so it can never conclude in the corpse marker (`offline` is a read-side
+		// judgement — task-173). An explicit non-offline status still wins. Otherwise the row is RE-DERIVED
+		// from its holdings instead of echoed back, so a state whose cause is gone cannot be re-asserted by
+		// the beat loop forever: that is how a stale `reviewing` outlived every review the agent held
+		// (task-176), and the same hole applied to `working`.
 		const requested = status === "offline" ? undefined : status;
-		const next = requested ?? (agent.status === "offline" ? (this.#holdsClaim(id) ? "working" : "idle") : agent.status);
 		this.#db.run(
 			"UPDATE agents SET heartbeat_at=?, status=?, current_task=? WHERE id=?",
 			now,
-			next,
-			currentTask === undefined ? agent.current_task : currentTask,
+			requested ?? derived.status,
+			currentTask === undefined ? derived.currentTask : currentTask,
 			id,
 		);
 		this.#db.run("UPDATE tasks SET lease_until=? WHERE claimed_by=? AND status='claimed'", now + leaseSeconds * 1000, id);
@@ -1258,6 +1266,9 @@ export class SwarmStore {
 			this.#log(approved ? "review.approve" : "review.reject", reviewer, taskId, { notes, promoted });
 			return { ok: true, task: this.getTask(taskId) };
 		});
+		// `claimReview` stamped `reviewing` before this transaction could reject the decision, and only the
+		// success path used to settle — so a refused decide left the stamp behind forever (task-176).
+		if (!result.ok) this.#settleAgent(reviewer, now);
 		if (result.ok) {
 			this.postBoard({
 				type: "REVIEW",

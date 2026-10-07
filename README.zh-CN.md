@@ -67,7 +67,7 @@ web/
   lib/         the read-only DB handle, asset path resolution and the row types
   assets/      the page itself: index.html, app.js, style.css, strings.js (zh/en) and its sample snapshot
 tests/
-  unit/store.test.ts           50 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, and the two ways an unclaimable row can be closed
+  unit/store.test.ts           54 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, a status that can never outlive the hold that justifies it, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
   unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
@@ -372,7 +372,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 451 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 455 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

@@ -617,8 +617,11 @@ export class SwarmDriver {
 	#beat(): void {
 		const { store, config } = this.#deps;
 		for (const worker of this.#workers.values()) {
-			const agent = store.getAgent(worker.spec.name);
-			store.heartbeat(worker.spec.name, agent?.status ?? "idle", undefined, config.leaseSeconds);
+			// No status is passed: the store re-derives what the row can PROVE from its holdings
+			// (working / reviewing / idle) and leaves the two declared states alone, so a status whose
+			// cause is gone cannot be re-asserted by the beat loop — the mirror of the offline marker
+			// (task-173, then the stale `reviewing` of task-176).
+			store.heartbeat(worker.spec.name, undefined, undefined, config.leaseSeconds);
 		}
 		store.sweep(config.offlineAfterSeconds);
 	}
