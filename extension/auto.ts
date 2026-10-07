@@ -168,19 +168,22 @@ export const SWARM_POLICY = [
 	"[MULTI-AGENT MODE] You are the coordinator of a peer swarm; the workers evaluate and execute the work.",
 	"The user's message is a task for the swarm. Do this, in this order:",
 	"1. Decide HOW MANY agents it needs (1 to your worker budget). Do NOT write the task list yourself:",
-	"   the workers read the goal, each propose their own split, merge it and claim the result.",
+	"   the workers read the goal, each propose their own split, merge it and claim the result - and they execute it, not you.",
 	"2. Call swarm_goal({ goal, agents }) ONCE with the user's request (carry every constraint they gave)",
-	"   and that agent count. It opens the planning round and starts the pool.",
-	"3. Tell the user the goal and the agent count, then STOP working on the task yourself: do not edit the files the workers own.",
+	"   and that agent count, BEFORE you run any other tool. It opens the planning round and starts the pool.",
+	"3. Tell the user the goal and the agent count, then STOP working on the task yourself: do not edit the files the workers own,",
+	"   do not run the commands a worker could run, and do not produce the deliverable yourself.",
 	"4. Stay available: answer progress questions with swarm_status / swarm_tasks / /swarm board.",
-	"If the user's message is a question, chat, or work that cannot be split, ignore this block and answer normally - do not call swarm_goal.",
+	"Anything that would create, change or delete a file, or produce a deliverable the user asked for, IS work: open a goal for it",
+	"BEFORE touching it - even when you could do it yourself, and even when the request reads like a finished specification.",
+	"Only a question, chat, or a request to explain something is answered directly, without swarm_goal.",
 ].join("\n");
 
 export const COORDINATOR_NOTICE =
 	"MULTI-AGENT MODE: this request is executed by a peer swarm. Publish the plan with swarm_task_create and do not edit the files yourself - the workers start automatically.";
 
 export const SWARM_NOTICE =
-	"MULTI-AGENT MODE: this request is executed by a peer swarm. Post it with swarm_goal (you only choose how many agents) and do not edit the files yourself - the workers split it, claim it and start automatically.";
+	"MULTI-AGENT MODE: this request is executed by a peer swarm. Call swarm_goal FIRST (you only choose how many agents) and do not do the work yourself - the workers split it, claim it and start automatically.";
 
 export const COORDINATOR_NUDGE =
 	"[swarm] no tasks exist yet for the user's request. Create them now with swarm_task_create (2-6 tasks, required_capabilities general/reviewer/integrator) so the swarm can start; if the request cannot be split, say so instead.";

@@ -652,6 +652,25 @@ describe("swarm-side planning", () => {
 		expect(h.controller.notice()).toContain("swarm_goal");
 	});
 
+	test("the swarm policy forbids the coordinator from doing the work itself, and the legacy text stays out of it", () => {
+		const h = harness();
+		h.controller.enable();
+		const policy = h.controller.policy();
+		// The escape clause is questions/chat/explanation only: a specification-shaped request is WORK.
+		expect(policy).toContain("open a goal for it");
+		expect(policy).toContain("even when you could do it yourself");
+		expect(policy).toContain("reads like a finished specification");
+		expect(policy).toContain("do not produce the deliverable yourself");
+		expect(policy).toContain("BEFORE you run any other tool");
+		expect(policy).not.toContain("work that cannot be split");
+		expect(h.controller.notice()).toContain("Call swarm_goal FIRST");
+		// The legacy coordinator path keeps its own text untouched (it ASKS for the task list).
+		const legacy = harness({ config: { planning: "coordinator" } });
+		legacy.controller.enable();
+		expect(legacy.controller.policy()).not.toContain("even when you could do it yourself");
+		expect(legacy.controller.policy()).toContain("Decompose it into 2-6 independent tasks");
+	});
+
 	test('planning: "coordinator" keeps the old text, notice and nudge', async () => {
 		const h = harness({ config: { planning: "coordinator" } });
 		h.controller.enable();
