@@ -70,12 +70,13 @@ tests/
   unit/store.test.ts           54 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, a status that can never outlive the hold that justifies it, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
-  unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/planning.test.ts        51 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
+  unit/planning-residue.test.ts  5 unit tests of the REAL goal-5 residue: every dependency the round folded must resolve to the survivor, and no row is ever minted for a reference that resolves to nothing
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/coordinator-guard.test.ts 17 unit tests of the coordinator-edit guard: when a main session may be told it is doing the workers' job, when silence is the right answer, and which bash commands count as writes
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
-  unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
+  unit/goal-tools.test.ts      10 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan, and a duplicate-ridden round creating one row per deliverable
   unit/tools.test.ts           13 unit tests of the worker's three contracts: swarm_wait's timeout must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`) while the constitution/bootstrap states the same rule and still refuses to stop with work in flight; a lifecycle call (renew/complete/release/fail) must drop only its OWN task's file holds instead of every reservation the caller holds; and swarm_wait must report only rows this agent could actually claim, so a row whose declared files another agent holds is NOT reported as work available
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
@@ -91,6 +92,7 @@ tests/
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
+  unit/helpers/goal5-round.ts  the real goal-5 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -259,7 +261,7 @@ message <id> <text>`（或 `swarm_message` 工具）仍然能在不离开这个�
 
 1. `swarm_goal({ goal, agents })` 在一个事务里写入目标行和它唯一的那一个规划任务，池子随后按目标的 agent 预算启动（至少 `agents`，上限 `config.workers`）。存活的目标在任何任务存在之前就已经计入名册定规模，并且它被刻意排除在停滞通知之外。
 2. 每个 worker 读这个目标（`swarm_status` 会列出它；规划任务本身带着简报），并用 `swarm_propose` 发布自己的拆分 —— 一条打了 `proposal` 标签、限定在该目标下的 board `OBSERVATION`，所以整个集群都能读到并回应它（可以用 `swarm_message` 完善别的 agent 的提案）。
-3. 第一个 `swarm_claim` 到规划任务的 worker 就是 **scribe**。随后 `swarm_plan` 在一次事务里合并这一轮：只有在调用者仍持有那次认领、目标仍然 open、并且至少有一条提案时它才继续。它按**产出什么**而不是标题措辞去重：标题完全相同的一律合并；其余情况下的键是**目标产物**（提案声明的 `files`，否则是标题里的文件名 —— 只有路径形状、或结尾是已知文件扩展名的 token 才算文件名，所以 `1.2.3`、`v1.0.beta` 这类版本号不是文件名，也就无法把两个交付物并成一个）加上**工作类型**（write/verify/fix/document/remove/refactor）。同一个产物上的两个 **writer** 永远只算一个交付物 —— 产物只有一个归属 —— 而同一交付物上的两个非写入视角（比如一个 writer 和一个 verifier）则在「一方是另一方的某一节」或措辞足够接近时才合并。文件、能力与依赖取并集并入存留者，描述取最长的那条；池子里已经持有的交付物会被跳过并如实报告；**没有可识别产物**的提案不与任何东西匹配（错误合并会丢工作，错误拆分只是多一个任务）。合并后的拆分以 `DECISION` 发布，目标被标记为 planned。
+3. 第一个 `swarm_claim` 到规划任务的 worker 就是 **scribe**。随后 `swarm_plan` 在一次事务里合并这一轮：只有在调用者仍持有那次认领、目标仍然 open、并且至少有一条提案时它才继续。它按**产出什么**而不是标题措辞去重：键是**目标产物**（提案声明的 `files`，否则是标题里的文件名 —— 只有路径形状、或结尾是已知文件扩展名的 token 才算文件名，所以 `1.2.3`、`v1.0.beta` 这类版本号不是文件名，也就无法把两个交付物并成一个）加上**工作类型**（write/verify/fix/document/remove/refactor，从标题里按中英文读，绝不从描述里读）。两个产物只会在同一种规范形式下比较 —— 大小写、分隔符、开头的 `./`、结尾的 `/` 或 `/**` —— 而当名字对得上时，一个目录与它里面的文件是同一个目标，所以 `scratch/advisory-burnrate/**`、`scratch/advisory-burn/rate-table.md`、`scratch/advisory-burn/` 是**一个**交付物而不是三个。标题完全相同的一律合并，中文标题与英文标题则在它们共享的产物上配对。未知类型（`other`）不与任何东西冲突，但两个**已知**且不同的类型永不合并：一个修复和针对它的验证，即使措辞重叠也仍然是两个任务。同一个产物上的两个 **writer** 永远只算一个交付物 —— 产物只有一个归属 —— 而同一交付物上的两个非写入视角，只在「一方是另一方的某一节」「措辞足够接近」或「一方多声明了产物」时才合并。文件、能力与依赖取并集并入存留者，描述取最长的那条；池子里已经持有的交付物会被跳过并如实报告。依赖引用会在这一轮见过的每一种拼法里解析，并落到任何折叠的**存留者**上：所以一个 agent 可以依赖另一个 agent 用别的措辞提出的交付物，而没有一条边会指向已经输掉的行；解析不到任何东西的引用会被**如实报告并丢弃**，绝不会被铸成它自己的任务。合并后的拆分以 `DECISION` 发布，其中逐条打印每个被折叠的行、它折进去的存留者以及理由，所以不看数据库也能审计一次合并 —— 而每一个存疑情形的方向都是一样的：错误合并会丢工作，错误拆分只是多一个任务。之后目标被标记为 planned。
 4. 规划任务完成，之后所有人通过那条并未改动的循环认领真正的任务。
 
 恰好一次靠的是**原子认领**，而不是时序：两个 agent 不可能同时持有规划任务，而一个过期租约（scribe 中途死掉）会把它交给下一个认领者，后者可以安全地重新合并，因为创建对池子而言是幂等的。

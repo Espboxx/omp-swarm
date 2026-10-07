@@ -79,12 +79,13 @@ tests/
   unit/store.test.ts           54 unit tests of atomic claim, leases and crash recovery, dependencies, review, the blackboard, reservations, messaging, the offline marker as a read-side judgement, a status that can never outlive the hold that justifies it, and the two ways an unclaimable row can be closed
   unit/auto.test.ts            59 unit tests of multi-agent mode: roster derivation, the goal budget, the planning round's bound, mid-run growth and the assemble/self-stop state machine
   unit/driver.test.ts          13 unit tests of the no-change wake edges: ten unchanged idle ticks cost ZERO model calls, ten unchanged ticks over an already-claimable row cost one rather than ten, a real change (claimable work, a peer message, a live goal, a different row set at the same count) wakes the worker on the very next tick, a HELD task keeps a bounded stepped nudge instead of one per tick, and the empty streak's stepped window parks it until a change
-  unit/planning.test.ts        38 unit tests of the planning round's pure rules: the dedupe key, proposal parsing, the merge, the creation order and the task brief
+  unit/planning.test.ts        51 unit tests of the planning round's pure rules: the dedupe key (artifact normalization, the language-blind pairing, the false-merge guard), proposal parsing, the merge and the fold record it leaves, the creation order and the task brief
+  unit/planning-residue.test.ts  5 unit tests of the REAL goal-5 residue: every dependency the round folded must resolve to the survivor, and no row is ever minted for a reference that resolves to nothing
   unit/scaling.test.ts         18 unit tests of the pool-size rule: collapsing concurrent asks into one resize, the ceiling clamp, the floor, the shrink deferral and the cooldown
   unit/starvation.test.ts      12 unit tests of the unclaimable-ready-work rule: which ready rows no online agent can take, and the notice that must follow
   unit/coordinator-guard.test.ts 17 unit tests of the coordinator-edit guard: when a main session may be told it is doing the workers' job, when silence is the right answer, and which bash commands count as writes
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
-  unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
+  unit/goal-tools.test.ts      10 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan, and a duplicate-ridden round creating one row per deliverable
   unit/tools.test.ts           13 unit tests of the worker's three contracts: swarm_wait's timeout must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`) while the constitution/bootstrap states the same rule and still refuses to stop with work in flight; a lifecycle call (renew/complete/release/fail) must drop only its OWN task's file holds instead of every reservation the caller holds; and swarm_wait must report only rows this agent could actually claim, so a row whose declared files another agent holds is NOT reported as work available
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
@@ -100,6 +101,7 @@ tests/
   unit/host-free-load.test.ts   3 checks that the extension loads under `bun --no-install` in a node_modules-free tree, with a negative control
   helpers/swarm-child.ts       child-process worker used by the race tests
   unit/helpers/goal-child.ts   child-process scribe used by the cross-process planning-race test
+  unit/helpers/goal5-round.ts  the real goal-5 proposals copied out of `.swarm/swarm.db` verbatim, the fixture the merge's hardest pairings are decided on
   integration/harness.ts       scratch project, seeded tasks, shared assertions
   integration/sdk-run.ts       live swarm driven through the SDK (headless)
   integration/swarm-run.ts     live swarm driven through a real `omp --mode rpc` session
@@ -393,17 +395,28 @@ The planning round (mode `"swarm"`), in order:
 3. The first worker to `swarm_claim` the planning task is the **scribe**. `swarm_plan` then merges the
    round in ONE transaction: it refuses unless the caller still holds that claim, the goal is still
    open, and at least one proposal exists. It dedupes a deliverable by WHAT IS PRODUCED, not by the
-   wording: identical titles always collapse, and otherwise the key is the TARGET ARTIFACT (the `files`
-   a proposal declares, else the file names in its title — where a title token counts as one only if it
-   is path-shaped or ends in a known file extension, so a version tag like `1.2.3` or `v1.0.beta` is not
-   a file name and cannot make two deliverables one) plus the KIND of work
-   (write/verify/fix/document/remove/refactor). On one artifact, two WRITERS are always one task — an
-   artifact has one owner — while two non-writing views of it (a writer and a verifier, say) collapse
-   when one is a section of the other or the wording is close enough. Files, capabilities and
-   dependencies are unioned into the survivor and the longest description is kept; deliverables the pool
-   already holds are skipped and reported, and a proposal with NO identifiable artifact matches nothing
-   at all (a false merge loses work; a false split only costs a task). The merged split is posted as a
-   `DECISION` and the goal is marked planned.
+   wording: the key is the TARGET ARTIFACT (the `files` a proposal declares, else the file names in its
+   title — where a title token counts as one only if it is path-shaped or ends in a known file
+   extension, so a version tag like `1.2.3` or `v1.0.beta` is not a file name and cannot make two
+   deliverables one) plus the KIND of work (write/verify/fix/document/remove/refactor), read from the
+   title in English or Chinese and never from the description. Two artifacts are compared only in one
+   normal form — case, separators, a leading `./`, a trailing `/` or `/**` — and a directory and a file
+   inside it name the same target when their names agree, so `scratch/advisory-burnrate/**`,
+   `scratch/advisory-burn/rate-table.md` and `scratch/advisory-burn/` are ONE deliverable and not three.
+   Identical titles always collapse, and a Chinese and an English title pair on the artifact they share.
+   An unknown kind (`other`) contradicts nothing, but two KNOWN kinds that differ never fold: a fix and
+   a verification of it stay two tasks even when their wording overlaps. On one artifact two WRITERS are
+   always one task — an artifact has one owner — while two non-writing views of it collapse only when
+   one is a section of the other, the wording is close enough, or one declares extra artifacts. Files,
+   capabilities and dependencies are unioned into the survivor and the longest description is kept, and
+   deliverables the pool already holds are skipped and reported. A dependency reference resolves against
+   every spelling the round saw and lands on the SURVIVOR of any fold, so an agent may depend on a
+   deliverable another agent phrased differently and no edge can point at a row that lost; a reference
+   that resolves to nothing is REPORTED and dropped, never minted into a task of its own. The merged
+   split is posted as a `DECISION` that prints every folded row beside the survivor it folded into and
+   the reason, so a merge can be audited without reading the database — and the direction of every
+   doubtful case is the same: a false merge loses work, a false split only costs a task. The goal is
+   then marked planned.
 4. The planning task completes and everyone claims the real tasks through the unchanged loop.
 
 Exactly-once is the ATOMIC CLAIM, not timing: two agents cannot hold the planning task at once, and a
