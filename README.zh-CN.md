@@ -76,6 +76,7 @@ tests/
   unit/coordinator-guard.test.ts 17 unit tests of the coordinator-edit guard: when a main session may be told it is doing the workers' job, when silence is the right answer, and which bash commands count as writes
   unit/goals.test.ts           14 unit tests of the goal lifecycle: the exactly-once scribe (incl. a 3-process race), the merge's idempotence, lease takeover and the bound
   unit/goal-tools.test.ts       9 unit tests of the round at the TOOL layer: swarm_goal -> swarm_propose -> swarm_claim -> swarm_plan
+  unit/tools.test.ts            5 unit tests of the idle worker's instruction pair: swarm_wait's timeout return must say END YOUR TURN (never invite invented work, and keep `wake: "timeout"`), and the constitution/bootstrap text must state the same rule while still refusing to stop with work in flight
   unit/render.test.ts          49 unit tests of the panel, task table, summary, progress bar, drain summary and age formatting
   unit/agentinfo.test.ts       30 unit tests of the agent-row facts: token/cost/context compaction, sorting, line fitting and colour
   unit/color.test.ts           39 unit tests of the reminder palette, status colours, painted output, host-parity width and control-byte sanitization
@@ -371,7 +372,7 @@ TUI 在信息量大时读起来吃力，所以集群也提供了一个页面 —
 ## 测试与已记录的运行
 
 ```bash
-bun run test                   # 433 unit tests in the 21 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
+bun run test                   # 438 unit tests in the 22 tracked files under tests/unit (incl. a 3-process claim race, a 3-process scribe race and a browser test)
 bun run typecheck              # tsc against the real OMP 18.6.1 host types
 bun run swarm:sdk              # live swarm, SDK-driven (headless, no TUI)
 bun run swarm:rpc              # live swarm through a real `omp --mode rpc` session + /swarm start

@@ -25,6 +25,18 @@ export interface SwarmToolDeps {
 	wake?: (to: string, text: string, urgent: boolean) => void;
 	/** Notified after ownership-changing calls so the driver can refresh its panel. */
 	onChange?: () => void;
+	/**
+	 * `swarm_wait`'s clock. Injected so a test can drive the wait window without a wall-clock sleep —
+	 * the tool blocks by looping, and a fake clock turns that loop into a deterministic no-op. Left out
+	 * in production, where `Date.now`/`Bun.sleep` are used (`driver.ts` injects `timers` the same way).
+	 */
+	clock?: WaitClock;
+}
+
+/** The two time primitives the wait tool needs, as one seam. */
+export interface WaitClock {
+	now(): number;
+	sleep(ms: number): Promise<void>;
 }
 
 type ZodBuilder = typeof zod;
@@ -72,6 +84,7 @@ export function isTaskStatus(value: string): value is TaskStatus {
  */
 export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 	const { store, config, identity, z, wake, onChange } = deps;
+	const clock: WaitClock = deps.clock ?? { now: Date.now, sleep: (ms) => Bun.sleep(ms) };
 
 	// Every tool call proves the agent is alive and keeps its leases warm.
 	const touch = (status?: "idle" | "working" | "reviewing") => {
@@ -713,20 +726,28 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_wait",
 		label: "Wait For Work",
 		description:
-			"Block until a claimable task or a peer message appears (default 25s, max 120s). Run this instead of ending your turn while the swarm is still running.",
+			"Block until a claimable task or a peer message appears (default 25s, max 120s). A cheap wait while someone else's work finishes: work that lands inside the window costs no model call. If nothing changes, END YOUR TURN — the driver wakes you on the next real change (claimable work, a review you may take, an unread message, a new goal), so waiting again only buys another model call for nothing.",
 		parameters: waitSchema,
 		approval: "read",
 		async execute(_id, params, _onUpdate, _ctx, signal) {
-			const deadline = Date.now() + Math.min(Math.max(params.seconds ?? 25, 1), 120) * 1000;
-			while (Date.now() < deadline) {
+			const deadline = clock.now() + Math.min(Math.max(params.seconds ?? 25, 1), 120) * 1000;
+			while (clock.now() < deadline) {
 				if (signal?.aborted) return ok("interrupted");
 				touch();
 				if (store.inbox(identity.id, 1).length > 0) return ok("message waiting: call swarm_inbox", { wake: "message" });
 				const next = claimable();
 				if (next.length > 0) return ok(`work available: ${next.map((t) => t.id).join(", ")}\n${renderTasks(next.slice(0, 10), Date.now())}`, { wake: "task" });
-				await Bun.sleep(1000);
+				await clock.sleep(1000);
 			}
-			return ok("no work within the wait window; check the board for something useful to add, then wait again or stop.", { wake: "timeout" });
+			// The window is for catching work that lands while someone else finishes, not for keeping this
+			// worker alive: the driver wakes an idle worker by itself when agent-relevant state changes
+			// (a matching ready row, a review it may take, an unread message, a new/live goal), so asking
+			// the worker to wait again is one model call spent on nothing. `wake: "timeout"` is kept — it
+			// is the contract callers and tests key on.
+			return ok(
+				"no work within the wait window, and nothing changed: the pool is idle. END YOUR TURN here — you will be woken when something changes. Do not invent work to stay busy; an empty pool is a real answer, not a gap to fill.",
+				{ wake: "timeout" },
+			);
 		},
 	};
 

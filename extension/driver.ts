@@ -244,7 +244,7 @@ export function workerSystemPrompt(spec: WorkerSpec, config: SwarmConfig, root: 
 		"7. Afterwards post what you learned: FACT for verified behaviour, FAIL for dead ends, RESULT for the outcome, QUESTION when you need a peer.",
 		"",
 		"Rules:",
-		"- Never end your turn while the swarm is running and work is claimable: use swarm_wait, then claim again.",
+		"- Keep working while there is work you can take or that you hold; when `swarm_wait` returns with nothing changed, END YOUR TURN — the driver wakes you on the next real change (claimable work, a review you may take, an unread message, a new goal), so waiting again only spends a model call. Never end your turn while you hold unfinished work, and never stall silently.",
 		"- Never touch a task another agent has claimed. If it is stuck (lease expired), it returns to the pool by itself.",
 		"- If a task is too large, split it with swarm_task_create (add dependencies instead of duplicating work).",
 		"- If you cannot finish, swarm_release with a reason. Never stall silently.",
@@ -258,7 +258,12 @@ export function workerSystemPrompt(spec: WorkerSpec, config: SwarmConfig, root: 
 	].join("\n");
 }
 
-function workerBootstrap(spec: WorkerSpec, config: SwarmConfig): string {
+/**
+ * The worker's first message. Exported beside {@link workerSystemPrompt} so the pair can be pinned by a
+ * test: both used to order the worker to keep looping ("Do not stop between tasks"), which cost one
+ * model call per idle wait window until the driver learned to wake a worker on a change.
+ */
+export function workerBootstrap(spec: WorkerSpec, config: SwarmConfig): string {
 	return [
 		`You are starting as swarm worker ${spec.name} (role ${spec.role}).`,
 		"Begin now:",
@@ -267,7 +272,7 @@ function workerBootstrap(spec: WorkerSpec, config: SwarmConfig): string {
 		"3. swarm_tasks status=ready, then swarm_claim the best match for your capabilities.",
 		"If there is no claimable task but swarm_status names an OPEN GOAL, that is your first job: read the goal, post your own split with swarm_propose, then claim the goal's planning task (the first claimer is the scribe that merges every proposal with swarm_plan).",
 		"4. Work the task in your working directory. Verify it. swarm_complete with a summary.",
-		"5. Keep going: swarm_wait when the pool is empty, then claim again. Do not stop between tasks.",
+		"5. Keep going while work exists: when a task ends, look for the next one (board, then swarm_tasks status=ready). When the pool has nothing for you, swarm_wait once; if it returns with nothing changed, end your turn — the driver wakes you when agent-relevant state changes.",
 		config.review
 			? "If a task you own is in review status and you are not its author, you may swarm_review it."
 			: "Review is disabled for this swarm; complete tasks directly.",
