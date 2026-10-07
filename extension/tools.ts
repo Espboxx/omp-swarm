@@ -263,12 +263,13 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_fail",
 		label: "Fail Task",
 		description:
-			"Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end. Also closes a task you do NOT hold when nobody holds it and a dependency of it can never reach done (a `failed`/missing/cyclic dependency) — permanently-blocked residue has no other exit, since the pool has no delete or archive.",
+			"Mark your task failed with the reason. A FAIL entry is posted to the blackboard automatically so peers never repeat the dead end. Also closes a task you do NOT hold, in two cases, since the pool has no delete or archive: (1) a dependency of it can never reach done (a `failed`/missing/cyclic dependency) — permanently-blocked residue; (2) it is `ready` or `blocked` with every dependency satisfied but NO online agent holds the capabilities it declares, and it has sat that way for at least ten minutes — a row nothing could claim would otherwise keep the batch from ever draining. A row any online agent could still claim is refused exactly as before.",
 		parameters: failSchema,
 		approval: "write",
 		async execute(_id, params) {
 			touch();
-			const result = store.fail(params.task_id, identity.id, params.reason);
+			// The unroutable close needs the window the config owns; the store never reads policy itself.
+			const result = store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
 			onChange?.();
 			if (!result.ok) return ok(`fail rejected: ${result.reason}`);
 			store.releaseReservations(identity.id);

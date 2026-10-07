@@ -291,6 +291,26 @@ export interface StatusSnapshot {
 }
 
 /**
+ * How long a row must have sat undisturbed before the unroutable exit may close it. An order of
+ * magnitude longer than the default offline window (60 s), so an agent reconnecting, a lease expiring
+ * or a review slot freeing cannot flip the condition mid-decision — and the same length as the
+ * planning round's own bound, because a capability that has not appeared in ten minutes is not coming
+ * from this pool.
+ */
+export const UNROUTABLE_GRACE_MS = 10 * 60_000;
+
+/**
+ * Caller-supplied policy for the unroutable close, because the window belongs to the config the caller
+ * already holds (the same reason `snapshot()` takes `offlineAfterSeconds` rather than reading it).
+ */
+export interface UnroutableClose {
+	/** An agent whose heartbeat is older than this counts as offline, exactly as `snapshot()` derives it. */
+	offlineAfterMs: number;
+	/** Override the grace window (tests pin the boundary with it). */
+	graceMs?: number;
+}
+
+/**
  * All swarm state lives in one SQLite database shared by every agent.
  * Every mutation that decides ownership runs inside `BEGIN IMMEDIATE`, so the
  * claim/lease/review races are settled by the database, not by agent etiquette.
@@ -741,7 +761,11 @@ export class SwarmStore {
 		});
 	}
 
-	fail(taskId: string, agentId: string, reason: string): { ok: boolean; task?: SwarmTask; reason?: string } {
+	/**
+	 * Fail a task. With no `unroutable` option this behaves exactly as it always has: the holder, or
+	 * unheld residue whose dependencies can never reach `done`.
+	 */
+	fail(taskId: string, agentId: string, reason: string, unroutable?: UnroutableClose): { ok: boolean; task?: SwarmTask; reason?: string } {
 		const now = Date.now();
 		const result = this.#db.transaction(() => {
 			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
@@ -754,8 +778,13 @@ export class SwarmStore {
 			const dead = this.deadDependencies(taskId);
 			const closable =
 				row.claimed_by === null && (row.status === "blocked" || row.status === "ready") && dead.length > 0;
-			if (!held && !closable) {
-				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}` };
+			// The OTHER way a row can be impossible, which the residue exit cannot reach: nobody holds it,
+			// every dependency is satisfied, and no agent ONLINE could claim it even if it tried. Only the
+			// caller can ask for this (it names the offline window), and the guards below are what keep it
+			// from ever closing work a capable agent could still take.
+			const stranded = !closable && unroutable !== undefined && this.#stranded(row, taskId, unroutable, now);
+			if (!held && !closable && !stranded) {
+				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}${this.#failHint(row, unroutable)}` };
 			}
 			this.#db.run(
 				"UPDATE tasks SET status='failed', result=?, claimed_by=NULL, claimed_at=NULL, lease_until=NULL, updated_at=? WHERE id=?",
@@ -766,11 +795,39 @@ export class SwarmStore {
 			// Only the holder goes idle: closing someone else's dead residue must not clear the
 			// caller's own current_task.
 			if (held) this.#db.run("UPDATE agents SET status='idle', current_task=NULL, heartbeat_at=? WHERE id=?", now, agentId);
-			this.#log("task.fail", agentId, taskId, { reason, closed: !held, deadDependencies: dead });
+			this.#log("task.fail", agentId, taskId, { reason, closed: !held, deadDependencies: dead, stranded });
 			return { ok: true, task: this.getTask(taskId) };
 		});
 		if (result.ok) this.postBoard({ type: "FAIL", agentId, taskId, content: reason, tags: ["failure"] });
 		return result;
+	}
+
+	/**
+	 * Whether an unheld row is unclaimable by EVERY online agent — the only case the unroutable exit
+	 * may close. Every guard is a refusal: the row is unheld and actionable, it has been undisturbed
+	 * for the grace window, its dependencies are all satisfied, it actually declares capabilities, and
+	 * at least one agent is online while none of them holds the whole set (`claim()` needs every
+	 * declared capability on the ONE agent that takes it). An empty roster is deliberately NOT enough:
+	 * a pool between batches must never become a licence to close ready work.
+	 */
+	#stranded(row: TaskRow, taskId: string, options: UnroutableClose, now: number): boolean {
+		if (row.claimed_by !== null || (row.status !== "ready" && row.status !== "blocked")) return false;
+		if (now - row.updated_at < (options.graceMs ?? UNROUTABLE_GRACE_MS)) return false;
+		if (this.unresolvedDependencies(taskId).length > 0) return false;
+		const required = parseList(row.required_capabilities);
+		if (required.length === 0) return false;
+		const online = this.listAgents().filter(
+			(agent) => agent.status !== "offline" && now - agent.heartbeatAt <= options.offlineAfterMs,
+		);
+		if (online.length === 0) return false;
+		return !online.some((agent) => required.every((cap) => agent.capabilities.includes(cap)));
+	}
+
+	/** Which guard refused an unheld actionable row, so a caller is not left guessing. */
+	#failHint(row: TaskRow, unroutable?: UnroutableClose): string {
+		if (row.claimed_by !== null || (row.status !== "ready" && row.status !== "blocked")) return "";
+		if (unroutable === undefined) return " (nothing here can close it: no dependency of it is dead)";
+		return " (an online agent can still claim it, or it has not been stranded for the grace window yet)";
 	}
 
 	/**

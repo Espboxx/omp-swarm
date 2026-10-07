@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { openDatabase, swarmPaths, type SwarmPaths } from "../../extension/db";
-import { SwarmStore, patternsConflict } from "../../extension/store";
+import { SwarmStore, UNROUTABLE_GRACE_MS, patternsConflict } from "../../extension/store";
 
 const CHILD = join(import.meta.dir, "..", "helpers", "swarm-child.ts");
 const roots: string[] = [];
@@ -359,6 +359,136 @@ describe("closing dead residue", () => {
 		expect(store.fail(b.id, "B", "CLOSED AS SUPERSEDED").ok).toBe(true);
 		expect(store.getTask(mine.id)?.status).toBe("claimed");
 		expect(store.getTask(mine.id)?.claimedBy).toBe("B");
+		store.close();
+	});
+});
+
+describe("closing a row nothing online can claim", () => {
+	/** A ready row requiring `reviewer`, undisturbed for longer than the grace window. */
+	const strandedRow = (store: SwarmStore, paths: SwarmPaths) => {
+		const task = store.createTask({ title: "audit", createdBy: "boot", requiredCapabilities: ["reviewer"] });
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET updated_at=? WHERE id=?", Date.now() - UNROUTABLE_GRACE_MS - 1_000, task.id);
+		raw.close();
+		return task;
+	};
+
+	test("an unheld ready row no online agent could claim is closable by a non-holder", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const task = strandedRow(store, paths);
+		expect(store.claim(task.id, "generalist", 300).ok).toBe(false);
+
+		const closed = store.fail(task.id, "generalist", "no online agent holds reviewer; re-filed as task-9", {
+			offlineAfterMs: 60_000,
+		});
+		expect(closed.ok).toBe(true);
+		expect(store.getTask(task.id)?.status).toBe("failed");
+		expect(store.getTask(task.id)?.claimedBy).toBeUndefined();
+		const entry = store.searchBoard({ type: "FAIL", taskId: task.id })[0];
+		expect(entry?.agentId).toBe("generalist");
+		expect(entry?.content).toContain("no online agent holds reviewer");
+		store.close();
+	});
+
+	test("a row an ONLINE agent could still claim is refused", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "reviewer", role: "reviewer", capabilities: ["reviewer", "general"] });
+		const task = strandedRow(store, paths);
+
+		const refused = store.fail(task.id, "generalist", "let me close it", { offlineAfterMs: 60_000 });
+		expect(refused.ok).toBe(false);
+		expect(refused.reason).toContain("can still claim it");
+		expect(store.getTask(task.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("an OFFLINE-only roster is not a licence to close ready work", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "reviewer", role: "reviewer", capabilities: ["reviewer", "general"] });
+		// Heartbeat far in the past: the agent is in the pool but not online.
+		const raw = openDatabase(paths);
+		raw.run("UPDATE agents SET heartbeat_at=? WHERE id='reviewer'", Date.now() - 10 * 60_000);
+		raw.close();
+		const task = strandedRow(store, paths);
+
+		// No online agent at all: refused, because an empty roster is the drain path's business.
+		expect(store.fail(task.id, "generalist", "close it", { offlineAfterMs: 60_000 }).ok).toBe(false);
+		expect(store.getTask(task.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("the grace window is real: a fresh row is refused, a stranded one is not", () => {
+		const { store } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const fresh = store.createTask({ title: "fresh", createdBy: "boot", requiredCapabilities: ["reviewer"] });
+		expect(store.fail(fresh.id, "generalist", "too early", { offlineAfterMs: 60_000 }).ok).toBe(false);
+		expect(store.getTask(fresh.id)?.status).toBe("ready");
+
+		// The default window is what refused it; an explicit wider override shows the row itself is eligible.
+		expect(store.fail(fresh.id, "generalist", "eligible now", { offlineAfterMs: 60_000, graceMs: 0 }).ok).toBe(true);
+		expect(UNROUTABLE_GRACE_MS).toBeGreaterThanOrEqual(60_000); // longer than the offline window it must outlast
+		store.close();
+	});
+
+	test("a row whose dependency is not satisfied is refused, however unroutable it looks", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const dep = store.createTask({ title: "first", createdBy: "boot" });
+		const blocked = store.createTask({ title: "later", createdBy: "boot", dependencies: [dep.id], requiredCapabilities: ["reviewer"] });
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET updated_at=? WHERE id=?", Date.now() - UNROUTABLE_GRACE_MS - 1_000, blocked.id);
+		raw.close();
+
+		expect(store.fail(blocked.id, "generalist", "close it", { offlineAfterMs: 60_000 }).ok).toBe(false);
+		expect(store.getTask(blocked.id)?.status).toBe("blocked");
+		store.close();
+	});
+
+	test("a row that declares no capability is never closed this way: anyone could claim it", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const open = store.createTask({ title: "anyone can take this", createdBy: "boot" });
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET updated_at=? WHERE id=?", Date.now() - UNROUTABLE_GRACE_MS - 1_000, open.id);
+		raw.close();
+
+		expect(store.fail(open.id, "generalist", "close it", { offlineAfterMs: 60_000 }).ok).toBe(false);
+		expect(store.getTask(open.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("without the option the rule is unchanged, and the residue exit still closes with it", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const task = strandedRow(store, paths);
+		// A store caller that does not name the window keeps the old behaviour exactly.
+		const refused = store.fail(task.id, "generalist", "no option");
+		expect(refused.ok).toBe(false);
+		expect(refused.reason).toContain("nothing here can close it");
+		expect(store.getTask(task.id)?.status).toBe("ready");
+
+		// …and passing the option does not disturb the residue path it has always had.
+		const a = store.createTask({ title: "A", createdBy: "boot" });
+		const b = store.createTask({ title: "B", createdBy: "boot", dependencies: [a.id] });
+		store.claim(a.id, "generalist", 300);
+		store.fail(a.id, "generalist", "superseded");
+		expect(store.fail(b.id, "generalist", "residue", { offlineAfterMs: 60_000 }).ok).toBe(true);
+		expect(store.getTask(b.id)?.status).toBe("failed");
+		store.close();
+	});
+
+	test("a row closed this way is indistinguishable downstream from any other failed row", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const stranded = strandedRow(store, paths);
+		const dependent = store.createTask({ title: "after it", createdBy: "boot", dependencies: [stranded.id] });
+
+		expect(store.fail(stranded.id, "generalist", "nothing could claim it", { offlineAfterMs: 60_000 }).ok).toBe(true);
+		// Same as the residue path: the dependent is now residue itself, and closable by the same rule.
+		expect(store.deadDependencies(dependent.id)).toEqual([stranded.id]);
+		expect(store.claim(dependent.id, "generalist", 300).ok).toBe(false);
+		expect(store.fail(dependent.id, "generalist", "residue follows").ok).toBe(true);
 		store.close();
 	});
 });
