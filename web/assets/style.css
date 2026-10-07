@@ -598,6 +598,23 @@ main {
 	color: var(--ink-faint);
 }
 
+/* The meta is a set of SLOTS, not one sentence: the owner carries the same visual weight as the status
+   badge beside the title, the age is emphasised (how stale), and the long fields take their own line so
+   the eye can skip them. Every field is still printed. */
+.task-meta .meta-owner {
+	border: 1px solid var(--line);
+	background: var(--bg);
+	border-radius: 999px;
+	padding: 0 8px;
+	color: var(--ink);
+}
+.task-meta .meta-age {
+	color: var(--ink);
+}
+.task-meta .meta-wide {
+	flex-basis: 100%;
+}
+
 .reason {
 	margin-top: 6px;
 	font-size: 13px;

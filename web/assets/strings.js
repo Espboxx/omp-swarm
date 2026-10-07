@@ -45,6 +45,7 @@ export const STRINGS = {
 		"agents.capabilities": "能力",
 		"agents.worktree": "工作树",
 		"agents.currentTask": "当前任务",
+		"agents.role": "角色",
 		"agents.none": "无",
 
 		"tasks.title": "任务",
@@ -144,7 +145,8 @@ export const STRINGS = {
 		"agents.lease": "lease",
 		"agents.capabilities": "capabilities",
 		"agents.worktree": "worktree",
-		"agents.currentTask": "current task",
+		"agents.currentTask": "Current task",
+		"agents.role": "role",
 		"agents.none": "none",
 
 		"tasks.title": "Tasks",

@@ -13,6 +13,7 @@
  *   - the page is read-only: the only controls are language, tabs and "show more".
  */
 import { STRINGS, LANGS } from "./strings.js";
+import { breakablePath } from "./format.js";
 
 const SNAPSHOT_URL = "/api/snapshot";
 const EVENTS_URL = "/api/events";
@@ -408,7 +409,7 @@ function renderAgents(snapshot) {
 				el(
 					"dl",
 					{ class: "kv" },
-					el("dt", { text: "role" }), el("dd", { text: agent.role ?? t("value.none") }),
+					el("dt", { text: t("agents.role") }), el("dd", { text: agent.role ?? t("value.none") }),
 					el("dt", { text: t("agents.currentTask") }), el("dd", {}, current),
 					el("dt", { text: t("agents.heartbeat") }),
 					el("dd", {}, timeAgo(agent.heartbeatAgeMs)),
@@ -421,7 +422,11 @@ function renderAgents(snapshot) {
 					el("dt", { text: t("agents.capabilities") }),
 					el("dd", { class: "chips" }, (agent.capabilities ?? []).map((cap) => el("span", { class: "chip", text: cap }))),
 					agent.worktree ? el("dt", { text: t("agents.worktree") }) : null,
-					agent.worktree ? el("dd", { class: "mono", text: agent.worktree }) : null,
+					// The path may break ONLY at its separators (`breakablePath` inserts a zero-width space
+					// after each one), and the raw value stays reachable on hover — it is lossless otherwise.
+					agent.worktree
+						? el("dd", { class: "mono path", text: breakablePath(agent.worktree), title: agent.worktree })
+						: null,
 				),
 			),
 		);
@@ -438,15 +443,22 @@ function reviewBadge(task) {
 
 function taskRow(task) {
 	const meta = [];
-	meta.push(el("span", {}, el("b", { text: `${t("tasks.owner")}:` }), task.claimedBy ?? t("tasks.unowned")));
+	// The meta is a set of SLOTS, not one sentence: the owner carries the chip weight the status badge has
+	// (and the age is emphasised) so "who owns what / how stale" is scannable, while the long fields take
+	// their own line. Every field is still printed — this is presentation, not removal.
+	meta.push(el("span", { class: "meta-owner" }, el("b", { text: `${t("tasks.owner")}:` }), task.claimedBy ?? t("tasks.unowned")));
 	if (typeof task.attempts === "number") meta.push(el("span", {}, el("b", { text: t("tasks.attempts", { n: task.attempts }) })));
-	if (typeof task.ageMs === "number") meta.push(el("span", {}, el("b", { text: `${t("tasks.age")}:` }), timeAgo(task.ageMs)));
+	if (typeof task.ageMs === "number") meta.push(el("span", { class: "meta-age" }, el("b", { text: `${t("tasks.age")}:` }), timeAgo(task.ageMs)));
 	if (typeof task.priority === "number" && task.priority > 0)
 		meta.push(el("span", {}, el("b", { text: t("tasks.priority", { n: task.priority }) })));
 	if ((task.dependencies ?? []).length > 0)
-		meta.push(el("span", {}, el("b", { text: `${t("tasks.deps")}:` }), el("span", { class: "mono", text: task.dependencies.join(", ") })));
+		meta.push(
+			el("span", { class: "meta-wide" }, el("b", { text: `${t("tasks.deps")}:` }), el("span", { class: "mono", text: task.dependencies.join(", ") })),
+		);
 	if ((task.files ?? []).length > 0)
-		meta.push(el("span", {}, el("b", { text: `${t("tasks.files")}:` }), el("span", { class: "mono", text: task.files.join(", ") })));
+		meta.push(
+			el("span", { class: "meta-wide" }, el("b", { text: `${t("tasks.files")}:` }), el("span", { class: "mono", text: task.files.join(", ") })),
+		);
 
 	return el(
 		"article",
