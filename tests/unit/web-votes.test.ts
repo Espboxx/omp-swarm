@@ -18,6 +18,9 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import puppeteer, { type Browser } from "puppeteer-core";
+import { createServer } from "../../web/server";
+import { makeFixtureDb } from "../../web/lib/fixture";
 import { voteBoardIds, votesFromSnapshot } from "../../web/assets/votes.js";
 import type { VoteView } from "../../web/assets/votes";
 
@@ -242,4 +245,65 @@ describe("the live swarm's own recorded rounds (feed-drift-proof assertions only
 		expect(spawn.absent).toEqual(["BrightTiger", "CalmTiger", "SwiftTiger"]);
 		expect(spawn.reason).toContain("timeout: 1/4 approved, needed 4");
 	});
+});
+
+/** Any readable database works: `?fixture=1` makes the page load the checked-in fixture instead. */
+const BROWSER_CANDIDATES = [
+	process.env.CHROME_PATH ?? "",
+	"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+	"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+	"/usr/bin/google-chrome",
+	"/usr/bin/chromium",
+	"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+];
+/** `undefined` on a machine without a Chromium-family browser: the test skips instead of failing. */
+const BROWSER_PATH = BROWSER_CANDIDATES.find((path) => path !== "" && existsSync(path));
+
+describe("the vote panel in the page's own DOM", () => {
+	test.skipIf(BROWSER_PATH === undefined)(
+		"the rendered panel states only what the payload states: no literal null on either tab",
+		async () => {
+			if (BROWSER_PATH === undefined) throw new Error("unreachable: the test is skipped without a browser");
+			const db = makeFixtureDb();
+			const server = createServer({
+				dbPath: db.path,
+				port: 0,
+				quiet: true,
+				assetsDir: join(import.meta.dir, "..", "..", "web", "assets"),
+			});
+			const browser: Browser = await puppeteer.launch({
+				executablePath: BROWSER_PATH,
+				headless: true,
+				args: ["--no-sandbox"],
+			});
+			try {
+				const page = await browser.newPage();
+				const failures: string[] = [];
+				page.on("pageerror", (error: unknown) => failures.push(`pageerror: ${error instanceof Error ? error.message : String(error)}`));
+				page.on("console", (message) => {
+					if (message.type() === "error") failures.push(`console: ${message.text()}`);
+				});
+				await page.setViewport({ width: 1280, height: 900 });
+				await page.goto(`http://127.0.0.1:${server.port}/?fixture=1#votes`, { waitUntil: "networkidle2", timeout: 30_000 });
+				await page.waitForSelector("#panel-votes", { timeout: 15_000 });
+
+				for (const tab of ["live", "recent"]) {
+					await page.click(`#vote-tab-${tab}`);
+					const rendered = await page.$eval("#panel-votes", (node) => {
+						const types: number[] = [];
+						for (let i = 0; i < node.childNodes.length; i++) types.push(node.childNodes[i]?.nodeType ?? -1);
+						return { text: node.textContent ?? "", childTypes: types };
+					});
+					expect(rendered.text).not.toContain("null");
+					// The two bare `null`s were TEXT_NODE children (type 3) with no wrapping element;
+					// the fix routes them through the project's own null-skipping append helper.
+					expect(rendered.childTypes.filter((type) => type === 3)).toEqual([]);
+				}
+				expect(failures).toEqual([]);
+			} finally {
+				await browser.close();
+				server.stop();
+			}
+		},
+	);
 });

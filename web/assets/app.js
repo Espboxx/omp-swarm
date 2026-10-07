@@ -768,7 +768,8 @@ function renderVotes(snapshot) {
 			dom.votesBody.append(el("p", { class: "empty", text: t("votes.empty.live") }));
 			return;
 		}
-		dom.votesBody.append(...liveRows, more, less);
+		// more/less are el() or null; route through append() so a null never becomes a text node.
+		append(dom.votesBody, [liveRows, more, less]);
 		return;
 	}
 
@@ -781,7 +782,8 @@ function renderVotes(snapshot) {
 		dom.votesBody.append(el("p", { class: "empty", text: t("votes.empty.recent") }));
 		return;
 	}
-	dom.votesBody.append(...recentRows, more, less);
+	// more/less are el() or null; route through append() so a null never becomes a text node.
+	append(dom.votesBody, [recentRows, more, less]);
 }
 
 function feedList(items, renderItem, tab) {
