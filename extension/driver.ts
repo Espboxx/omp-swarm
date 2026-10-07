@@ -63,6 +63,11 @@ export interface SwarmDriverDeps {
 	onDrained?(summary: DrainSummary): void;
 	/** Deliver a message to the main session (native `pi.sendMessage` path). */
 	deliverToMain?(text: string, urgent: boolean): void;
+	/**
+	 * The tick's clock. Injected for the same reason `timers` is: the unit tests run the tick by hand and
+	 * must not spend `idleTickSeconds` of real time to observe a stepped nudge. Left out in production.
+	 */
+	now?(): number;
 }
 
 /** Usage facts folded out of a worker's live session (task-32's obtainable route). */
@@ -641,7 +646,7 @@ export class SwarmDriver {
 		const goals = store.liveGoals();
 		for (const worker of this.#workers.values()) {
 			if (worker.session.isStreaming) continue;
-			const now = Date.now();
+			const now = this.#deps.now?.() ?? Date.now();
 			const { messages, mine, ready, reviews } = this.#workerState(worker.spec.name, worker.identity.capabilities);
 			const scribe = goals.find((goal) => mine.some((task) => task.id === goal.planningTask));
 			// Everything this worker can be prompted FOR, as ONE signature over the ID SETS — a different row

@@ -67,7 +67,7 @@ interface Harness {
 	tick(): Promise<void>;
 }
 
-function harness(overrides: Partial<SwarmConfig> = {}): Harness {
+function harness(overrides: Partial<SwarmConfig> = {}, now?: () => number): Harness {
 	const root = mkdtempSync(join(tmpdir(), "swarm-driver-unit-"));
 	tempDirs.push(root);
 	const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(root));
@@ -118,6 +118,7 @@ function harness(overrides: Partial<SwarmConfig> = {}): Harness {
 		exec: async () => ({ code: 1, stdout: "", stderr: "not a git repository" }),
 		notify: () => {},
 		onPanel: () => {},
+		now,
 	});
 
 	return {
@@ -304,5 +305,45 @@ describe("stalledWake: an obligation repeats on a bounded cadence and never park
 		const moved = stalledWake(state, "t:task-1,t:task-2", now, 15);
 		expect(moved.wake).toBe(true);
 		expect(moved.state.empty).toBe(0);
+	});
+});
+
+describe("a worker that HOLDS work is still driven", () => {
+	/**
+	 * The half the idle fix must NOT weaken: work ADDRESSED to a worker (a task it holds) is nudged on a
+	 * bounded cadence, because nothing else reclaims it — `#beat` renews every held task's lease, so a
+	 * silent holder would strand its task forever. The bound is the point: not one prompt per tick (the
+	 * loop task-171 removes), and not zero (a stranded holder). The clock is injected so the stepping is
+	 * observed without spending 15 real seconds per window.
+	 */
+	test("a held task keeps a bounded stepped nudge: not one per tick, and never zero", async () => {
+		let clock = 0;
+		const h = harness({}, () => clock);
+		await h.start();
+		const held = h.store.listAgents()[0]?.id ?? "";
+		h.store.createTask({ title: "held work", createdBy: "main" });
+		expect(h.store.claim("task-1", held, 300, ["general"]).ok).toBe(true);
+		await h.tick();
+
+		// The claim is a change: one nudge. Then the clock stands still, and a stalled holder costs NOTHING.
+		const afterClaim = h.prompts.length;
+		for (let i = 0; i < 5; i++) await h.tick();
+		expect(h.prompts.length).toBe(afterClaim);
+
+		// One nudge per ELAPSED window, on the stepped cadence: idleTickSeconds, then 2x, 4x … Half a
+		// window is not a window.
+		clock += 15_000;
+		await h.tick();
+		expect(h.prompts.length).toBe(afterClaim + 1);
+		clock += 15_000;
+		await h.tick();
+		expect(h.prompts.length).toBe(afterClaim + 2);
+		clock += 7_000;
+		await h.tick();
+		expect(h.prompts.length).toBe(afterClaim + 2);
+		clock += 23_000; // the second window stepped to 2x: the next nudge is 30s after the last one
+		await h.tick();
+		expect(h.prompts.length).toBe(afterClaim + 3);
+		expect(h.prompts.at(-1)?.text).toContain("hold");
 	});
 });
