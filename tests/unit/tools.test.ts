@@ -100,6 +100,80 @@ describe("swarm_wait: an idle pool ends the turn", () => {
 	});
 });
 
+describe("a lifecycle call releases only its own task's file holds", () => {
+	/**
+	 * The lock that used to evaporate: `swarm_renew` called `releaseReservations(identity.id)` with no
+	 * patterns, so the one call the docs tell a busy agent to make deleted every reservation it held —
+	 * and closing one task also dropped another task's files (FAIL #602). A reservation is the only
+	 * thing stopping two agents from writing one file, so this is the difference between a lock and a
+	 * line in the docs.
+	 */
+	const patternsOf = (store: SwarmStore, id: string) =>
+		store
+			.listReservations()
+			.filter((row) => row.owner === id)
+			.map((row) => row.pattern)
+			.sort();
+
+	/** Two tasks with disjoint declared files, both claimed by the same worker. */
+	const twoClaimedTasks = async (store: SwarmStore, call: (name: string, params: object) => Promise<CallResult>) => {
+		store.createTask({ title: "a", createdBy: "main", files: ["omp-swarm/extension/a.ts"] });
+		store.createTask({ title: "b", createdBy: "main", files: ["omp-swarm/extension/b.ts"] });
+		await call("swarm_claim", { task_id: "task-1" });
+		await call("swarm_claim", { task_id: "task-2" });
+	};
+
+	test("renewing keeps every reservation the caller holds", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-renew")));
+		const { call } = workerTools(store, "SwiftTiger", fakeClock());
+		await twoClaimedTasks(store, call);
+		// A hold the agent made by hand carries no task, so nothing it does to a task may drop it.
+		await call("swarm_reserve", { paths: ["scratch/notes.md"] });
+		const before = patternsOf(store, "SwiftTiger");
+		expect(before).toContain("omp-swarm/extension/a.ts");
+
+		const { text } = await call("swarm_renew", {});
+		expect(text).toContain("renewed: task-1, task-2");
+		expect(patternsOf(store, "SwiftTiger")).toEqual(before);
+	});
+
+	test("completing one task keeps the other task's reservation", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-complete")));
+		const { call } = workerTools(store, "SwiftTiger", fakeClock());
+		await twoClaimedTasks(store, call);
+
+		await call("swarm_complete", { task_id: "task-1", summary: "done" });
+		expect(patternsOf(store, "SwiftTiger")).toEqual(["omp-swarm/extension/b.ts"]);
+	});
+
+	test("releasing one task keeps the other task's reservation", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-release")));
+		const { call } = workerTools(store, "SwiftTiger", fakeClock());
+		await twoClaimedTasks(store, call);
+
+		await call("swarm_release", { task_id: "task-1", reason: "blocked" });
+		expect(patternsOf(store, "SwiftTiger")).toEqual(["omp-swarm/extension/b.ts"]);
+	});
+
+	test("failing one task keeps the other task's reservation", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-fail")));
+		const { call } = workerTools(store, "SwiftTiger", fakeClock());
+		await twoClaimedTasks(store, call);
+
+		await call("swarm_fail", { task_id: "task-1", reason: "dead end" });
+		expect(patternsOf(store, "SwiftTiger")).toEqual(["omp-swarm/extension/b.ts"]);
+	});
+
+	test("the unreserve tool still releases exactly the paths it is given", async () => {
+		const store = new SwarmStore(openInMemoryDatabase(), swarmPaths(join(tmpdir(), "swarm-tools-unreserve")));
+		const { call } = workerTools(store, "SwiftTiger", fakeClock());
+		await call("swarm_reserve", { paths: ["scratch/a.md", "scratch/b.md"] });
+
+		await call("swarm_unreserve", { paths: ["scratch/a.md"] });
+		expect(patternsOf(store, "SwiftTiger")).toEqual(["scratch/b.md"]);
+	});
+});
+
 describe("the worker's instruction pair states the rule the driver can honour", () => {
 	const spec = { name: "RapidTiger", role: "general", capabilities: ["general"], index: 0 };
 

@@ -91,6 +91,20 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		store.heartbeat(identity.id, status, undefined, config.leaseSeconds);
 	};
 
+	/**
+	 * Release ONLY the reservations the task being closed registered. A lifecycle tool must never drop
+	 * holds the caller still needs elsewhere: the blanket `releaseReservations(identity.id)` this
+	 * replaces deleted every pattern the agent owned, so `swarm_renew` — the tool whose whole purpose is
+	 * to keep a hold alive while you work — eviscerated the file lock it was meant to protect, and
+	 * finishing one task also released another task's files (FAIL #602). Matching on the stored
+	 * `taskId` (rather than on the task's declared files) keeps this exact: the reservation rows carry
+	 * the patterns that were actually registered, so no normalization has to agree.
+	 */
+	const releaseTaskReservations = (taskId: string) => {
+		const mine = store.listReservations().filter((row) => row.owner === identity.id && row.taskId === taskId);
+		if (mine.length > 0) store.releaseReservations(identity.id, mine.map((row) => row.pattern));
+	};
+
 	const claimable = () =>
 		store.listTasks({ status: "ready", limit: 100 }).filter(
 			(t) => t.requiredCapabilities.length === 0 || t.requiredCapabilities.some((cap) => identity.capabilities.includes(cap)),
@@ -209,7 +223,9 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			const targets = params.task_id ? held.filter((t) => t.id === params.task_id) : held;
 			if (targets.length === 0) return ok("no held tasks to renew");
 			const renewed = targets.filter((t) => store.renew(t.id, identity.id, config.leaseSeconds)).map((t) => t.id);
-			store.releaseReservations(identity.id);
+			// A lease extension is not an ownership change, so renewing must not release anything: this
+			// call used to be a blanket wipe, which made "renew while you work" drop the file lock you
+			// were renewing for.
 			return ok(`renewed: ${renewed.join(", ") || "none"}`, { renewed });
 		},
 	};
@@ -224,7 +240,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		async execute(_id, params) {
 			touch();
 			const released = store.release(params.task_id, identity.id, params.reason ?? "released");
-			store.releaseReservations(identity.id);
+			releaseTaskReservations(params.task_id);
 			onChange?.();
 			if (!released) return ok(`nothing released: ${params.task_id} is not claimed by you`);
 			if (params.reason) store.postBoard({ type: "OBSERVATION", agentId: identity.id, taskId: params.task_id, content: `released: ${params.reason}` });
@@ -263,7 +279,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 				files: params.files,
 				tags: ["result"],
 			});
-			store.releaseReservations(identity.id);
+			releaseTaskReservations(params.task_id);
 			const state = result.task?.status ?? "done";
 			return ok(`${params.task_id} -> ${state}${state === "review" ? " (a peer must review before it counts as done)" : ""}`, {
 				status: state,
@@ -285,7 +301,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			const result = store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
 			onChange?.();
 			if (!result.ok) return ok(`fail rejected: ${result.reason}`);
-			store.releaseReservations(identity.id);
+			releaseTaskReservations(params.task_id);
 			return ok(`${params.task_id} -> failed; FAIL posted to the board`, { failed: true });
 		},
 	};
