@@ -740,3 +740,87 @@ describe("pool sizing from agent requests", () => {
 		expect(h.store.pendingScaleRequests()).toEqual([]); // decided as satisfied
 	});
 });
+
+describe("pool starvation: ready work nobody online can claim", () => {
+	/**
+	 * A running pool whose claimable work has been taken by an online general agent, so the only thing
+	 * left ready is whatever the test creates. Without the claim, a `ready` row that ANY online agent
+	 * could take would (correctly) silence the detector.
+	 */
+	async function claimedPool(h: Harness): Promise<void> {
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		h.store.createTask({ title: "claimable", createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(true);
+		h.setWorkers(1);
+		h.store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"] });
+		h.store.claim("task-1", "SwiftTiger", 300, ["general"]);
+	}
+
+	const starvationNotices = (h: Harness) => h.calls.notify.filter((line) => line.includes("can claim"));
+
+	test("a ready row demanding a capability nobody holds is notified once, named, and is not a stall", async () => {
+		const h = harness();
+		await claimedPool(h);
+		h.store.createTask({ title: "audit the thing", createdBy: "main", requiredCapabilities: ["reviewer"] });
+		const stops = h.calls.stop.length;
+
+		await h.controller.tick();
+		const notices = starvationNotices(h);
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("task-2");
+		expect(notices[0]).toContain("reviewer");
+		// The main session is told too, so a human can re-file the row.
+		expect(h.calls.main.filter((line) => line.includes("can claim"))).toHaveLength(1);
+		// Not a stall-stop of its own: the row is legitimate, only unroutable.
+		expect(h.calls.stop.length).toBe(stops);
+		expect(h.controller.phase).toBe("running");
+
+		// A tick repeating the same condition stays silent; growth never mints the capability.
+		const starts = h.calls.start.length;
+		await h.controller.tick();
+		expect(starvationNotices(h)).toHaveLength(1);
+		expect(h.calls.start.length).toBe(starts);
+	});
+
+	test("a capable but busy agent silences it: that is queueing, not starvation", async () => {
+		const h = harness();
+		await claimedPool(h);
+		h.store.registerAgent({ id: "VividTiger", role: "reviewer", capabilities: ["reviewer"] });
+		h.store.setAgentStatus("VividTiger", "working");
+		h.store.createTask({ title: "audit the thing", createdBy: "main", requiredCapabilities: ["reviewer"] });
+		await h.controller.tick();
+		expect(starvationNotices(h)).toEqual([]);
+	});
+
+	test("an offline capable agent does not count, and the notice re-arms on the next occurrence", async () => {
+		const h = harness();
+		await claimedPool(h);
+		h.store.registerAgent({ id: "VividTiger", role: "reviewer", capabilities: ["reviewer"] });
+		h.store.createTask({ title: "audit the thing", createdBy: "main", requiredCapabilities: ["reviewer"] });
+		await h.controller.tick();
+		expect(starvationNotices(h)).toEqual([]); // capable and online: fine
+
+		h.store.setAgentStatus("VividTiger", "offline");
+		await h.controller.tick();
+		expect(starvationNotices(h)).toHaveLength(1); // the condition, reported fresh
+
+		await h.controller.tick();
+		expect(starvationNotices(h)).toHaveLength(1); // and silent while it still holds
+	});
+
+	test("an ordinary ready pool with a capable idle agent is untouched (regression)", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		h.store.createTask({ title: "one", createdBy: "main", requiredCapabilities: ["general"] });
+		await settle(h);
+		h.setDriverRunning(true);
+		h.setWorkers(1);
+		h.store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"] });
+		await h.controller.tick();
+		expect(starvationNotices(h)).toEqual([]);
+	});
+});
+

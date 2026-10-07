@@ -13,6 +13,7 @@
  */
 import type { SwarmStore } from "./store";
 import { reconcilePool } from "./scaling";
+import { findStarvation } from "./starvation";
 import type { RoleConfig, SwarmConfig, SwarmGoal, SwarmTask, TaskCounts } from "./types";
 
 export type AutoPhase = "off" | "idle" | "planning" | "nudging" | "running" | "done" | "stalled";
@@ -206,6 +207,12 @@ export class AutoController {
 	#plannedWorkers = 0;
 	/** When the pool last changed size, for the resize cooldown. */
 	#lastResizeAt = 0;
+	/**
+	 * Identity of the last reported starvation condition (ready rows nobody online can claim). Held so
+	 * a tick repeating the same condition stays silent, and cleared the moment it stops so the next
+	 * occurrence — or a different row set — is reported again.
+	 */
+	#unclaimableKey: string | undefined;
 	readonly #scaleCooldownMs: number;
 	readonly #scaleWindowMs: number;
 
@@ -238,6 +245,7 @@ export class AutoController {
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
+		this.#unclaimableKey = undefined;
 		this.#setPhase("idle");
 	}
 
@@ -500,6 +508,42 @@ export class AutoController {
 				}
 			}
 
+			// Starvation: the pool is running and ready work exists that NO online agent can claim —
+			// every ready row declares a capability nobody online holds. Deliberately NOT a stall-stop
+			// (the rows are legitimate, only unroutable) and deliberately NOT a growth: the roster is
+			// minted from the plan's own role order, never from an individual row's capability string, so
+			// more workers cannot mint the missing capability — only a re-file or a different pool can.
+			// One notice per distinct condition, cleared as soon as somebody capable appears, so a later
+			// recurrence (or a different row set) reports again instead of inheriting the old silence.
+			if (this.#phase === "running" && this.#deps.isDriverRunning()) {
+				const report =
+					counts.ready > 0
+						? findStarvation({
+								ready: store.listTasks({ status: "ready", limit: 500 }),
+								agents: store.listAgents(),
+								now: this.#deps.now(),
+								offlineAfterMs: config.offlineAfterSeconds * 1000,
+							})
+						: undefined;
+				if (report === undefined) {
+					this.#unclaimableKey = undefined;
+				} else if (report.key !== this.#unclaimableKey) {
+					this.#unclaimableKey = report.key;
+					const rows = report.rows.map((row) => `${row.id} (${row.why})`).join(", ");
+					const notice =
+						report.online === 0
+							? `[swarm] ${report.rows.length} ready task(s) that no ONLINE agent can claim: ${rows}. Nothing is blocked, so nothing reports itself: start a pool (/swarm start) or re-file the work.`
+							: `[swarm] ready work nobody online can claim: ${rows}. This is not a stall, and growth cannot fix it (it only mints roles the plan asks for): re-file those task(s) with a capability the pool has, or add an agent that has it.`;
+					this.#deps.notify(notice, "warning");
+					this.#deps.notifyMain(notice);
+					this.#deps.onEvent?.("pool.unclaimable", {
+						rows: report.rows.map((row) => ({ id: row.id, missing: row.missing, why: row.why })),
+						missing: report.missing,
+						online: report.online,
+					});
+				}
+			}
+
 			this.#deps.onChange();
 		} finally {
 			this.#ticking = false;
@@ -550,6 +594,7 @@ export class AutoController {
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
+		this.#unclaimableKey = undefined;
 	}
 
 	#setPhase(phase: AutoPhase, data?: Record<string, unknown>): void {
