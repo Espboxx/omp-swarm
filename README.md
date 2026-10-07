@@ -648,8 +648,8 @@ board FACT #25). Red: `review cycle ran — 0 started, 0
 approved` and `seeded tasks reached a terminal or review state — task-1:done, task-2:done,
 task-3:done, task-4:done, task-5:ready`. Cause, reproducible in both verifier runs and NOT a
 regression from the iteration-2 changes: the harness crash test killed the first working agent, and
-seeded task-5 requires `requiredCapabilities: ["integrator"]` (`harness.ts:101`) — when the victim was
-the only integrator holder (`harness.ts:54`) that task was unclaimable, the runner never reached its
+seeded task-5 requires `requiredCapabilities: ["integrator"]` (`harness.ts:102`) — when the victim was
+the only integrator holder (`harness.ts:55`) that task was unclaimable, the runner never reached its
 break condition and ended on its own `--timeout`, so the review cycle of the task that did reach
 `review` never started.
 
@@ -736,11 +736,11 @@ lines once its own settle window passed, which is the one-batch-one-alert rule a
   `config.workers`, and only while the pool is running and undrained — a task published after the
   pool stopped or drained waits for the next `/swarm start` instead. Because the trigger is the ready
   count, a worker whose spawn failed is not replaced by a later growth: only new claimable work grows
-  the pool. The trigger compares the ready count with the LIVE worker count (`auto.ts:301`), not with
+  the pool. The trigger compares the ready count with the LIVE worker count (`auto.ts:414`), not with
   capability: ready work that no live worker is able to claim does not grow the pool by itself (seen
   in the pre-fix SDK run: 1 ready `integrator`-only task against 4 live workers → 0 `roster.grow`
   events; the harness now ends such a run with a `[stuck]` line instead of waiting for the timeout).
-  The delta itself is measured against `max(live, planned)` (`auto.ts:304`).
+  The delta itself is measured against `max(live, planned)` (`auto.ts:417`).
 - The status line and widget are extension UI frames — a headless session (`--no-ui`) emits none by
   host contract; use a UI-mode session to see them.
 - The batch-completion alert is one per batch and lands `DRAIN_SETTLE_MS` (10 s) after the task

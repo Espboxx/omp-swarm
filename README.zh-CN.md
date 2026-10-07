@@ -404,7 +404,7 @@ RPC 运行（它的报告是 `last-run.json`，直到下一次 SDK 运行覆盖�
 **修复前的运行，保留作为记录：** `bun run swarm:sdk -- --workers 5 --timeout 600` → **14/16
 checks passed**（`tests/integration/last-run.json`，5 个 worker，691 秒；验证者的字面输出，board FACT #25）。红项：`review cycle ran — 0 started, 0
 approved` 与 `seeded tasks reached a terminal or review state — task-1:done, task-2:done,
-task-3:done, task-4:done, task-5:ready`。原因在两次验证者运行中都可复现，而且**不是** iteration-2 改动带来的回归：harness 的崩溃测试杀掉了第一个工作中的 agent，而播种的 task-5 需要 `requiredCapabilities: ["integrator"]`（`harness.ts:101`）—— 当受害者是唯一的 integrator 持有者时（`harness.ts:54`），那个任务不可认领，运行器永远到不了它的跳出条件，于是在自己的 `--timeout` 上结束，所以那个确实到达 `review` 的任务的评审流程从未开始。
+task-3:done, task-4:done, task-5:ready`。原因在两次验证者运行中都可复现，而且**不是** iteration-2 改动带来的回归：harness 的崩溃测试杀掉了第一个工作中的 agent，而播种的 task-5 需要 `requiredCapabilities: ["integrator"]`（`harness.ts:102`）—— 当受害者是唯一的 integrator 持有者时（`harness.ts:55`），那个任务不可认领，运行器永远到不了它的跳出条件，于是在自己的 `--timeout` 上结束，所以那个确实到达 `review` 的任务的评审流程从未开始。
 
 **最新的一次字面运行，诚实记录：** 在 harness 修好之后，`bun run swarm:sdk -- --workers 5 --timeout 600`
 → **16/16 checks passed**（`tests/integration/last-run.json`，5 个 worker，273 秒；写这份文档时验证者自己的运行）。`review cycle ran — 1 started, 1 approved`；`seeded tasks reached a terminal or review state — task-1:done, task-2:done, task-3:done, task-4:done, task-5:done`；`expired lease was reclaimed and the task re-claimed by a peer — 1 lease-expiry reclaim(s) of 1 total`。崩溃测试现在杀的是一个持有任务、但不是未完成工作仍然需要的某个能力的唯一存活持有者的工作中的 agent（`harness.ts:pickCrashVictim`），所以回收检查仍然跑在一次真实认领上，而一次把受能力门控的 ready 工作困住的运行会以 `[stuck]` 行提前结束（`sdk-run.ts:114`），而不是等到超时。
@@ -454,7 +454,7 @@ UI 那次运行还断言了状态行跟随整个过程：`idle → planning → 
   `swarm_task_create` 行（模式 `"coordinator"`），什么都不会启动 —— 它会在 90 秒后催一次，然后回到 `idle` —— 而只有问题、闲聊或解释类请求会按平常方式回答。模式开启时你手工创建的任务会在下一个 tick 启动池子，手工打开的目标也一样。
 - 存活的目标算作工作：它让池子不落入停滞通知，并自己决定名册规模，所以一个没人能规划的目标会由这一轮自己的界限来报告（10 分钟后一条 `FAIL`），而不是以 `stalled` 报告。两者的延迟并不相同：如果规划任务在目标仍 open 时就已经被关闭为 `failed`，池子可以在那个界限剩下的时间里看起来毫无动静，之后 `FAIL` 才落地 —— 有报告，但比一次停滞通知要晚。
 - 名册增长以 ready 工作为键：每次 ready 计数上升最多一步，绝不超过
-  `config.workers`，且只在池子运行且未排空时发生 —— 池子停止或排空后才发布的任务会等下一次 `/swarm start`。因为触发条件是 ready 计数，启动失败的 worker 不会被后续的增长补上：只有新的可认领工作才会让池子增长。触发条件的比较对象是**存活** worker 数（`auto.ts:301`），而不是能力：没有任何存活 worker 能认领的 ready 工作不会自己让池子增长（在修复前的 SDK 运行里可见：1 个只有 `integrator` 能力的 ready 任务对上 4 个存活 worker → 0 个 `roster.grow` 事件；现在 harness 会以 `[stuck]` 行结束这类运行，而不是等超时）。增量本身以 `max(live, planned)` 为基准衡量（`auto.ts:304`）。
+  `config.workers`，且只在池子运行且未排空时发生 —— 池子停止或排空后才发布的任务会等下一次 `/swarm start`。因为触发条件是 ready 计数，启动失败的 worker 不会被后续的增长补上：只有新的可认领工作才会让池子增长。触发条件的比较对象是**存活** worker 数（`auto.ts:414`），而不是能力：没有任何存活 worker 能认领的 ready 工作不会自己让池子增长（在修复前的 SDK 运行里可见：1 个只有 `integrator` 能力的 ready 任务对上 4 个存活 worker → 0 个 `roster.grow` 事件；现在 harness 会以 `[stuck]` 行结束这类运行，而不是等超时）。增量本身以 `max(live, planned)` 为基准衡量（`auto.ts:417`）。
 - 状态行和 widget 是 extension 的 UI 帧 —— 无头会话（`--no-ui`）按宿主契约不产出；要看它们请用 UI 模式的会话。
 - 批次完成告警每批次一条，落在任务计数停止变化后的 `DRAIN_SETTLE_MS`（10 秒），而不是最后一个任务完成的瞬间：池子必须看起来空闲超过一个 tick 的时间，否则一个即将认领下一个任务的 worker 会提前结束批次。一个批次的任务是它开始时的那批加上运行期间创建的任何任务，所以稍后重启的运行不会重复报告已完成的工作。
 - 最响的那个界面是 `TERMINAL.sendNotification`，`PI_NOTIFICATIONS=off` 会抑制它，无头终端会丢弃它。常驻标记（widget + 状态行）也只存在于 UI，所以 `--no-ui` 会话只有在多 agent 模式关闭时才会以转录消息的形式拿到摘要。
