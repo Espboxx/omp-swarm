@@ -407,7 +407,10 @@ describe("closing a row nothing online can claim", () => {
 
 		const refused = store.fail(task.id, "generalist", "let me close it", { offlineAfterMs: 60_000 });
 		expect(refused.ok).toBe(false);
-		expect(refused.reason).toContain("can still claim it");
+		// goal-18's U4: the reason no longer says "can still claim it, OR it is not old enough yet"
+		// — the two refusals that used to share one sentence. It names the guard that actually
+		// decided: this row's full capability set IS held by an online agent.
+		expect(refused.reason).toContain("an online agent holds its full capability set");
 		expect(store.getTask(task.id)?.status).toBe("ready");
 		store.close();
 	});
@@ -498,6 +501,65 @@ describe("closing a row nothing online can claim", () => {
 		expect(store.deadDependencies(dependent.id)).toEqual([stranded.id]);
 		expect(store.claim(dependent.id, "generalist", 300).ok).toBe(false);
 		expect(store.fail(dependent.id, "generalist", "residue follows").ok).toBe(true);
+		store.close();
+	});
+});
+
+/**
+ * goal-18's U4 (task-279): the refusal REASON names the guard that decided, so a row that can never
+ * be closed reads differently from a row that is simply not old enough yet.
+ *
+ * The defect: one sentence ("an online agent can still claim it, or it has not been stranded for
+ * the grace window yet") covered five guards, and its first half is TRUE BY DEFINITION for a
+ * `caps=[]` row — the exact shape the exit refuses at `required.length === 0`. Measured by
+ * `omp-swarm/scratch/goal18/u4-ladder-probe.ts`, section B. The row's own status is asserted too,
+ * because a diagnostic that arrives with the row already closed is not a diagnostic.
+ */
+describe("goal-18 U4: the unroutable refusal names the guard that decided", () => {
+	test("a caps=[] row is refused with a reason that says WHY the exit is not for it", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const task = store.createTask({ title: "verify with no caps", createdBy: "boot" });
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET updated_at=? WHERE id=?", Date.now() - UNROUTABLE_GRACE_MS - 1_000, task.id);
+		raw.close();
+
+		const refused = store.fail(task.id, "generalist", "close it", { offlineAfterMs: 60_000 });
+		expect(refused.ok).toBe(false);
+		// The row is trivially claimable, so the OLD wording was true and useless. The reason now
+		// names the guard and says what the exit IS for.
+		expect(refused.reason).toContain("declares no capability at all");
+		expect(refused.reason).toContain("it is for a capability nobody holds");
+		expect(store.getTask(task.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a row inside the grace window is refused with its age and the window", () => {
+		const { store } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const task = store.createTask({ title: "audit", createdBy: "boot", requiredCapabilities: ["reviewer"] });
+		// Freshly minted: 0s of the 10-minute grace window has elapsed.
+		const refused = store.fail(task.id, "generalist", "close it", { offlineAfterMs: 60_000 });
+		expect(refused.ok).toBe(false);
+		expect(refused.reason).toContain("has not been stranded for the grace window");
+		expect(store.getTask(task.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a row with unresolved dependencies is refused naming THAT, not the clock", () => {
+		const { store, paths } = makeRoot();
+		store.registerAgent({ id: "generalist", role: "general", capabilities: ["general"] });
+		const parent = store.createTask({ title: "parent", createdBy: "boot" });
+		const child = store.createTask({ title: "child", createdBy: "boot", requiredCapabilities: ["reviewer"], dependencies: [parent.id] });
+		const raw = openDatabase(paths);
+		raw.run("UPDATE tasks SET updated_at=? WHERE id=?", Date.now() - UNROUTABLE_GRACE_MS - 1_000, child.id);
+		raw.close();
+
+		const refused = store.fail(child.id, "generalist", "close it", { offlineAfterMs: 60_000 });
+		expect(refused.ok).toBe(false);
+		// `deadDependencies` says "not dead", so the honest reason names the dependency, not the
+		// cooldown or the capability set.
+		expect(refused.reason).toContain("still has unresolved dependencies");
 		store.close();
 	});
 });

@@ -12,7 +12,7 @@
  * and tests call it directly.
  */
 import type { SwarmStore } from "./store";
-import { ALERT_COOLDOWN_MS, alertGate, type AlertState } from "./driver";
+import { ALERT_COOLDOWN_MS, alertGate, freshAlertState, type AlertState } from "./driver";
 import { reconcilePool } from "./scaling";
 import { findStarvation } from "./starvation";
 import { postStrandedNotice } from "./stranded";
@@ -79,6 +79,26 @@ const SCALE_WINDOW_MS = 60_000;
  * so the pool waits for a quiet period instead.
  */
 const START_SETTLE_MS = 20_000;
+/**
+ * How long the driver gives ONE worker's session creation before it gives up on that spawn
+ * (`driver.ts:328`, `SPAWN_TIMEOUT_MS = 120_000`). Mirrored here rather than imported because the
+ * driver's is a module-private constant and auto.ts is its CALLER, not its peer: the value is quoted
+ * so the derivation below stays honest, and the comment is the audit trail if the driver's number
+ * ever moves. A pool that has just started legitimately reports zero workers for up to this long.
+ */
+const WORKER_SPAWN_TIMEOUT_MS = 120_000;
+/**
+ * How long a `running` driver must hold ZERO workers before the controller treats the pool as dead
+ * and brings the roster back (goal-18 U5).
+ *
+ * The number is derived, not chosen: a spawn can take up to {@link WORKER_SPAWN_TIMEOUT_MS}, so a
+ * pool that was just started still reports zero workers for that long while its sessions come up —
+ * and that pool must NOT be grown, because its first growth attempt is exactly what a second one
+ * would duplicate. This window is a full spawn timeout plus the settle quiet period, so a late spawn
+ * can never be mistaken for a pool that died, and a pool that really died is recovered within ~2.5
+ * minutes instead of never.
+ */
+const EMPTY_POOL_MS = WORKER_SPAWN_TIMEOUT_MS + START_SETTLE_MS;
 /**
  * How long the under-budget condition must stay AWAY before its return is a new episode worth a second
  * notice. Without it a shape that dips in and out of the budget (a task finishing, another arriving
@@ -246,6 +266,37 @@ export class AutoController {
 	 */
 	#lastGrowthReady = 0;
 	#plannedWorkers = 0;
+	/**
+	 * When the growth branch first saw a `running` driver holding ZERO workers, or `undefined` while
+	 * the pool has any worker at all. This is the discriminator goal-18 U5 needed, because a
+	 * zero-worker tick means one of two opposite things:
+	 *
+	 *   - a SPAWN IN FLIGHT (the start just happened, nothing has registered yet): the pool is
+	 *     momentarily empty and is about to fill, so the growth branch must keep its plan and stay
+	 *     quiet — the pre-existing rule, pinned by "does not grow for a spawn that is still coming up";
+	 *   - a pool that DIED from outside (an Agent-Hub release, a disposed session): the same zero is
+	 *     permanent, and the roster must be brought back (goal-18 U5, shape 2).
+	 *
+	 * The discriminator is DURATION, not a flag: an empty pool that stays empty for
+	 * {@link EMPTY_POOL_MS} — a full spawn timeout plus the settle window, so a late spawn can never
+	 * be mistaken for a dead pool — is the second case. One tick of zero means nothing, which is why
+	 * this cannot be a boolean: that was my first attempt, and it broke the spawn-in-flight rule.
+	 */
+	#emptyPoolSince: number | undefined;
+	/**
+	 * When the controller first saw a pool it cannot use: either the driver stopped while ready work
+	 * exists, or the driver is running with ZERO workers. Held so the re-raise is rate-limited and the
+	 * operator is told once per episode instead of every 2 s tick.
+	 *
+	 * THE SHAPE THIS FIXES (goal-18 U5, measured by `scratch/goal18/u5-repro.ts`): a driver that stops
+	 * under a `running` phase (a `/swarm stop`, an unrouteable stop, the runtime tearing the driver
+	 * down) leaves `#pendingStart` false — it is only set when a NEW task id appears — so ready work
+	 * waits forever with no pool and no notice. Symmetrically, a driver that stays `running` after
+	 * every worker session is released keeps `#plannedWorkers` at its stale value, so the growth
+	 * branch's `max(live, plannedWorkers)` delta is 0 on every tick. Neither path ever brings the
+	 * pool back; the operator found out by seeing "0 online".
+	 */
+	#poolDownSince: number | undefined;
 	/** When the pool last changed size, for the resize cooldown. */
 	#lastResizeAt = 0;
 	/**
@@ -322,6 +373,8 @@ export class AutoController {
 		this.#drained = false;
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
+		this.#emptyPoolSince = undefined;
+		this.#poolDownSince = undefined;
 		this.#lastResizeAt = 0;
 		this.#underBudgetedCeiling = undefined;
 		this.#underBudgetClearedAt = 0;
@@ -333,6 +386,8 @@ export class AutoController {
 		if (this.#deps.isDriverRunning()) await this.#deps.stopSwarm("multi-agent mode disabled");
 		this.#plannedWorkers = 0;
 		this.#lastGrowthReady = 0;
+		this.#emptyPoolSince = undefined;
+		this.#poolDownSince = undefined;
 		this.#lastResizeAt = 0;
 		this.#setPhase("off");
 		this.#deps.onChange();
@@ -453,9 +508,66 @@ export class AutoController {
 				await this.#deps.stopSwarm("all tasks finished");
 				this.#plannedWorkers = 0;
 				this.#lastGrowthReady = 0;
+				this.#emptyPoolSince = undefined;
+				this.#poolDownSince = undefined;
 				this.#lastResizeAt = 0;
 				this.#setPhase("idle");
 				this.#deps.onChange();
+			}
+
+			// DEAD POOL re-raise (goal-18 U5): the pool this controller owes cannot do the work, and
+			// no new task is going to say so. Two measured shapes:
+			//
+			//   1. the driver STOPPED while work is still actionable (a `/swarm stop`, the runtime
+			//      tearing the driver down). `#pendingStart` is only ever set by a NEW task id, so an
+			//      existing pool of ready rows is never re-assembled — the operator's "0 online" with
+			//      ready work sitting there;
+			//   2. the driver is still `running` but has ZERO workers (`#watchHostRoster` deleted the
+			//      last one). The growth branch cannot fix this on its own: its delta is measured
+			//      against `max(live, #plannedWorkers)`, and `#plannedWorkers` is only reset by a stop
+			//      the controller itself performs — so a pool that dies from outside keeps a stale plan
+			//      (and a stale ready watermark) and its delta stays 0 forever. That is handled below,
+			//      where the watermark is re-bound.
+			//
+			// The re-raise is deliberately NOT a second auto-start: it reuses the same roster/shape
+			// rule (`planRoster`, the settle window, the operator's ceiling) and it never fires while
+			// the main session is mid-turn, so a coordinator publishing a plan is not interrupted.
+			if (this.#phase === "running" && !this.#deps.isDriverRunning() && actionable > 0) {
+				// The episode latch: tell the operator once per episode, and never re-raise on every
+				// tick. A start that lands but whose driver has not published `running` yet is the
+				// case this guards — the host needs a moment to bring the sessions up.
+				this.#poolDownSince ??= this.#deps.now();
+				const settled = this.#deps.now() - this.#lastTaskAt >= this.#settleMs;
+				if (!this.#deps.isMainBusy() && settled && this.#deps.now() - this.#poolDownSince >= this.#settleMs) {
+					const roster = planRoster(tasks, config, goalAgents);
+					if (roster.length > 0) {
+						const downFor = this.#deps.now() - this.#poolDownSince;
+						const size = roster.reduce((n, role) => n + role.count, 0);
+						this.#blockedSince = undefined;
+						try {
+							await this.#deps.startSwarm(roster, size);
+							this.#plannedWorkers = size;
+							this.#lastGrowthReady = counts.ready;
+							this.#poolDownSince = undefined;
+							this.#emptyPoolSince = undefined;
+							this.#deps.notify(`swarm re-raised with ${size} worker(s): the pool had gone down with ${actionable} actionable task(s) still waiting`);
+							this.#deps.onEvent?.("roster.reraise", { workers: size, ready: counts.ready, downForMs: downFor });
+						} catch (error) {
+							// A pool that refuses to come back must not wedge the mode in `running`, and
+							// the operator hears why — the same shape the first start already uses.
+							this.#lastTaskAt = this.#deps.now();
+							this.#deps.notify(`swarm re-raise failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+						}
+						this.#deps.onChange();
+						return;
+					}
+				} else if (this.#deps.now() - this.#poolDownSince >= this.#stallMs) {
+					// Nothing to build a roster from, or the main session owns the turn: say so once,
+					// at the stall deadline this branch already uses, rather than on every tick.
+					this.#deps.notify(`[swarm] ${actionable} actionable task(s) with no pool running and nothing scheduled to bring one up: run /swarm start`, "warning");
+				}
+			} else {
+				this.#poolDownSince = undefined;
 			}
 
 			// Roster growth: work published after the pool was sized (the coordinator adding tasks, a
@@ -465,7 +577,35 @@ export class AutoController {
 			// cannot trigger a growth of its own.
 			if (this.#phase === "running" && !this.#drained && this.#deps.isDriverRunning()) {
 				const live = this.#deps.workerCount();
-				if (counts.ready > live && counts.ready > this.#lastGrowthReady && this.#plannedWorkers < config.workers) {
+				// A pool that lost every worker from outside (an Agent-Hub release, a disposed session)
+				// keeps the driver `running` and keeps `#plannedWorkers` at its stale value, so
+				// `max(live, #plannedWorkers)` stays at the old size and the delta below is 0 on every
+				// tick — the pool can never grow back (goal-18 U5, shape 2). The plan is the
+				// controller's own accounting, so it may only be rewritten DOWN to what the host
+				// actually holds, and only once the emptiness has PROVEN itself by outlasting a whole
+				// spawn window: a spawn still in flight is also empty, and rewriting its plan would
+				// leave the growth branch without the size it was just started at.
+				if (live === 0) {
+					this.#emptyPoolSince ??= this.#deps.now();
+				} else {
+					this.#emptyPoolSince = undefined;
+				}
+				const emptiesFor = this.#emptyPoolSince === undefined ? 0 : this.#deps.now() - this.#emptyPoolSince;
+				// SECOND discriminating fact, beside duration: the store's agent table. A spawn that is
+				// in flight has ALREADY registered its workers by the time the driver reports them (the
+				// driver sets its own map entry and calls `registerAgent` back to back inside `#spawn`),
+				// so an empty pool with REGISTERED agents is one whose sessions were disposed afterwards
+				// — the Agent-Hub release path. An empty pool with NO agents at all has never come up,
+				// which is the spawn-in-flight case the growth throttle must leave alone.
+				const registered = store.listAgents().length > 0;
+				// The empty-pool gate is the ONLY condition allowed to rewrite the plan downward: below
+				// it the plan still means "what the last start produced", spawn-in-flight included.
+				if (live === 0 && registered && emptiesFor >= EMPTY_POOL_MS && this.#plannedWorkers > 0) this.#plannedWorkers = 0;
+				// An empty pool that has stayed empty also bypasses the ready watermark, which would
+				// otherwise still record the count the dead pool was sized for and refuse to grow at
+				// all (goal-18 U5, shape 2). Everything else keeps the throttle exactly as it was.
+				const emptyBypass = live === 0 && registered && emptiesFor >= EMPTY_POOL_MS;
+				if (counts.ready > live && (emptyBypass || counts.ready > this.#lastGrowthReady) && this.#plannedWorkers < config.workers) {
 					const desired = planRoster(tasks, config);
 					const target = Math.min(config.workers, desired.reduce((n, role) => n + role.count, 0));
 					const pool = Math.max(live, this.#plannedWorkers);
@@ -587,6 +727,8 @@ export class AutoController {
 						await this.#deps.stopSwarm("swarm stalled: tasks blocked with no claimable work");
 						this.#plannedWorkers = 0;
 						this.#lastGrowthReady = 0;
+						this.#emptyPoolSince = undefined;
+						this.#poolDownSince = undefined;
 						this.#lastResizeAt = 0;
 						this.#setPhase("stalled");
 					}
@@ -637,7 +779,7 @@ export class AutoController {
 				}
 				// "This stream has never reported" is an entry with `lastKey === undefined`, NOT a
 				// default with a set `lastKey` — supplying the latter would swallow the first report.
-				const state = this.#unclaimableAlerts.get("stranded") ?? { lastKey: undefined, lastAt: 0, repeats: 0 };
+				const state = this.#unclaimableAlerts.get("stranded") ?? freshAlertState();
 				const decision = alertGate(`stranded|${report.key}`, this.#deps.now(), state, ALERT_COOLDOWN_MS);
 				this.#unclaimableAlerts.set("stranded", decision.next);
 				this.#deps.onEvent?.("pool.unclaimable", {
@@ -784,6 +926,8 @@ export class AutoController {
 		this.#drained = false;
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
+		this.#emptyPoolSince = undefined;
+		this.#poolDownSince = undefined;
 		this.#lastResizeAt = 0;
 		this.#unclaimableAlerts.clear();
 		this.#strandedKey = undefined;

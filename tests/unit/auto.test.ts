@@ -80,6 +80,11 @@ function harness(options: { config?: Partial<SwarmConfig>; auto?: AutoOptions } 
 				startFailure = false;
 				throw new Error("swarm is already running");
 			}
+			// Mirror the real host: `startSwarm` brings the driver up (`driver.start`), so the NEXT
+			// tick observes `isDriverRunning() === true`. Without this a test that stops the driver
+			// mid-episode would see the re-raise fire on every tick, because nothing ever publishes
+			// the new driver back to the controller.
+			running = true;
 			workers += count;
 			// One name per WORKER, as the real host returns: `driver.start`/`addWorkers` hand back the specs
 			// they will bring up (already clamped by the operator's ceiling), not the role shape.
@@ -158,6 +163,18 @@ async function settle(h: Harness): Promise<void> {
 	await h.controller.tick();
 }
 
+/**
+	 * Start a pool sized for `tasks` ready tasks, then let the harness control how many workers are
+	 * actually registered (`live`), which lags the background spawn in the real driver.
+	 */
+	async function runningPool(h: Harness, tasks: number, live?: number): Promise<void> {
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		for (let i = 0; i < tasks; i++) h.store.createTask({ title: `t${i}`, createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(true);
+		h.setWorkers(live ?? tasks);
+	}
 describe("planRoster", () => {
 	test("general-only work yields one general role sized to the ready tasks", () => {
 		const config: SwarmConfig = { ...DEFAULT_CONFIG, workers: 4 };
@@ -443,18 +460,6 @@ describe("multi-agent mode", () => {
 });
 
 describe("roster growth", () => {
-	/**
-	 * Start a pool sized for `tasks` ready tasks, then let the harness control how many workers are
-	 * actually registered (`live`), which lags the background spawn in the real driver.
-	 */
-	async function runningPool(h: Harness, tasks: number, live?: number): Promise<void> {
-		h.controller.enable();
-		h.controller.noteTask("do the thing");
-		for (let i = 0; i < tasks; i++) h.store.createTask({ title: `t${i}`, createdBy: "main" });
-		await settle(h);
-		h.setDriverRunning(true);
-		h.setWorkers(live ?? tasks);
-	}
 
 	test("ready work published after the pool was sized grows the roster by the delta toward the plan", async () => {
 		const h = harness();
@@ -1164,14 +1169,21 @@ describe("G2: the starvation alert is a (key, time) decision, not a remembered k
 		expect(strandNotices(h)).toHaveLength(1);
 
 		// Past the cooldown: the same condition is news again, and it says how old it is.
-		h.advance(1_001);
+		// MIGRATION NOTE (goal-18 task-277, the age-aware cohort ladder): this assertion used to
+		// advance a flat `COOLDOWN + 1ms`. After the first announcement the condition now owes
+		// `ALERT_COOLDOWN_MS × 2^1` of silence, so the clock has to move the doubled window for the
+		// repeat to be heard at all — 600 s + 1 ms is now INSIDE the window and is held. Everything
+		// else in this test is unchanged; only the advance distance and the age it prints moved.
+		h.advance(2 * COOLDOWN - (COOLDOWN - 1_000) + 1_000);
 		await h.controller.tick();
 		const notices = strandNotices(h);
 		expect(notices).toHaveLength(2);
 		expect(notices[1]).toContain("reported 2x");
-		// The age is real: the row was created 137 minutes before the pool assembled, and the clock
-		// has since moved by the cooldown, so the first sighting is 147 minutes old.
-		expect(notices[1]).toContain("first sighting now 2 h 27 min ago");
+		// The age is real and it is MEASURED, not derived: the row was created 137 minutes before the
+		// pool assembled, and the clock has since moved by 19 minutes (the 600 s of cooldown the
+		// pre-ladder test used, plus the extra window this one had to wait out), so the first
+		// sighting is 2 h 37 min old.
+		expect(notices[1]).toContain("first sighting now 2 h 37 min ago");
 		// The row set and the remedy are still named — a repeat is an escalation, not a summary.
 		expect(notices[1]).toContain("task-2");
 		expect(notices[1]).toContain("re-file those task(s)");
@@ -1228,3 +1240,129 @@ describe("G2: the starvation alert is a (key, time) decision, not a remembered k
 });
 
 
+
+/**
+ * goal-18's U5: the pool that died with work still actionable.
+ *
+ * The measured defect (scratch/goal18/u5-repro.ts, before the fix): a driver that goes away while
+ * ready rows wait is NEVER re-assembled, because the auto-start path only fires when a NEW task id
+ * appears (`#pendingStart`), and the growth path measures its delta against `max(live,
+ * #plannedWorkers)` with a `#plannedWorkers` that nothing resets. The operator's only symptom was
+ * "0 online". Both shapes are pinned here so neither can come back.
+ */
+describe("the pool that died with work outstanding", () => {
+	test("a driver that stopped under a `running` phase is re-raised once, with one notice", async () => {
+		const h = harness();
+		await runningPool(h, 3);
+		expect(h.calls.start).toHaveLength(1);
+
+		// The halt loop: every worker session is gone and the driver object stopped. Critically, NO new
+		// task is created afterwards, so `#pendingStart` never fires.
+		h.setDriverRunning(false);
+		h.setWorkers(0);
+		// The re-raise is rate-limited by the settle window, exactly as the first start is: one attempt
+		// per episode rather than one per 2 s tick. Past the window the harness keeps reporting the
+		// driver as running (the start succeeded), so no second re-raise fires.
+		for (let i = 0; i < 6; i++) {
+			h.advance(60_000);
+			await h.controller.tick();
+		}
+		expect(h.calls.start).toHaveLength(2);
+		expect(h.store.counts().ready).toBe(3);
+		// One notice naming the size and the work it owed, plus the event the panel reads.
+		expect(h.calls.notify.filter((text) => text.includes("re-raised"))).toHaveLength(1);
+		expect(h.calls.events.filter((entry) => entry.type === "roster.reraise")).toHaveLength(1);
+	});
+
+	test("a running driver with zero workers grows back instead of waiting for a new task", async () => {
+		const h = harness();
+		await runningPool(h, 3);
+		expect(h.calls.start).toHaveLength(1);
+		// The workers really came up: each registered with the store inside the driver's `#spawn`,
+		// which is what a pool that is later emptied leaves behind (the row survives the release).
+		for (const name of ["w1", "w2", "w3"]) {
+			h.store.registerAgent({ id: name, role: "general", capabilities: ["general"] });
+		}
+		h.setWorkers(3);
+
+		// The Agent-Hub release path: `#watchHostRoster` deletes each worker and marks its row offline,
+		// but never stops the driver, so `isDriverRunning()` stays TRUE and `workerCount()` is 0.
+		h.setWorkers(0);
+		// One tick of zero is a spawn still in flight and must stay quiet; the emptiness has to prove
+		// itself by lasting the settle window (that is the pre-existing rule this keeps intact).
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(1);
+		// Inside the spawn window the empty pool is still "a spawn in flight" and stays quiet; past
+		// EMPTY_POOL_MS the emptiness has proven itself and the roster comes back.
+		h.advance(90_000);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(1);
+		h.advance(90_000);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(2);
+		expect(h.calls.events.filter((entry) => entry.type === "roster.grow")).toHaveLength(1);
+	});
+
+	test("a spawn still in flight stays quiet, so an empty tick is not read as a dead pool", async () => {
+		// THE REGRESSION GUARD: this is the rule the duration gate exists to preserve. A pool that was
+		// just started reports zero LIVE workers while its sessions come up (`#workers` is populated
+		// before `registerAgent`, and the harness lags it), and it must NOT be grown for the whole
+		// spawn window — its first growth attempt is exactly what a second one would duplicate.
+		const h = harness();
+		await runningPool(h, 2, 0);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(1);
+		// Three minutes of an untouched empty pool — longer than the driver's own 120 s spawn
+		// timeout — and the controller still does not grow it, because the pool that just started
+		// has a plan (2) that the duration gate refuses to rewrite.
+		for (let i = 0; i < 3; i++) {
+			h.advance(60_000);
+			await h.controller.tick();
+		}
+		expect(h.calls.start).toHaveLength(1);
+	});
+
+	test("a re-raise that fails is reported and does not wedge the phase", async () => {
+		const h = harness();
+		await runningPool(h, 3);
+		h.setDriverRunning(false);
+		h.setWorkers(0);
+		// First tick only records the episode (the re-raise is rate-limited by the settle window, so
+		// an episode is never acted on in the tick that discovers it).
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(1);
+		h.advance(120_000);
+		h.failNextStart();
+		await h.controller.tick();
+		expect(h.controller.phase).toBe("running");
+		const afterFail = h.calls.start.length;
+		expect(afterFail).toBe(2);
+		expect(h.calls.notify.some((text) => text.includes("re-raise failed"))).toBe(true);
+		// Still retrying later, because the work is still owed. (The failure resets the episode
+		// clock, so the next attempt waits out the window again — one attempt per episode.)
+		h.advance(120_000);
+		await h.controller.tick();
+		expect(h.calls.start.length).toBeGreaterThan(afterFail);
+	});
+
+	test("a dead driver with nothing actionable is left to the drain path", async () => {
+		const h = harness();
+		await runningPool(h, 3);
+		// The whole batch finished: the drain branch owns this state, and a re-raise here would start
+		// workers for work that no longer exists. Each row is claimed and completed by the live
+		// worker, which is the shape the driver reports as drained.
+		for (const task of h.store.listTasks({ limit: 10 })) {
+			h.store.claim(task.id, "w1", 300, ["general"]);
+			h.store.complete(task.id, "w1", { summary: "done" });
+		}
+		h.controller.noteDrained();
+		h.setDriverRunning(false);
+		h.setWorkers(0);
+		h.advance(60_000);
+		await h.controller.tick();
+		// The drain branch stops the pool and returns to idle; the re-raise never runs (it needs
+		// `actionable > 0`, and the drain happens on the same tick).
+		expect(h.calls.stop).toContain("all tasks finished");
+		expect(h.calls.start.length).toBeLessThanOrEqual(1);
+	});
+});

@@ -13,9 +13,13 @@
  * and no I/O, so both can be pinned by unit tests and reused by the store operation and the tool:
  *
  *   1. `strandedRows` — which ready/blocked/review rows can nobody claim, and what exactly is
- *      missing. The predicate is the claim gate's own, verbatim from tools.ts:121 /
- *      driver.ts:713 (`requiredCapabilities.length === 0 || requiredCapabilities.some(...)`),
- *      because a repair that used a DIFFERENT predicate than the gate would fix the wrong rows.
+ *      missing. The predicate is the claim gate's own, verbatim from `store.ts:984-985`
+ *      (`required.filter((cap) => !capabilities.includes(cap))` — refuse when ANY is missing) and
+ *      `starvation.ts:65-68`, because a repair that used a DIFFERENT predicate than the gate would
+ *      fix the wrong rows. goal-18's U4 measured the earlier divergence: the predicate here read
+ *      `.some(...)` (one agent holding one capability) while the gates read `.every(...)` on one
+ *      agent, so a `[reviewer, nobody]` row looked claimable to the repair while `claim()` would
+ *      have refused it forever.
  *
  *   2. `planCapsRepair` — what a repair may change, and what it may not. A repair rewrites the
  *      capability label of a row nobody can claim. It must never touch anything else, and it must
@@ -58,13 +62,28 @@ export function reachableCapabilities(config: SwarmConfig): Set<string> {
 
 /**
  * The claim gate's predicate, verbatim: an agent can take a row when it requires no capability,
- * or when at least one required capability is one that agent holds. Kept as a named export so the
- * repair, the surfacing report and the gate itself cannot drift apart (DECISION #1078: "判定必须
- * 复用 expandWorkers/planRoster 的同一份事实，不许另写一份能力表").
+ * or when the ONE agent that takes it holds EVERY declared capability.
+ *
+ * Kept as a named export so the repair, the surfacing report and the gate itself cannot drift apart
+ * (DECISION #1078: "判定必须复用 expandWorkers/planRoster 的同一份事实，不许另写一份能力表").
+ *
+ * goal-18's U4 measured the drift this closes: the predicate used to read
+ * `required.some((cap) => held.includes(cap))`, which says ONE agent holding ONE capability is
+ * enough. The two gates that actually decide a claim say `every` on one agent — `store.ts:984-985`
+ * (`required.filter((cap) => !capabilities.includes(cap))` → refuse if ANY is missing) and
+ * `starvation.ts:65-68` — so a row declaring `[reviewer, nobody]` was reported claimable by the
+ * repair's own predicate while `claim()` would refuse it forever. Three callers consume this
+ * predicate (`strandedRows`, `planCapsRepair`, and the docstring's citation of the gate), and all
+ * three want the gate's answer, not a more permissive one.
+ *
+ * The `held` iterable is a UNION of every agent's capabilities (`reachableCapabilities(config)`
+ * passes the whole roster's set, not one agent's), so `every` over it asks "could one agent
+ * holding all of these exist" rather than "does some real agent hold all of these" — the strict
+ * per-agent form lives in `starvation.ts`, where the agents themselves are in scope.
  */
 export function claimableBy(requiredCapabilities: string[], held: Iterable<string>): boolean {
 	const heldList = [...held];
-	return requiredCapabilities.length === 0 || requiredCapabilities.some((cap) => heldList.includes(cap));
+	return requiredCapabilities.length === 0 || requiredCapabilities.every((cap) => heldList.includes(cap));
 }
 
 /** One stranded row, with the capability nobody holds and how long it has been stuck. */
@@ -76,6 +95,12 @@ export interface StrandedRow {
 	missingCapabilities: string[];
 	/** Required capabilities that ARE reachable (kept for the report; they are not the problem). */
 	reachableCapabilities: string[];
+	/**
+	 * Which of the two strand shapes this is, phrased so a reader does not have to infer it: either
+	 * a capability no role provides, or capabilities that each exist but never together on one role.
+	 * goal-18's U4 added this because the report previously made the two indistinguishable.
+	 */
+	reason: string;
 	ageMs: number;
 }
 
@@ -91,14 +116,23 @@ export function strandedRows(rows: StrandedRowCandidate[], config: SwarmConfig, 
 	for (const row of rows) {
 		if (row.requiredCapabilities.length === 0) continue;
 		if (claimableBy(row.requiredCapabilities, held)) continue;
+		// goal-18's U4: a row is stranded when EITHER nothing holds a required capability, OR the
+		// capabilities it needs exist in the pool but never together on one agent (the
+		// `[reviewer, integrator]` shape — `claimableBy` over the roster UNION says true, the real
+		// claim gate says no). The earlier `if (missing.length === 0) continue;` silently dropped
+		// exactly that row, so the combination strand was never reported and never repairable.
 		const missing = row.requiredCapabilities.filter((cap) => !held.has(cap));
-		if (missing.length === 0) continue;
 		out.push({
 			id: row.id,
 			title: row.title,
 			status: row.status,
 			missingCapabilities: missing,
 			reachableCapabilities: row.requiredCapabilities.filter((cap) => held.has(cap)),
+			/** Which of the two shapes this is, so the report can say it without the reader guessing. */
+			reason:
+				missing.length > 0
+					? `no configured role provides ${missing.join(", ")}`
+					: `needs ${row.requiredCapabilities.join(" + ")} together, and no single configured role provides them all`,
 			ageMs: Math.max(0, now - row.updatedAt),
 		});
 	}

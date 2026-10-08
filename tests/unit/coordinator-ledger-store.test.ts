@@ -47,6 +47,18 @@ function entry(id: number, type: string, tags: string[]): LedgerEntry {
 	return { id, type, agentId: "A", tags };
 }
 
+/** The bullet lines of one named section of an injected brief, in the order they were printed. */
+function section(text: string, heading: string): string[] {
+	const start = text.split("\n").findIndex((line) => line === heading);
+	if (start < 0) return [];
+	const lines: string[] = [];
+	for (const line of text.split("\n").slice(start + 1)) {
+		if (line !== "" && !line.startsWith("- ")) break;
+		if (line.startsWith("- ")) lines.push(line.slice(2));
+	}
+	return lines;
+}
+
 /** The kind each goal asked for, as `coordinatorLedger()` supplies it from the goals table. */
 const kinds = new Map([
 	["goal-1", "fix" as const],
@@ -208,6 +220,61 @@ describe("ledgerInjection: the text the round is handed", () => {
 		expect(text).toContain("REMEDY: read those entries before opening this round");
 		expect(text).toContain("This is an injection, not a refusal");
 		expect(text).not.toContain("REFUSE this goal");
+	});
+
+	/**
+	 * goal-18's U2 fix: the sections rank by relevance to the goal, not by recency alone. Measured on
+	 * the live board, the visible list used to lead with this round's own planning metadata while the
+	 * older knots about the files the goal actually touches sat below the cut.
+	 */
+	test("the classes a goal's own artifacts touch are shown first, above a newer but irrelevant one", () => {
+		const rows = [
+			// Newest first in the index, and irrelevant to this goal: a planning-meeting class of a
+			// round that just opened. Under recency-only ordering it leads the list.
+			entry(30, "FAIL", ["fail", "goal:goal-18", "plan"]),
+			entry(31, "DECISION", ["decision", "goal:goal-18", "plan"]),
+			// Older, and named directly by this goal: the classes it must not re-derive.
+			entry(10, "FAIL", ["fail", "goal:goal-1", "extension/store.ts", "reviewer-knot"]),
+			entry(11, "DECISION", ["decision", "goal:goal-1", "extension/store.ts", "reviewer-knot"]),
+			entry(20, "FAIL", ["fail", "goal:goal-2", "extension/tools.ts"]),
+			entry(21, "DECISION", ["decision", "goal:goal-2", "extension/tools.ts"]),
+		];
+		const ledger = goalLedger(rows, kinds);
+		const text = ledgerInjection(
+			ledger,
+			"Fix extension/store.ts and extension/tools.ts",
+			goalDuplicateVerdict(ledger, "Fix extension/store.ts and extension/tools.ts"),
+		);
+		// Both relevant classes are ANSWERED, so they lead the answered section. The two score 1 each
+		// against the goal's artifacts, so the index's own newest-first order breaks the tie; either
+		// order proves the point — both outrank the irrelevant, merely-newest plan class at 0.
+		const answered = section(text, "Already answered (read before re-deriving):");
+		expect(answered[0]).toContain("extension/tools.ts,goal:goal-2");
+		expect(answered[1]).toContain("extension/store.ts,goal:goal-1,reviewer-knot");
+		// The irrelevant class is still listed — ranking changes the order, never the content — but it
+		// is no longer first.
+		expect(answered.some((line) => line.includes("goal:goal-18,plan"))).toBe(true);
+		expect(answered.findIndex((line) => line.includes("goal:goal-18,plan"))).toBeGreaterThan(1);
+	});
+
+	test("a goal naming no artifact ranks on recency alone, so its brief is byte-identical to the unranked one", () => {
+		const rows = [
+			entry(1, "FAIL", ["fail", "goal:goal-1", "extension/store.ts"]),
+			entry(2, "DECISION", ["decision", "goal:goal-1", "extension/store.ts"]),
+			entry(3, "FAIL", ["fail", "goal:goal-2", "scratch/goal11/A.md"]),
+		];
+		const ledger = goalLedger(rows, kinds);
+		const verdict = goalDuplicateVerdict(ledger, "the pool keeps spinning");
+		const text = ledgerInjection(ledger, "the pool keeps spinning", verdict);
+		// The answered section holds one class, and the open section one; with nothing to key on the
+		// order is the index's own newest-first order, which is what this goal got before the ranking.
+		expect(section(text, "Already answered (read before re-deriving):")).toEqual([
+			"extension/store.ts,goal:goal-1 — 2 entry(ies) (1, 2), newest DECISION #2",
+		]);
+		expect(section(text, "Still open (dead ends earlier rounds met):")).toEqual(["goal:goal-2,scratch/goal11/A.md — 1 entry(ies) (3)"]);
+		// And the ranking is a copy, not a reorder of the ledger's own array: the verdict and
+		// `createGoal`'s event counts read the same order they always did.
+		expect(ledger.classes.map((c) => c.key)).toEqual(["goal:goal-2,scratch/goal11/A.md", "extension/store.ts,goal:goal-1"]);
 	});
 });
 

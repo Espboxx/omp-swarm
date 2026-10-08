@@ -21,6 +21,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { expandWorkers } from "../../extension/config";
+import { findStarvation } from "../../extension/starvation";
 import {
 	candidatesFromTasks,
 	claimableBy,
@@ -40,6 +41,22 @@ const ROLED: SwarmConfig = {
 	auto: true,
 	workers: 6,
 	roles: [{ name: "reviewer", count: 1, capabilities: ["reviewer", "general"] }],
+};
+
+/**
+ * A config whose roles each provide ONE capability, so a row needing two of them is reachable in
+ * the UNION (every role provides one) yet unreachable on any ONE agent — the combination strand
+ * goal-18's U4 measures. `ROLED` cannot produce that shape: its single role carries both
+ * `reviewer` and `general`, so every pair it could name is satisfiable together.
+ */
+const TWO_ROLES: SwarmConfig = {
+	...DEFAULT_CONFIG,
+	auto: true,
+	workers: 6,
+	roles: [
+		{ name: "reviewer", count: 1, capabilities: ["reviewer"] },
+		{ name: "integrator", count: 1, capabilities: ["integrator"] },
+	],
 };
 
 function task(overrides: Partial<SwarmTask> & { id: string }): SwarmTask {
@@ -163,5 +180,103 @@ describe("goal-14 clause 3: the rule decides before anything is written", () => 
 		expect(text).toContain("stranded since 17:04");
 		// The point of the trail: a relaxed label must never look like the original one.
 		expect(text).toContain("the row's own text is unchanged");
+	});
+});
+
+/**
+ * goal-18's U4 (task-279). The goal asks whether "交付物/能力同时为空的 verify 类行，以及 caps=[] 的行"
+ * walk into an undiagnosable corner, and the measurement found two real defects on top of the one
+ * the goal names. Both fixes are pinned here.
+ *
+ * The probe that found them: `omp-swarm/scratch/goal18/u4-ladder-probe.ts`.
+ */
+describe("goal-18 U4: the ladder's predicates agree with the claim gate", () => {
+	/**
+	 * THE DEFECT: `claimableBy` read `.some(...)` over the roster's union of capabilities — "one
+	 * capability on some agent" — while the gate that actually decides a claim reads `.every(...)`
+	 * on the ONE agent that takes the row (`store.ts:984-985`: refuse when ANY is missing). So a row
+	 * declaring two capabilities where ONE of them is reachable was reported claimable, was not
+	 * surfaced as stranded, and its repair was planned — while `claim()` refused it forever.
+	 */
+	test("a MIS-SHAPED pair (one reachable, one not) is no longer called claimable", () => {
+		const held = reachableCapabilities(ROLED);
+		expect([...held].sort()).toEqual(["general", "reviewer"]);
+		// `.some` used to answer TRUE here — `reviewer` is in the union, so one capability on some
+		// agent was enough — and the row then vanished from every diagnostic.
+		expect(claimableBy(["reviewer", "nobody"], held)).toBe(false);
+		expect(claimableBy(["nobody"], held)).toBe(false);
+		// The readings the fix must NOT change.
+		expect(claimableBy([], held)).toBe(true);
+		expect(claimableBy(["reviewer"], held)).toBe(true);
+		expect(claimableBy(["general"], held)).toBe(true);
+		// A genuinely satisfiable pair on ONE role is still claimable, so this is not a blanket no.
+		expect(claimableBy(["reviewer", "general"], held)).toBe(true);
+	});
+
+	test("the change is observable at the rows the pool REPORTS, not only the predicate", () => {
+		const now = 1_000_000;
+		const stranded = strandedRows(
+			[
+				{ id: "mis-1", title: "reviewer + nobody", status: "ready", requiredCapabilities: ["reviewer", "nobody"], updatedAt: now - 60_000 },
+				{ id: "ok-1", title: "reviewer alone", status: "ready", requiredCapabilities: ["reviewer"], updatedAt: now - 60_000 },
+			],
+			ROLED,
+			now,
+		);
+		// Before the fix, `mis-1` was dropped here: `.some` said claimable, so it was never reported.
+		expect(stranded.map((r) => r.id)).toEqual(["mis-1"]);
+		// The repair the pool would offer is unchanged — this decides WHICH rows reach it, never
+		// what a repair is allowed to do.
+		const plan = planCapsRepair({ taskId: "mis-1", currentCapabilities: ["reviewer", "nobody"], requestedBy: "A" }, ROLED);
+		expect(plan.ok).toBe(true);
+		if (!plan.ok) return;
+		expect(plan.to).toEqual([]);
+		expect(plan.from).toEqual(["reviewer", "nobody"]);
+	});
+
+	test("the STRANDED REASON names which shape the row is, without the reader inferring it", () => {
+		const now = 1_000_000;
+		const stranded = strandedRows(
+			[
+				// shape A: a capability no configured role provides — the row this layer owns.
+				{ id: "str-1", title: "needs nobody", status: "ready", requiredCapabilities: ["nobody"], updatedAt: now - 60_000 },
+				// shape B (`reviewer + integrator`) is deliberately NOT here: `TWO_ROLES` holds both in
+				// its union, so `claimableBy` says claimable and this layer stays silent by design.
+				// The combination strand is `starvation.ts`'s job — pinned in the test below.
+			],
+			TWO_ROLES,
+			now,
+		);
+		// shape B (`reviewer + integrator`) is the union-true combination: `TWO_ROLES` holds both
+		// capabilities, so `claimableBy` over the union says claimable and this layer stays silent.
+		// That shape is NOT this layer's job — see the test below for the layer that owns it.
+		expect([...reachableCapabilities(TWO_ROLES)].sort()).toEqual(["general", "integrator", "reviewer"]);
+		expect(stranded.map((r) => r.id)).toEqual(["str-1"]);
+		const a = stranded.find((r) => r.id === "str-1")!;
+		expect(a.missingCapabilities).toEqual(["nobody"]);
+		expect(a.reason).toContain("no configured role provides nobody");
+		// A row whose capabilities ARE together on one role is not stranded at all.
+		const together = strandedRows(
+			[{ id: "ok-2", title: "reviewer+general", status: "ready", requiredCapabilities: ["reviewer", "general"], updatedAt: now }],
+			TWO_ROLES,
+			now,
+		);
+		expect(together).toEqual([]);
+	});
+
+	test("the combination strand is what findStarvation already names, and the two layers agree", () => {
+		// Starvation.ts is the layer with the AGENTS in scope, so it alone can see
+		// "no single online agent holds them all". Pinned here so the two reasons stay the same
+		// sentence when one of them is edited.
+		const NOW = 1_800_000_000_000;
+		const agents = [
+			{ id: "r", name: "r", role: "reviewer", capabilities: ["reviewer"], status: "online", heartbeatAt: NOW },
+			{ id: "i", name: "i", role: "integrator", capabilities: ["integrator"], status: "online", heartbeatAt: NOW },
+		] as never;
+		const task = { id: "t9", title: "needs both", requiredCapabilities: ["reviewer", "integrator"] } as never;
+		const report = findStarvation({ ready: [task], agents, now: NOW, offlineAfterMs: 60_000 })!;
+		expect(report).toBeDefined();
+		expect(report.missing).toEqual([]);
+		expect(report.rows[0]!.why).toContain("needs reviewer + integrator together, and no single online agent holds them all");
 	});
 });

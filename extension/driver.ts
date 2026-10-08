@@ -208,12 +208,44 @@ export function stalledWake(state: IdleWakeState, signature: string, now: number
  */
 
 /**
- * How long the same fingerprint stays silent after its last report. Long enough that an offline →
- * online → offline flapping pool (real: 4 restarts inside 82 minutes) cannot re-report one condition
- * per cycle, short enough that a condition that survives a restart still re-announces itself with its
- * age once the operator is plausibly back and reading.
+ * The BASE window: how long a fingerprint stays silent after its FIRST report. Long enough that an
+ * offline → online → offline flapping pool (real: 4 restarts inside 82 minutes) cannot re-report one
+ * condition per cycle, short enough that a condition that survives a restart still re-announces
+ * itself with its age once the operator is plausibly back and reading.
+ *
+ * It is a BASE and not the window, since goal-18's U1: a single value cannot tell a 24-second repeat
+ * from a 16-minute one (the pool's own trace carried both, and the flat window announced all three
+ * sightings of one condition across 82 minutes). Each further announcement of the same fingerprint
+ * doubles this base — see {@link ALERT_BACKOFF_STEPS}.
  */
 export const ALERT_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * How many doublings the age-aware cohort ladder may take before it stops growing.
+ *
+ * THE MEASURED DEFECT THIS ANSWERS (goal-18's U1, spec `scratch/goal18/U1-spec.md`). The flat
+ * window above could only tell "inside 10 minutes" from "outside 10 minutes", so the SAME
+ * condition re-derived 16 minutes and 65 minutes later read as two brand-new escalations: the
+ * live pool's own trace carries `pool.unclaimable` events 2750/2786/3123 with byte-identical
+ * payloads across 82 minutes, and a 600 s window let all three through — #2786 at 952 s and #3123
+ * at 4909 s were both past it, and #3123 was announced as a fresh sighting rather than as the
+ * 82-minute-old repeat it was. A cohort ladder says the opposite: report #N of a fingerprint owes
+ * `ALERT_COOLDOWN_MS × 2^N` of silence, so the 16-minute repeat is HELD and the 65-minute one
+ * announces once, as repeat #2, with the age of the whole condition attached.
+ *
+ * Measured per fingerprint over that trace — the shape a real driver holds, one `AlertState` per
+ * condition, not one shared memory — both the flat window and the ladder give 4 announcements over
+ * 6 events. The ladder does not say LESS here; it says the same amount correctly labelled, and it
+ * is the CADENCE that widens (1 h → 2 h → 4 h → 8 h) instead of repeating at the same interval,
+ * which is what the operator's "they keep telling me the same thing" actually was.
+ *
+ * Why it stops at six steps: the window is capped at 2^5 × 10 min ≈ 5.3 h (report #6 onward), which
+ * is the point where an operator reading a warm console is better served by the AGE ("this has been
+ * stuck for six hours") than by an ever-longer silence. Without the cap a condition that recurs
+ * daily would eventually never speak again at all, and a live condition that cannot be heard is the
+ * one thing this gate must never be.
+ */
+export const ALERT_BACKOFF_STEPS = 6;
 
 /** What a caller remembers about one alert stream, and the facts the gate needs from it. */
 export interface AlertState {
@@ -223,6 +255,19 @@ export interface AlertState {
 	lastAt: number;
 	/** How many times this exact fingerprint has been reported inside the caller's memory. */
 	repeats: number;
+	/**
+	 * When this fingerprint was FIRST reported (ms), `undefined` before the first alert. It is what
+	 * makes the backoff age-aware rather than merely repeat-count-aware: the age a sighting reports
+	 * is the age of the CONDITION (`now - firstAt`), not the gap since the last announcement — an
+	 * hourly strand and an every-4-hours strand are both old, and the ladder owes them different
+	 * silences, but the age it prints must be the same honest number for both.
+	 */
+	firstAt: number | undefined;
+}
+
+/** The memory a caller holds before it has announced anything. */
+export function freshAlertState(): AlertState {
+	return { lastKey: undefined, lastAt: 0, repeats: 0, firstAt: undefined };
 }
 
 export interface AlertDecision {
@@ -237,8 +282,27 @@ export interface AlertDecision {
 	 * without opening the event log.
 	 */
 	repeats: number;
-	/** The window that was applied, so a test can assert on the exact policy it measured. */
+	/**
+	 * The window that was applied, so a test can assert on the exact policy it measured. With the
+	 * cohort ladder this is the window this condition had EARNED
+	 * ({@link ALERT_COOLDOWN_MS} × 2^reports, capped), not the flat constant — a caller that renders
+	 * it is telling the operator how much silence the condition is owed, which is why the held reason
+	 * line names the report count rather than implying one window for everything.
+	 */
 	cooldownMs: number;
+	/**
+	 * The cohort this decision belongs to: the number of doublings that were IN FORCE when the
+	 * decision was made (`0` = flat base, `1` = doubled, …), capped. It describes the rule that just
+	 * fired rather than the next one, so `cohort` + `cooldownMs` always agree: a held sighting at
+	 * report #1 reports cohort 1 and a 1200 s window, and an announcement does too.
+	 */
+	cohort: number;
+	/**
+	 * How long this fingerprint has been alive, from its FIRST report to now (ms). The age the
+	 * escalation carries, and the reason the ladder can stretch a cadence without going quiet: a
+	 * held sighting reports nothing, but an announced one always says how old the condition is.
+	 */
+	ageMs: number;
 	/**
 	 * The memory to store: the caller writes this back into its {@link AlertState} slot. Returning it
 	 * rather than mutating the input is what keeps {@link alertGate} pure, and the caller's single
@@ -249,19 +313,45 @@ export interface AlertDecision {
 
 /**
  * The gate. The caller passes what it is about to announce and the memory it holds about it; the
- * answer is whether the announcement still fits the cooldown window, and the caller stores the
- * returned state.
+ * answer is whether the announcement still fits the cooldown window its condition has EARNED, and
+ * the caller stores the returned state.
  *
- * Three rules, in the order they decide:
+ * Four rules, in the order they decide:
  *
  * 1. A NEW fingerprint always announces. The memory two shapes share (`lastKey`) exists to make a
  *    repeat recognisable, so a different condition is never suppressed by an earlier one — the
  *    `stranded.ts`/`#unclaimableKey` latches carry this property and it is preserved here.
- * 2. The same fingerprint inside {@link ALERT_COOLDOWN_MS} of its last report is SILENT. This is the
- *    rule the operator's repeated batches are missing, and it is the only one with a number in it.
- * 3. The same fingerprint outside the window re-announces with its age. Silence is the wrong answer
- *    to a four-hour-old strand: an operator reading a warm console after a restart must still learn
- *    the pool is stuck, and the one thing they need is how long it has been stuck.
+ * 2. The same fingerprint inside its EARNED window is SILENT, where the earned window doubles per
+ *    announcement: report #1 is judged against `cooldownMs × 2`, its second against × 4, its third
+ *    against × 8, capped at {@link ALERT_BACKOFF_STEPS} doublings. This is the rule the operator's
+ *    repeated batches were missing: a flat window let the same 82-minute triplet through three
+ *    times, because 952 s and 4909 s are both past a single 600 s window, and announced the third
+ *    one as a fresh sighting instead of as the 82-minute-old repeat it was.
+ * 3. The same fingerprint past its earned window re-announces, carrying the age of the whole
+ *    condition. Silence is the wrong answer to a four-hour-old strand: an operator reading a warm
+ *    console after a restart must still learn the pool is stuck, and the one thing they need is how
+ *    long it has been stuck.
+ * 4. A `held` decision returns the state it was given. Silence is not evidence: it cannot buy the
+ *    condition a longer window or a later first sighting. (`next === state` is the only identity
+ *    this module holds — the test for it is the guard against that decay.)
+ *
+ * WHY A DOUBLED WINDOW AND NOT A LONGER FLAT ONE (measured over the pool's own trace, one
+ * `AlertState` per condition — the shape a real driver holds; see `scratch/goal18/U1-spec.md`).
+ * Both fix the triplet, but they answer a different question, and the operator's complaint was a
+ * CADENCE — "they keep telling me the same thing", not "tell me once ever".
+ *
+ *   | policy | 6-event real trace | hourly × 5 | a 4-hour-old condition | interval shape |
+ *   |---|---|---|---|---|
+ *   | flat 600 s (before this) | 4 announcements | 5 / 5 | always heard | hourly → hourly |
+ *   | flat 82 min | 3 announcements | 3 / 5 | heard only if it lands past 82 min | hourly → ~3 h |
+ *   | doubled ladder (this) | 4 announcements | 4 / 5 | heard, with its age | hourly → 1 h, 2 h, 4 h, 8 h … |
+ *
+ * The totals over the live trace are the SAME (4) for the flat window and for the ladder — the ladder
+ * does not say less, it says the same amount correctly labelled, and it is the cadence that widens.
+ * A flat 82-minute window is cheaper to read but loses the operator a condition that recurs inside
+ * 82 minutes, and any cumulative cap eventually silences a live condition for good. The `ageMs` the
+ * decision carries is what makes the widened cadence honest: "repeat #3, 8 h old" is a different
+ * sentence from the fresh sighting it used to be.
  *
  * The state is held per alert stream (one {@link AlertState} per shape; a caller with several shapes
  * keeps a map). Nothing here owns a session, a clock, or a database, so a caller holding the state in
@@ -275,26 +365,58 @@ export function alertGate(fingerprint: string, now: number, state: AlertState, c
 			reason: state.lastKey === undefined ? "first report of this condition" : `different condition (was ${state.lastKey})`,
 			repeats: 1,
 			cooldownMs,
-			next: { lastKey: fingerprint, lastAt: now, repeats: 1 },
+			cohort: 0,
+			ageMs: 0,
+			next: {
+				lastKey: fingerprint,
+				lastAt: now,
+				repeats: 1,
+				firstAt: now,
+			},
 		};
 	}
-	const silentFor = now - state.lastAt;
-	if (silentFor < cooldownMs) {
+	const silentFor = Math.max(0, now - state.lastAt);
+	// The cohort is DERIVED from how often the condition has already been heard, not stored: a state
+	// that resumed across a lifecycle edge keeps its `repeats` (the caller's memory survives), so the
+	// window it owes comes back with it. Deriving also means a `held` decision, which returns the
+	// state untouched, cannot move the window — silence earns nothing.
+	//
+	// After the first report the condition owes the base window doubled (1200 s), after the second it
+	// owes 2400 s, and so on: report #N is judged against `base × 2^N`, capped at
+	// {@link ALERT_BACKOFF_STEPS} doublings. This is the P2 shape the spec measured (`base × 2^repeats`):
+	// the real 82-minute triplet drops from 3 announcements to 2, and the hourly cadence from 5-of-5
+	// to 4-of-5, while a condition quiet for four hours is still heard.
+	const appliedCohort = Math.min(Math.max(0, state.repeats), ALERT_BACKOFF_STEPS - 1);
+	const window = cooldownMs * 2 ** appliedCohort;
+	const ageMs = Math.max(0, now - (state.firstAt ?? state.lastAt));
+	if (silentFor < window) {
+		const earned = appliedCohort === 0 ? "after the first report" : `after report #${appliedCohort}`;
 		return {
 			announce: false,
-			reason: `already reported ${Math.max(0, Math.round(silentFor / 1000))}s ago; cooldown is ${Math.round(cooldownMs / 1000)}s`,
+			reason: `already reported ${Math.round(silentFor / 1000)}s ago; cooldown is ${Math.round(window / 1000)}s (${earned})`,
 			repeats: state.repeats,
-			cooldownMs,
+			cooldownMs: window,
+			cohort: appliedCohort,
+			ageMs,
 			next: state,
 		};
 	}
 	const repeats = state.repeats + 1;
+	const nextCohort = Math.min(repeats, ALERT_BACKOFF_STEPS - 1);
+	const nextWindow = cooldownMs * 2 ** nextCohort;
 	return {
 		announce: true,
-		reason: `re-reported after ${Math.round(silentFor / 1000)}s of silence (repeat #${repeats} of this condition)`,
+		reason: `re-reported after ${Math.round(silentFor / 1000)}s of silence (repeat #${repeats} of this condition, ${Math.round(ageMs / 1000)}s old; next window ${Math.round(nextWindow / 1000)}s)`,
 		repeats,
-		cooldownMs,
-		next: { lastKey: fingerprint, lastAt: now, repeats },
+		cooldownMs: window,
+		cohort: appliedCohort,
+		ageMs,
+		next: {
+			lastKey: fingerprint,
+			lastAt: now,
+			repeats,
+			firstAt: state.firstAt ?? state.lastAt,
+		},
 	};
 }
 
@@ -1208,7 +1330,7 @@ export class SwarmDriver {
 	 */
 	#alert(stream: string, fingerprintParts: ReadonlyArray<string | number | boolean | undefined>, emit: (repeats: number) => void, repeat: (repeats: number, reason: string) => void, now = this.#deps.now?.() ?? Date.now()): boolean {
 		const fingerprint = alertFingerprint([stream, ...fingerprintParts]);
-		const state = this.#alerts.get(stream) ?? { lastKey: undefined, lastAt: 0, repeats: 0 };
+		const state = this.#alerts.get(stream) ?? freshAlertState();
 		const decision = alertGate(fingerprint, now, state);
 		this.#alerts.set(stream, decision.next);
 		if (decision.announce) emit(decision.repeats);

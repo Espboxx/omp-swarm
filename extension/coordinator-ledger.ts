@@ -278,9 +278,21 @@ function artifactsOverlap(entry: GoalClass, artifacts: readonly string[]): boole
  * It is a REMINDER, never a gate, exactly as `guard.ts` frames its own notice — the scribe reads it and
  * decides. Empty when the board carries nothing to say, so a fresh pool gets an unchanged brief rather
  * than a section of zeros.
+ *
+ * WHY THE CLASSES ARE RANKED (goal-18's U2 measurement). The sections used to take the classes in
+ * `boardClasses`'s own order — newest first — which on a live board means the newest few
+ * conclusions about THIS round's planning dominate the list and the knots an older goal actually
+ * raised are never shown: measured over the live pool, the injected list led with
+ * `goal:goal-18,plan` (an artifact of the round being opened) while 25 of the 77 answered classes say
+ * `plan`/`merge` and 18 of them `dedupe`/`duplicate` — none of which a goal about a specific source
+ * file can use. So each class is scored on how many of the goal's OWN artifacts it carries (the same
+ * overlap the duplicate verdict uses — one notion of "relevant", not two), and the ties are broken by
+ * the class's own recency, which preserves the old ordering exactly when nothing overlaps. A goal
+ * naming no artifact ranks on recency alone, so its brief is unchanged.
  */
 export function ledgerInjection(ledger: GoalLedger, goal: string, verdict: GoalDuplicateVerdict): string {
 	if (ledger.classes.length === 0) return "";
+	const artifacts = goalArtifacts(goal);
 	const lines = [
 		"COORDINATOR LEDGER (goal-17 L3): the board already carries conclusions from earlier rounds. Read them before re-diagnosing anything.",
 		`${ledger.readRows} conclusion row(s) read, ${ledger.classes.length} distinct class(es): ${ledger.answeredCount} already answered by a DECISION, ${ledger.openCount} still open.`,
@@ -295,7 +307,7 @@ export function ledgerInjection(ledger: GoalLedger, goal: string, verdict: GoalD
 				: "This is an injection, not a refusal: the goal opens either way, and this round decides what to do with it.",
 		);
 	}
-	const answered = ledger.classes.filter((entry) => entry.answered).slice(0, 8);
+	const answered = rankForGoal(ledger.classes.filter((entry) => entry.answered), artifacts).slice(0, 8);
 	if (answered.length > 0) {
 		lines.push("");
 		lines.push("Already answered (read before re-deriving):");
@@ -303,11 +315,29 @@ export function ledgerInjection(ledger: GoalLedger, goal: string, verdict: GoalD
 			lines.push(`- ${entry.key} — ${entry.count} entry(ies) (${entry.entryIds.join(", ")}), newest DECISION #${entry.latestId}`);
 		}
 	}
-	const open = ledger.classes.filter((entry) => !entry.answered).slice(0, 5);
+	const open = rankForGoal(ledger.classes.filter((entry) => !entry.answered), artifacts).slice(0, 5);
 	if (open.length > 0) {
 		lines.push("");
 		lines.push("Still open (dead ends earlier rounds met):");
 		for (const entry of open) lines.push(`- ${entry.key} — ${entry.count} entry(ies) (${entry.entryIds.join(", ")})`);
 	}
 	return lines.join("\n");
+}
+
+/**
+ * The classes most worth handing this goal, most-relevant first: the classes carrying the most of the
+ * goal's own artifacts, then the newest. A class carrying none of them all scores 0, so the order
+ * degrades to the index's own newest-first order byte for byte — a goal naming no artifact therefore
+ * gets exactly the brief it got before this ranking existed.
+ *
+ * Sorting a copy rather than the ledger's own array: `goalLedger`'s output is shared with the verdict
+ * and with `createGoal`'s event counts, and a reordered list would make them read a different order.
+ */
+function rankForGoal(classes: readonly GoalClass[], artifacts: readonly string[]): GoalClass[] {
+	if (artifacts.length === 0) return [...classes];
+	const wanted = new Set(artifacts);
+	return [...classes]
+		.map((entry, at) => ({ entry, at, score: entry.key.split(",").filter((tag) => wanted.has(tag)).length }))
+		.sort((a, b) => b.score - a.score || a.at - b.at)
+		.map((row) => row.entry);
 }

@@ -27,10 +27,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+	ALERT_BACKOFF_STEPS,
 	ALERT_COOLDOWN_MS,
 	SwarmDriver,
 	alertFingerprint,
 	alertGate,
+	freshAlertState,
 	type AlertState,
 	type TimerApi,
 } from "../../extension/driver";
@@ -60,9 +62,9 @@ function replay(
 }
 
 /** The memory a caller holds before it has announced anything. */
-const fresh = (): AlertState => ({ lastKey: undefined, lastAt: 0, repeats: 0 });
+const fresh = (): AlertState => freshAlertState();
 
-describe("the pure rule: one fingerprint, one cooldown window", () => {
+describe("the pure rule: one fingerprint, one window that grows with the repeat count", () => {
 	test("the same condition on three consecutive ticks is ONE announcement", () => {
 		// The measured shape: events 2750/2786/3123 with identical payloads, and events 3193/3201 the
 		// same payloads 24 seconds apart. Ticks are the driver's own 3s interval.
@@ -78,19 +80,126 @@ describe("the pure rule: one fingerprint, one cooldown window", () => {
 		expect(reasons[2]).toContain("already reported 6s ago");
 	});
 
-	test("the window bounds the silence, and the report after it carries its age", () => {
+	test("each announcement DOUBLES the silence the condition is owed", () => {
 		const first = 1_800_000_000_000;
-		const { announced, state } = replay("pool.unclaimable|reviewer|task-221,task-222", [
-			first,
-			first + ALERT_COOLDOWN_MS - 1,
-			first + ALERT_COOLDOWN_MS,
-			first + 2 * ALERT_COOLDOWN_MS,
-		]);
-		// Inside the window: silent. AT the window and past it: announced, with the repeat count the
-		// operator reads as "this is not news, it is three hours old".
-		expect(announced).toBe(3);
-		// The memory the caller would hold after the run carries all three announcements.
-		expect(state.repeats).toBe(3);
+		// The first sighting announces; report #1 will owe the base window DOUBLED.
+		const opening = alertGate("k", first, fresh(), ALERT_COOLDOWN_MS);
+		expect(opening.announce).toBe(true);
+		expect(opening.repeats).toBe(1);
+		expect(opening.cohort).toBe(0);
+		expect(opening.ageMs).toBe(0);
+
+		// Report #1 owes 1200 s, not the old flat 600 s: a second sighting 600 s later is HELD. That
+		// is the whole U1 clause — the 24-second pair this already held, plus the 16-minute repeat the
+		// flat window let through three times across 82 minutes.
+		expect(alertGate("k", first + ALERT_COOLDOWN_MS, opening.next, ALERT_COOLDOWN_MS).announce).toBe(false);
+		expect(alertGate("k", first + 2 * ALERT_COOLDOWN_MS - 1, opening.next, ALERT_COOLDOWN_MS).announce).toBe(false);
+		// Exactly at it, the condition speaks again as repeat #2.
+		const second = alertGate("k", first + 2 * ALERT_COOLDOWN_MS, opening.next, ALERT_COOLDOWN_MS);
+		expect(second.announce).toBe(true);
+		expect(second.repeats).toBe(2);
+		// The cohort reported is the window this decision was JUDGED against (1200 s = one doubling),
+		// so `cohort` + `cooldownMs` always describe the rule that just fired.
+		expect(second.cohort).toBe(1);
+		expect(second.cooldownMs).toBe(2 * ALERT_COOLDOWN_MS);
+		expect(second.ageMs).toBe(2 * ALERT_COOLDOWN_MS);
+		expect(second.reason).toContain("repeat #2");
+		expect(second.reason).toContain("1200s old");
+		// The window the next sighting is owed is printed, so the cadence is auditable.
+		expect(second.reason).toContain("next window 2400s");
+
+		// Report #2 owes 2400 s. A sighting 1200 s later is held — the pre-U1 flat window would have
+		// announced it, which is precisely the 16-minute repeat this change exists to stop.
+		expect(alertGate("k", first + 2 * ALERT_COOLDOWN_MS + 2 * ALERT_COOLDOWN_MS, second.next, ALERT_COOLDOWN_MS).announce).toBe(false);
+		const third = alertGate("k", first + 2 * ALERT_COOLDOWN_MS + 4 * ALERT_COOLDOWN_MS, second.next, ALERT_COOLDOWN_MS);
+		expect(third.announce).toBe(true);
+		expect(third.repeats).toBe(3);
+		// Report #2 was judged against the 2400 s window (cohort 2).
+		expect(third.cohort).toBe(2);
+		expect(third.cooldownMs).toBe(4 * ALERT_COOLDOWN_MS);
+		expect(third.ageMs).toBe(6 * ALERT_COOLDOWN_MS);
+		// Report #3 owes 4800 s, and its age keeps accumulating from the FIRST report.
+		expect(third.reason).toContain("repeat #3");
+		expect(third.reason).toContain("next window 4800s");
+	});
+
+	test("the ladder is CAPPED, so a stale condition can never go quiet forever", () => {
+		const first = 1_800_000_000_000;
+		// Walk the ladder one announcement at a time, always waiting out the window the current
+		// report count owes, past the cap and a few steps beyond it.
+		let state: AlertState = { ...fresh(), lastKey: "k", lastAt: first, firstAt: first };
+		let announced = 0;
+		for (let step = 0; step < ALERT_BACKOFF_STEPS + 3; step += 1) {
+			const window = ALERT_COOLDOWN_MS * 2 ** Math.min(state.repeats, ALERT_BACKOFF_STEPS - 1);
+			const decision = alertGate("k", state.lastAt + window, state, ALERT_COOLDOWN_MS);
+			if (decision.announce) announced += 1;
+			state = decision.next;
+		}
+		// Every sighting past its window announced, so the ladder never goes quiet by construction.
+		expect(announced).toBe(ALERT_BACKOFF_STEPS + 3);
+		expect(state.repeats).toBe(ALERT_BACKOFF_STEPS + 3);
+		// Past the cap the applied cohort stops advancing: report #7 and report #70 owe the same window.
+		const capped = ALERT_COOLDOWN_MS * 2 ** (ALERT_BACKOFF_STEPS - 1);
+		const decision = alertGate("k", state.lastAt + capped, state, ALERT_COOLDOWN_MS);
+		expect(decision.announce).toBe(true);
+		expect(decision.cohort).toBe(ALERT_BACKOFF_STEPS - 1);
+		expect(decision.cooldownMs).toBe(capped);
+		expect(decision.reason).toContain(`repeat #${ALERT_BACKOFF_STEPS + 4}`);
+	});
+
+	/**
+	 * THE ACCEPTANCE CLAUSE, replayed literally: the pool's OWN trace, the SAME timestamps,
+	 * byte-identical fingerprint. `pool.unclaimable` events 2750 (00:10:12), 2786 (00:26:05) and
+	 * 3123 (01:32:01) carry identical payloads — gaps of 952.49 s and 3956.07 s across 82 minutes —
+	 * and the flat 600 s window announced all THREE (5 announcements + 1 hold over the 6 real
+	 * events). The U1 clause is that this pair now announces exactly once per cohort with a
+	 * cumulative age, and this test holds the gate to it at the real numbers rather than round ones.
+	 */
+	test("the 82-minute triplet announces once per cohort, and the 16-minute repeat is held", () => {
+		const base = 1_800_000_000_000;
+		const fingerprint = "stranded|task-221:reviewer|task-222:reviewer";
+		// The real event times as recorded in the live pool, in the order the gate saw them.
+		const trace = [base, base + 952_490, base + 4_909_570];
+
+		const openingSighting = alertGate(fingerprint, trace[0], fresh(), ALERT_COOLDOWN_MS);
+		expect(openingSighting.announce).toBe(true);
+		expect(openingSighting.repeats).toBe(1);
+		expect(openingSighting.ageMs).toBe(0);
+
+		// The 16-minute sighting: 952 s past a 600 s window USED to announce (cohort 0 is the flat
+		// base and it is the only cohort the old rule ever opened), and that is the repeat the
+		// operator was told about three times in 82 minutes.
+		const short = alertGate(fingerprint, trace[1], openingSighting.next, ALERT_COOLDOWN_MS);
+		expect(short.announce).toBe(false);
+		expect(short.repeats).toBe(1);
+		// The hold is not silence: it names the condition's age and the window it owes.
+		expect(short.reason).toContain("already reported 952s ago");
+		expect(short.reason).toContain("cooldown is 1200s");
+		expect(short.reason).toContain("after report #1");
+
+		// The 65-minute sighting: 3956 s past the HELD one is past report #1's 1200 s window, so the
+		// condition speaks ONCE more — as repeat #2, with the cumulative age the operator needs.
+		// It is judged on the state the held sighting left behind (`short.next`), NOT on the state as
+		// it was before that hold: a hold does not write to the stream, but the sighting behind it is
+		// still the same condition and the operator has now seen it twice.
+		const long = alertGate(fingerprint, trace[2], short.next, ALERT_COOLDOWN_MS);
+		expect(long.announce).toBe(true);
+		expect(long.repeats).toBe(2);
+		// The applied cohort is the one this sighting was JUDGED against (report #1 owed 1200 s).
+		expect(long.cohort).toBe(1);
+		// The age is the WHOLE trace, not the gap since the held sighting: 82 minutes.
+		expect(long.ageMs).toBe(4_909_570);
+		expect(long.reason).toContain("repeat #2");
+		expect(long.reason).toContain("4910s old");
+		// Report #2 is owed 2400 s next, so the cadence keeps widening — and the receipt says so.
+		expect(long.reason).toContain("next window 2400s");
+
+		// The 6 real events then yield 4 announcements instead of the flat window's 5: the 24-second
+		// pair (a different fingerprint) is still held, and this triplet drops one.
+		const held = alertGate(fingerprint, base + 5_000, long.next, ALERT_COOLDOWN_MS);
+		expect(held.announce).toBe(false);
+		// Silence cannot move the memory: the held decision returns the state it was handed.
+		expect(held.next).toBe(long.next);
 	});
 
 	test("a different condition announces, and neither condition inherits the other's silence", () => {
@@ -125,7 +234,7 @@ describe("the pure rule: one fingerprint, one cooldown window", () => {
 	});
 
 	test("a held decision returns the state it already held: silence cannot move the window", () => {
-		const state: AlertState = { lastKey: "k", lastAt: 1_800_000_000_000, repeats: 2 };
+		const state: AlertState = { lastKey: "k", lastAt: 1_800_000_000_000, repeats: 2, firstAt: 1_800_000_000_000 };
 		const decision = alertGate("k", 1_800_000_000_003, state, ALERT_COOLDOWN_MS);
 		expect(decision.announce).toBe(false);
 		// Writing `next` back must not push the window out, or a condition that keeps being evaluated
@@ -288,12 +397,17 @@ describe("the wiring: the driver's own dispose seam, failed on purpose", () => {
 		const first = h.notices.filter((notice) => notice.includes("dispose of")).length;
 		expect(first).toBe(1);
 
-		// Past the window: the identical condition is news again, and it says so.
-		await h.setClock(1_800_000_000_000 + ALERT_COOLDOWN_MS + 1);
+		// Past the window: the identical condition is news again, and it says so. Report #1 is owed
+		// the base window doubled (the ladder's first step), so a single `ALERT_COOLDOWN_MS` is no
+		// longer enough — the flat-window clock this test used before goal-18's U1 would have been.
+		await h.setClock(1_800_000_000_000 + 2 * ALERT_COOLDOWN_MS + 1);
 		await h.start();
 		await h.driver.stop("test: second teardown");
 		const second = h.notices.filter((notice) => notice.includes("dispose of"));
 		expect(second.length).toBe(2);
 		expect(second[1]).toContain("repeat #2");
+		// The operator-facing notice names the repeat, not the gate's internals: the window itself is
+		// traced (`alert held - …`), because an operator reading a notice needs "this happened again",
+		// while the widened window is what a debugger reads.
 	});
 });

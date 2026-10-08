@@ -1114,7 +1114,7 @@ export class SwarmStore {
 			// from ever closing work a capable agent could still take.
 			const stranded = !closable && unroutable !== undefined && this.#stranded(row, taskId, unroutable, now);
 			if (!held && !closable && !stranded) {
-				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}${this.#failHint(row, unroutable)}` };
+				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}${this.#failHint(row, taskId, unroutable, now)}` };
 			}
 			this.#db.run(
 				"UPDATE tasks SET status='failed', result=?, claimed_by=NULL, claimed_at=NULL, lease_until=NULL, updated_at=? WHERE id=?",
@@ -1153,11 +1153,34 @@ export class SwarmStore {
 		return !online.some((agent) => required.every((cap) => agent.capabilities.includes(cap)));
 	}
 
-	/** Which guard refused an unheld actionable row, so a caller is not left guessing. */
-	#failHint(row: TaskRow, unroutable?: UnroutableClose): string {
+	/**
+	 * Which guard refused an unheld actionable row, so a caller is not left guessing.
+	 *
+	 * goal-18's U4: this used to be ONE sentence for five different guards, and the sentence it
+	 * chose ("an online agent can still claim it") is TRUE BY DEFINITION for a `caps=[]` row — which
+	 * is precisely the shape the unroutable exit refuses at `required.length === 0`. A reader could
+	 * not tell "this row will never be closable" from "this row is not old enough yet". The ladder's
+	 * guards are now named in the order `#stranded` evaluates them, so the reason is auditable
+	 * instead of plausible.
+	 */
+	#failHint(row: TaskRow, taskId: string, unroutable?: UnroutableClose, now = Date.now()): string {
 		if (row.claimed_by !== null || (row.status !== "ready" && row.status !== "blocked")) return "";
 		if (unroutable === undefined) return " (nothing here can close it: no dependency of it is dead)";
-		return " (an online agent can still claim it, or it has not been stranded for the grace window yet)";
+		if (now - row.updated_at < (unroutable.graceMs ?? UNROUTABLE_GRACE_MS)) {
+			return ` (it has not been stranded for the grace window: ${Math.max(0, Math.round((now - row.updated_at) / 1000))}s of ${Math.round((unroutable.graceMs ?? UNROUTABLE_GRACE_MS) / 1000)}s)`;
+		}
+		if (this.unresolvedDependencies(taskId).length > 0) return " (it still has unresolved dependencies)";
+		const required = parseList(row.required_capabilities);
+		if (required.length === 0) {
+			return " (it declares no capability at all, so every agent can claim it: the unroutable exit is not for `caps=[]` rows — it is for a capability nobody holds)";
+		}
+		const online = this.listAgents().filter(
+			(agent) => agent.status !== "offline" && now - agent.heartbeatAt <= unroutable.offlineAfterMs,
+		);
+		if (online.length === 0) {
+			return " (no agent is online, and a pool between batches must never become a licence to close ready work)";
+		}
+		return " (an online agent holds its full capability set)";
 	}
 
 	/**
