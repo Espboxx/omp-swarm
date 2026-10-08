@@ -20,7 +20,7 @@ import {
 import { loadSwarmConfig, saveSwarmAuto } from "../../extension/config";
 import { openInMemoryDatabase, swarmPaths } from "../../extension/db";
 import { SwarmStore } from "../../extension/store";
-import { DEFAULT_CONFIG, type RoleConfig, type SwarmConfig, type SwarmTask } from "../../extension/types";
+import { DEFAULT_CONFIG, type RoleConfig, type SwarmConfig, type SwarmGoal, type SwarmTask } from "../../extension/types";
 
 const tempDirs: string[] = [];
 
@@ -649,6 +649,155 @@ describe("swarm-side planning", () => {
 		expect(h.calls.notify).toEqual([]);
 		expect(h.store.searchBoard({ type: "FAIL" })).toEqual([]);
 	});
+
+/**
+ * goal-21 F1: the round that dies past its bound must not be the end of the pool.
+ *
+ * The measured defect (goal-21, events 5915-5922): at 09:32:09 the controller was `idle`, at
+ * 09:32:11 goal-19 and goal-20 both hit their bound and were closed failed — and then the event
+ * stream produced NOTHING for 102.5 minutes, until a human opened goal-21 at 11:14:41. Nothing
+ * restarted the pool because (a) auto-start is gated on `#pendingStart`, which only a NEW task id
+ * ever sets, and a dying round creates no new ids; and (b) the dead-pool re-raise below is gated on
+ * `phase === "running"` (auto.ts:536), which an `idle` controller never satisfies. The closure is
+ * the owed work, so it must mark the start pending exactly the way a new task id does.
+ */
+describe("a planning round that failed on its bound still leaves the pool working", () => {
+	/**
+	 * The isolation every test below needs: a goal whose bound has ALREADY passed, created and
+	 * released in the shape the pool can see. `createGoal` computes `deadlineAt = createdAt +
+	 * deadlineMs`, so `deadlineMs: 1` with `now: h.now()` makes the very next tick's
+	 * `closeExpiredGoals` close it — while the controller has already observed every task id
+	 * (the round's own planning task arrived with the goal and `enable()` recorded it). That is the
+	 * point: the surviving new-id path (`tasks.filter((t) => !#knownIds.has(t.id))`) sees nothing
+	 * new, so ONLY the goal-failure branch can owe a start. With `deadlineMs: 1000` the closure
+	 * would land on a later tick and the test could not tell which branch fired.
+	 */
+	function expiredRound(h: Harness): { goal: SwarmGoal; planningTask: SwarmTask } {
+		return h.store.createGoal({ goal: "never planned", agents: 2, createdBy: "main", deadlineMs: 1, now: h.now() });
+	}
+
+	test("the round closing under an `idle` phase re-assembles the pool for the residue work", async () => {
+		const h = harness();
+		// The residue a bound closure leaves behind. Measured: the round's OWN planning task goes
+		// `failed` with the goal, so it is not claimable residue — what survives is whatever other
+		// rows the pool held. Here: one claimable row and NO pool, which is the shape the defect
+		// killed.
+		h.store.createTask({ title: "residue", createdBy: "main" });
+		// THE IDLE PHASE, DELIBERATELY: `settle()` would assemble the pool and leave the phase
+		// `running`, which hands the recovery to the dead-pool re-raise at auto.ts:536 instead of
+		// the branch under test. The measured state at event 5915 (`swarm.auto.idle` two seconds
+		// before the bound fired) is a controller that never assembled a pool — and `enable()` is
+		// called AFTER every row exists, so the new-id path (`tasks.filter((t) => !#knownIds…)`)
+		// is empty on every tick and the round's closure is the ONLY thing that owes a start.
+		const opened = expiredRound(h);
+		h.controller.enable();
+		h.advance(2);
+		await h.controller.tick();
+		// The bound closed the goal with its own FAIL, exactly as before — F1 changes nothing there.
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("failed");
+		expect(h.store.searchBoard({ type: "FAIL" }).length).toBe(1);
+		expect(h.store.getTask(opened.goal.planningTask)?.status).toBe("failed");
+		// The settle window still paces it: the operator is never interrupted mid-turn.
+		expect(h.calls.start).toHaveLength(0);
+		h.advance(h.settleMs);
+		await h.controller.tick();
+		// THE FIX: the closure is the owed work, so the pool comes back for the residue — the action
+		// that did NOT happen across the 102.5-minute measured silence.
+		expect(h.calls.start).toHaveLength(1);
+		expect(h.calls.start[0]?.count).toBeGreaterThan(0);
+		expect(h.controller.phase).toBe("running");
+		expect(h.calls.events.filter((entry) => entry.type === "swarm.goal.failed")).toHaveLength(1);
+	});
+
+	test("the re-assembly is one per episode, not one per tick", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.store.createTask({ title: "a", createdBy: "main" });
+		await settle(h);
+		// The measured shape: the driver is DOWN when the bound fires (this is what `swarm.auto.idle`
+		// plus a stalled driver means), so the recovery branch is the only start-owing actor left.
+		// `settle()` already produced the pool's one start for the residue task; the second start
+		// below is the recovery action the bound now owes.
+		h.setDriverRunning(false);
+		h.setWorkers(0);
+		expiredRound(h);
+		h.advance(2);
+		await h.controller.tick();
+		// The recovery is paced by the settle window, exactly as the first start is: the tick that
+		// discovers the closure only marks the work owed (production ticks are `AUTO_TICK_MS` apart),
+		// and the NEXT tick assembles the pool.
+		h.advance(h.settleMs);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(2);
+		const recoveredAt = h.calls.start.length;
+		// The driver came up (the harness mirrors the host), so every later tick sees a live pool and
+		// neither the growth branch nor the dead-pool re-raise has anything left to fire on.
+		for (let i = 0; i < 5; i++) {
+			h.advance(60_000);
+			await h.controller.tick();
+		}
+		expect(h.calls.start).toHaveLength(recoveredAt);
+	});
+
+	test("a goal closing while the pool is RUNNING is not owed a start", async () => {
+		const h = harness();
+		// A live pool whose residue work is ALL claimed (nothing ready), so the growth branch has
+		// nothing to fire on either: this test isolates the recovery branch and nothing else.
+		await runningPool(h, 1);
+		expect(h.calls.start).toHaveLength(1);
+		for (const row of h.store.listTasks({ limit: 10 })) h.store.claim(row.id, "w1", 300, ["general"]);
+		expect(h.store.counts().ready).toBe(0);
+		const opened = expiredRound(h);
+		h.advance(2);
+		await h.controller.tick();
+		h.advance(60_000);
+		await h.controller.tick();
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("failed");
+		// The pool is alive and claimed every row: the recovery branch must stay out of it, because
+		// it lives inside `!isDriverRunning()` on purpose — a live pool claims residue normally.
+		expect(h.calls.start).toHaveLength(1);
+		expect(h.calls.events.filter((entry) => entry.type === "roster.grow")).toHaveLength(0);
+	});
+
+	test("a round closing with NOTHING claimable left starts nothing", async () => {
+		const h = harness();
+		h.controller.enable();
+		// No tasks at all: `planRoster` returns an empty roster and the auto-start branch has nothing
+		// to assemble. The recovery must not invent work or wedge the phase.
+		const opened = expiredRound(h);
+		h.advance(1 + h.settleMs);
+		await h.controller.tick();
+		expect(h.store.getGoal(opened.goal.id)?.status).toBe("failed");
+		expect(h.calls.start).toHaveLength(0);
+		expect(h.controller.phase).toBe("idle");
+	});
+
+	test("the recovery survives a start that fails, and retries once the window passes", async () => {
+		const h = harness();
+		h.controller.enable();
+		h.store.createTask({ title: "a", createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(false);
+		h.setWorkers(0);
+		expiredRound(h);
+		h.advance(2 + h.settleMs);
+		// No pending task-owed start competes with the recovery one: `settle()` already spent its own,
+		// so the failed start below IS the recovery action.
+		h.failNextStart();
+		await h.controller.tick();
+		// The recovery is paced by the settle window: this tick only marks the work owed. The NEXT
+		// tick is the one that reaches `startSwarm`, and it is the start made to fail here.
+		h.advance(h.settleMs);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(2);
+		expect(h.controller.phase).toBe("idle");
+		expect(h.calls.notify.some((text) => text.includes("swarm failed to start"))).toBe(true);
+		h.advance(60_000);
+		await h.controller.tick();
+		expect(h.calls.start).toHaveLength(3);
+		expect(h.controller.phase).toBe("running");
+	});
+});
 
 	test("the default policy hands the split to the workers and never asks for a task list", () => {
 		const h = harness();

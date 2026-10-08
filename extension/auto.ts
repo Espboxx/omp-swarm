@@ -438,11 +438,13 @@ export class AutoController {
 			// A live goal is work the pool owes before any task exists: it sizes the roster on its own
 			// and it must not be read as a stall. The bound is enforced here, on the tick that already
 			// exists, so a round that cannot converge is CLOSED with a FAIL instead of spinning.
+			let goalClosed = false;
 			for (const goal of store.closeExpiredGoals(this.#deps.now())) {
 				const notice = goalBoundNotice(goal);
 				this.#deps.notify(notice, "warning");
 				this.#deps.notifyMain(notice);
 				this.#deps.onEvent?.("swarm.goal.failed", { goal: goal.id });
+				goalClosed = true;
 			}
 			const liveGoals = store.liveGoals();
 			const goalAgents = liveGoals.reduce((n, goal) => Math.max(n, goal.agents), 0);
@@ -455,6 +457,23 @@ export class AutoController {
 					this.#knownIds = new Set(tasks.map((t) => t.id));
 					this.#lastTaskAt = this.#deps.now();
 					if (newIds.some((t) => t.status !== "done" && t.status !== "failed")) this.#pendingStart = true;
+				}
+				// RECOVERY (goal-21 F1): a planning round that hit its bound is the one failure that
+				// used to leave the pool dead forever. The re-raise branch below is gated on
+				// `phase === "running"`, and auto-start is gated on `#pendingStart`, which only a NEW
+				// task id ever sets — so a round dying introduced no new ids and changed no phase, and
+				// the pool sat at `idle` with claimable work nobody would come back for (measured:
+				// events 5915 `swarm.auto.idle` @ 09:32:09, 5916-5921 goal.fail/swarm.goal.failed, then
+				// NOTHING until 5922 @ 11:14:41 — 102.5 minutes of stream silence).
+				//
+				// The closure itself is the owed work, so it marks the start pending exactly the way a
+				// new task id does. The rest of the tick is unchanged: the settle window still paces
+				// it, the main session is still never interrupted, and a goal that closes while the
+				// driver is running is NOT owed a start (the branch is inside `!isDriverRunning()`),
+				// so a live pool claims the residue work through its ordinary path.
+				if (goalClosed) {
+					this.#pendingStart = true;
+					this.#lastTaskAt = this.#deps.now();
 				}
 			}
 			if (
