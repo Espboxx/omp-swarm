@@ -12,6 +12,7 @@
  * and tests call it directly.
  */
 import type { SwarmStore } from "./store";
+import { ALERT_COOLDOWN_MS, alertGate, type AlertState } from "./driver";
 import { reconcilePool } from "./scaling";
 import { findStarvation } from "./starvation";
 import { postStrandedNotice } from "./stranded";
@@ -251,8 +252,32 @@ export class AutoController {
 	 * Identity of the last reported starvation condition (ready rows nobody online can claim). Held so
 	 * a tick repeating the same condition stays silent, and cleared the moment it stops so the next
 	 * occurrence — or a different row set — is reported again.
+	 *
+	 * Part 2 of goal-15's G2 is the failure this field alone CANNOT express: it remembers ONE key, so
+	 * a key that comes back inside a short window is treated as a brand-new condition and reported
+	 * again. The real pool measured it — `pool.unclaimable` events 2750/2786/3123 carry byte-identical
+	 * payloads (rows task-221+task-222, missing reviewer, online 4) across 82 minutes, and 3193/3201
+	 * the same payloads 24 seconds apart. So the ONE key that was in force then survived by being
+	 * re-derived from a fresh direction (a lifecycle edge, a roster flap), which is exactly what a
+	 * time-aware cohort below fixes: it holds (fingerprint, when, how many) per alert stream and
+	 * answers both "same key, inside the cooldown" (silent) and "same key, past it" (announce with
+	 * the age, raised by this gate's caller). The stream is keyed by the ALERT SHAPE, so the strand
+	 * and any future condition on the same controller share one cooldown family without inheriting
+	 * each other's silence: a different fingerprint always announces.
+	 *
+	 * Deliberately NOT cleared by `enable()`/`disable()`: the reset is what let a condition report
+	 * itself again after every restart, and the operator reading a warm console after one must still
+	 * learn the pool is stuck.
 	 */
-	#unclaimableKey: string | undefined;
+	readonly #unclaimableAlerts = new Map<string, AlertState>();
+	/**
+	 * The stranded board's own per-condition latch: the key of the condition the durable entry was
+	 * posted for, so a repeat of it stays out of the board while a CHANGED condition posts again.
+	 * Cleared the moment the strand disappears, so its return after a break is a new entry — and
+	 * deliberately NOT cleared by `enable()`/`disable()`, which is the same lifecycle reset that let
+	 * the announcement latch re-report a condition after every restart.
+	 */
+	#strandedKey: string | undefined;
 	/**
 	 * The ceiling the standing under-budget notice was issued for (`undefined`: no notice standing), and
 	 * when the condition last went away. The notice is an EDGE, not a level: the floor it reports is
@@ -298,7 +323,6 @@ export class AutoController {
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
-		this.#unclaimableKey = undefined;
 		this.#underBudgetedCeiling = undefined;
 		this.#underBudgetClearedAt = 0;
 		this.#underBudgetedPresent = false;
@@ -578,6 +602,21 @@ export class AutoController {
 			// more workers cannot mint the missing capability — only a re-file or a different pool can.
 			// One notice per distinct condition, cleared as soon as somebody capable appears, so a later
 			// recurrence (or a different row set) reports again instead of inheriting the old silence.
+			//
+			// THE G2 GATE (goal-15 task-258's open half): that "one notice per distinct condition"
+			// used to be a single remembered key, which cannot tell "the same condition again inside
+			// the cooldown" from "the same condition again hours later" — the real event log carries
+			// `pool.unclaimable` events 2750/2786/3123 with byte-identical payloads across 82 minutes
+			// and 3193/3201 24 seconds apart. So the decision now goes through the driver's gate
+			// family: ONE key per condition, remembered together with WHEN it was last reported and
+			// HOW MANY times, in a memory the controller holds (so a lifecycle edge does not erase
+			// it) — silent inside {@link ALERT_COOLDOWN_MS}, and announced past it with its age.
+			//
+			// What the gate deliberately does NOT touch: the `pool.unclaimable` EVENT is the audit
+			// trail and still fires on EVERY tick this branch runs, inside and outside the cooldown —
+			// a suppression applies to the announcement, never to the record. The stranded BOARD entry
+			// keeps its own per-key latch (`#strandedKey`) so the durable half is also asked what it
+			// already holds, exactly the G2 "asked against the board" clause.
 			if (this.#phase === "running" && this.#deps.isDriverRunning()) {
 				const report =
 					counts.ready > 0
@@ -589,35 +628,62 @@ export class AutoController {
 							})
 						: undefined;
 				if (report === undefined) {
-					this.#unclaimableKey = undefined;
-				} else if (report.key !== this.#unclaimableKey) {
-					this.#unclaimableKey = report.key;
-					const rows = report.rows.map((row) => `${row.id} (${row.why})`).join(", ");
-					const notice =
-						report.online === 0
-							? `[swarm] ${report.rows.length} ready task(s) that no ONLINE agent can claim: ${rows}. Nothing is blocked, so nothing reports itself: start a pool (/swarm start) or re-file the work.`
-							: `[swarm] ready work nobody online can claim: ${rows}. This is not a stall, and growth cannot fix it (it only mints roles the plan asks for): re-file those task(s) with a capability the pool has, or add an agent that has it.`;
-					this.#deps.notify(notice, "warning");
-					this.#deps.notifyMain(notice);
-					this.#deps.onEvent?.("pool.unclaimable", {
-						rows: report.rows.map((row) => ({ id: row.id, missing: row.missing, why: row.why })),
-						missing: report.missing,
-						online: report.online,
-					});
-					// The durable half: the notice above goes to the transcript and the event to
-					// `events`, and neither answers "how long has this been stuck" once the turn is
-					// over. One board entry per distinct condition, with each row's age and the repair
-					// paths ranked — the strand that cost this pool two idle hours on task-221/222/223
-					// was visible in neither form.
-					postStrandedNotice(
-						report,
-						new Map(store.listTasks({ status: "ready", limit: 500 }).map((task) => [task.id, { createdAt: task.createdAt, title: task.title }])),
-						this.#deps.now(),
-						undefined,
-						(entry) => store.postBoard({ ...entry, agentId: "auto" }),
-						"auto",
-					);
+					// Nothing stranded right now. The gate memory is deliberately KEPT across this
+					// branch's ticks: clearing it here is what let offline→online→offline re-derive
+					// the same key and report it as a fresh sighting, which is the B1/B2 shape
+					// task-258 measured. It is released in `dispose()` only.
+					this.#strandedKey = undefined;
+					return;
 				}
+				// "This stream has never reported" is an entry with `lastKey === undefined`, NOT a
+				// default with a set `lastKey` — supplying the latter would swallow the first report.
+				const state = this.#unclaimableAlerts.get("stranded") ?? { lastKey: undefined, lastAt: 0, repeats: 0 };
+				const decision = alertGate(`stranded|${report.key}`, this.#deps.now(), state, ALERT_COOLDOWN_MS);
+				this.#unclaimableAlerts.set("stranded", decision.next);
+				this.#deps.onEvent?.("pool.unclaimable", {
+					rows: report.rows.map((row) => ({ id: row.id, missing: row.missing, why: row.why })),
+					missing: report.missing,
+					online: report.online,
+					announced: decision.announce,
+					reportedTimes: decision.repeats,
+				});
+				if (!decision.announce) {
+					// Held: traced, never silent, and the reason names how long ago the operator was
+					// already told (the gate's own reason line).
+					this.#deps.notify(`[swarm] starvation alert held (repeat #${decision.repeats}): ${decision.reason}`, "info");
+					return;
+				}
+				const ages = new Map(store.listTasks({ status: "ready", limit: 500 }).map((task) => [task.id, { createdAt: task.createdAt, title: task.title }]));
+				const oldestMinutes = Math.max(
+					0,
+					Math.floor((this.#deps.now() - Math.min(...[...ages.values()].map((a) => a.createdAt))) / 60_000),
+				);
+				const rows = report.rows.map((row) => `${row.id} (${row.why})`).join(", ");
+				const age = oldestMinutes >= 60 ? `${Math.floor(oldestMinutes / 60)} h ${oldestMinutes % 60} min` : `${oldestMinutes} min`;
+				const escal = decision.repeats > 1 ? `(reported ${decision.repeats}x; first sighting now ${age} ago) ` : "";
+				const notice =
+					report.online === 0
+						? `[swarm] ${escal}${report.rows.length} ready task(s) that no ONLINE agent can claim: ${rows}. Nothing is blocked, so nothing reports itself: start a pool (/swarm start) or re-file the work.`
+						: `[swarm] ${escal}ready work nobody online can claim: ${rows}. This is not a stall, and growth cannot fix it (it only mints roles the plan asks for): re-file those task(s) with a capability the pool has, or add an agent that has it.`;
+				this.#deps.notify(notice, "warning");
+				this.#deps.notifyMain(notice);
+				// The durable half: the notice above goes to the transcript and the event to
+				// `events`, and neither answers "how long has this been stuck" once the turn is
+				// over. One board entry per distinct condition, with each row's age and the repair
+				// paths ranked — the strand that cost this pool two idle hours on task-221/222/223
+				// was visible in neither form. `alreadyPostedKey` is the caller's memory of the last
+				// condition it told the board about, so the durable half is deduped against itself
+				// too rather than trusting the in-process latch alone — and it is written AFTER the
+				// call, otherwise it would always equal the current key and dedupe nothing.
+				const strandedPosted = postStrandedNotice(
+					report,
+					ages,
+					this.#deps.now(),
+					this.#strandedKey,
+					(entry) => store.postBoard({ ...entry, agentId: "auto" }),
+					"auto",
+				);
+				if (strandedPosted !== undefined) this.#strandedKey = report.key;
 			}
 
 			this.#deps.onChange();
@@ -719,7 +785,8 @@ export class AutoController {
 		this.#lastGrowthReady = 0;
 		this.#plannedWorkers = 0;
 		this.#lastResizeAt = 0;
-		this.#unclaimableKey = undefined;
+		this.#unclaimableAlerts.clear();
+		this.#strandedKey = undefined;
 		this.#underBudgetedCeiling = undefined;
 		this.#underBudgetClearedAt = 0;
 		this.#underBudgetedPresent = false;

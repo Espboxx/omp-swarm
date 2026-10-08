@@ -301,6 +301,13 @@ export interface CreateTaskInput {
 	files?: string[];
 	reviewRequired?: boolean;
 	/**
+	 * The caller's clock, stamped into `created_at`/`updated_at` exactly as `createGoal` already
+	 * takes one (see {@link createGoal}). Absent means `Date.now()`, so every existing caller keeps
+	 * its behaviour byte for byte; present means an age-sensitive test (or a takeover replay) can
+	 * mint a row that is genuinely old instead of reaching past the store into the schema.
+	 */
+	now?: number;
+	/**
 	 * goal-14's clause 1, at this mint site. The set of capabilities the roster can actually hand an
 	 * agent — `reachableCapabilities(config)` from `caps-repair.ts`, derived from `expandWorkers`.
 	 * When it is SUPPLIED, a required capability outside it makes the mint a REFUSAL (see
@@ -673,7 +680,7 @@ export class SwarmStore {
 			});
 			return refusal(reason);
 		}
-		const now = Date.now();
+		const now = input.now ?? Date.now();
 		const deps = [...new Set(input.dependencies ?? [])];
 		const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM tasks");
 		const id = `task-${next?.n ?? 1}`;

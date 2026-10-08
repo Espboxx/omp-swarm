@@ -1035,3 +1035,196 @@ describe("under-budget notice: an edge, not a level", () => {
 	});
 });
 
+/**
+ * goal-15's G2, at the starvation site: the gate task-258 measured as still open.
+ *
+ * WHAT WAS MEASURED. `pool.unclaimable` events 2750 (00:10:12), 2786 (00:26:05) and 3123 (01:32:01)
+ * carried BYTE-IDENTICAL payloads — rows task-221+task-222, missing ["reviewer"], online 4 — and
+ * events 3193/3201 the same payloads 24 SECONDS apart. The `#unclaimableKey` latch that was shipped
+ * for this remembers ONE key, so it can tell "a different condition" from "the same one" but NOT
+ * "the same one inside a cooldown" from "the same one hours later" — which is exactly the pair the
+ * operator needs separated. task-258 named that as B1/B2 and left it open.
+ *
+ * WHAT THESE TESTS PIN, each against the REAL controller (no re-implementation of the branch):
+ *
+ *   1. THE SAME CONDITION ON THE NEXT TICK IS SILENT, and the silence is per (key, time), not per
+ *      key — the pre-gate latch already got the first half right.
+ *   2. THE REPEAT INSIDE THE COOLDOWN IS STILL SILENT — this is the B1/B2 case the latch missed:
+ *      the identical row set re-derived after a lifecycle edge (`enable()`) is NOT a new sighting.
+ *   3. THE `pool.unclaimable` EVENT STILL FIRES on a held tick. The contract is explicit: a
+ *      suppression applies to the ANNOUNCEMENT, never to the audit trail.
+ *   4. OUTSIDE THE COOLDOWN THE REPEAT ANNOUNCES AND CARRIES ITS AGE — "reported 2x; first sighting
+ *      now 2 h 17 min ago" — not as a fresh sighting. The age is what an operator sorts by.
+ *   5. THE BOARD IS ASKED TOO: the stranded entry is deduped by the caller's own last-posted key,
+ *      so the durable half does not re-post one class per restart.
+ *   6. A CHANGED CONDITION ANNOUNCES IMMEDIATELY: a new stranded row is news, and it does not
+ *      inherit the other condition's silence.
+ */
+describe("G2: the starvation alert is a (key, time) decision, not a remembered key", () => {
+	const COOLDOWN = 10 * 60_000;
+
+	/**
+	 * A running pool whose only claimable work is already held, so a `reviewer` row is unroutable.
+	 *
+	 * The aged row needs no invented API and no reaching past the store into the schema:
+	 * `createTask` takes the caller's clock (`CreateTaskInput.now`, the seam `createGoal`
+	 * already had), so this row is genuinely 137 minutes old — the same age this pool's real
+	 * task-221 strand carried, which is the number the escalation must print.
+	 */
+	async function strandedPool(h: Harness): Promise<{ reviewer: string }> {
+		h.controller.enable();
+		h.controller.noteTask("do the thing");
+		h.store.createTask({ title: "claimable", createdBy: "main" });
+		await settle(h);
+		h.setDriverRunning(true);
+		h.setWorkers(1);
+		h.store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"] });
+		h.store.claim("task-1", "SwiftTiger", 300, ["general"]);
+		h.store.createTask({
+			title: "audit the thing",
+			createdBy: "main",
+			requiredCapabilities: ["reviewer"],
+			now: h.now() - 137 * 60_000,
+		});
+		return { reviewer: "task-2" };
+	}
+
+	const strandNotices = (h: Harness) => h.calls.notify.filter((line) => line.includes("can claim"));
+	const strandEvents = (h: Harness) => h.calls.events.filter((event) => event.type === "pool.unclaimable");
+	const strandedBoardEntries = (h: Harness) => h.store.searchBoard({ type: "OBSERVATION", tags: ["stranded"], limit: 500 });
+
+	/**
+	 * Re-arm the controller the way a lifecycle edge does, keeping the ORIGINAL strand.
+	 * `enable()` puts the controller in `idle` and re-reads the task ids, so nothing is "new" and
+	 * the pool never re-assembles — the harness has to hand it a genuinely new row (also stranded,
+	 * so the condition is unchanged in kind) for the controller to come back to `running`. The
+	 * driver flag is dropped first because `noteTask` is a no-op while the driver is reported up.
+	 * Getting that order wrong makes the test measure the `idle` guard instead of the gate.
+	 */
+	async function reedge(h: Harness): Promise<void> {
+		h.setDriverRunning(false);
+		h.controller.enable();
+		h.controller.noteTask("continue after the restart");
+		// A second stranded row created NOW: it makes the pool re-assemble, and the extra row keeps
+		// the condition's kind identical (still a `reviewer` strand) while the KEY changes, which is
+		// exactly the "changed row set reports again" half.
+		h.store.createTask({ title: "second strand", createdBy: "main", requiredCapabilities: ["reviewer"] });
+		await settle(h);
+		h.setDriverRunning(true);
+		h.setWorkers(1);
+		h.store.registerAgent({ id: "SwiftTiger", role: "general", capabilities: ["general"] });
+	}
+
+	test("the same condition on the next tick is silent, and the audit event still fires", async () => {
+		const h = harness();
+		await strandedPool(h);
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandEvents(h)).toHaveLength(1);
+
+		await h.controller.tick();
+		await h.controller.tick();
+		// The announcement is held (the operator was already told), the record is not.
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandEvents(h)).toHaveLength(3);
+		// …and the hold says why, rather than being silent about being silent.
+		expect(h.calls.notify.filter((line) => line.includes("starvation alert held")).length).toBe(2);
+	});
+
+	test("B1/B2: the identical condition re-derived after a lifecycle edge is NOT a new sighting", async () => {
+		const h = harness();
+		await strandedPool(h);
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+
+		// The measured shape: the roster flaps (an agent goes offline, comes back) and the same row set
+		// is re-derived from a fresh direction. `enable()` is the lifecycle edge that used to clear
+		// the latch, so this used to produce a SECOND identical notice 3 seconds after the first.
+		h.store.setAgentStatus("SwiftTiger", "idle");
+		await h.controller.tick();
+		h.store.setAgentStatus("SwiftTiger", "working");
+		h.controller.enable();
+		await h.controller.tick();
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+		// The event is the audit trail and keeps counting — that is the contract, not a defect.
+		expect(strandEvents(h).length).toBeGreaterThan(1);
+	});
+
+	test("the repeat outside the cooldown announces and carries its age", async () => {
+		const h = harness();
+		await strandedPool(h);
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandNotices(h)[0]).not.toContain("reported 2x"); // the first sighting is not a repeat
+
+		// Inside the cooldown: still one.
+		h.advance(COOLDOWN - 1_000);
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+
+		// Past the cooldown: the same condition is news again, and it says how old it is.
+		h.advance(1_001);
+		await h.controller.tick();
+		const notices = strandNotices(h);
+		expect(notices).toHaveLength(2);
+		expect(notices[1]).toContain("reported 2x");
+		// The age is real: the row was created 137 minutes before the pool assembled, and the clock
+		// has since moved by the cooldown, so the first sighting is 147 minutes old.
+		expect(notices[1]).toContain("first sighting now 2 h 27 min ago");
+		// The row set and the remedy are still named — a repeat is an escalation, not a summary.
+		expect(notices[1]).toContain("task-2");
+		expect(notices[1]).toContain("re-file those task(s)");
+	});
+
+	test("the stranded board entry is deduped by condition, so a restart does not re-post it", async () => {
+		const h = harness();
+		await strandedPool(h);
+		await h.controller.tick();
+		expect(strandedBoardEntries(h)).toHaveLength(1);
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandEvents(h)).toHaveLength(1);
+
+		// THE LIFECYCLE EDGE, past the cooldown: the controller is re-armed and the pool re-assembles
+		// around a NEW row, which is the flap shape (the roster comes back from a fresh direction).
+		h.advance(COOLDOWN + 1_000);
+		await reedge(h);
+		// The precondition the edge must actually meet, asserted rather than assumed: the controller
+		// is back in `running` and the strand is still there. Without this the test would silently
+		// measure the `idle` guard and "pass" for the wrong reason.
+		expect(h.controller.phase).toBe("running");
+		const before = { notices: strandNotices(h).length, events: strandEvents(h).length, board: strandedBoardEntries(h).length };
+
+		await h.controller.tick();
+		// The audit trail keeps counting — the event fires whether or not the announcement does.
+		expect(strandEvents(h).length).toBeGreaterThan(before.events);
+		// The new row set is a DIFFERENT key, so it announces immediately (a repeat of a changed
+		// condition is not suppressed by the earlier one's silence).
+		expect(strandNotices(h).length).toBeGreaterThan(before.notices);
+		// …and the durable half posts for the new condition, carrying the unchanged repair advice.
+		expect(strandedBoardEntries(h).length).toBe(before.board + 1);
+		expect(strandedBoardEntries(h).at(-1)!.content).toContain("RE-FILE");
+	});
+
+	test("a healthy pool posts nothing, and the strand's silence survives a lifecycle edge", async () => {
+		const h = harness();
+		await strandedPool(h);
+		await h.controller.tick();
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandEvents(h)).toHaveLength(1);
+
+		// The strand is rescued: task-2 was never claimed by anybody (it was unroutable, which is why
+		// it was reported), so making the pool healthy means the reviewer capability is now reachable —
+		// a reviewer agent comes online and the row is claimable.
+		h.store.registerAgent({ id: "VividTiger", role: "reviewer", capabilities: ["reviewer", "general"] });
+		await h.controller.tick();
+		await h.controller.tick();
+		// Nothing new announced, nothing new recorded, and the board still holds the one entry it
+		// earned — a vanished strand must not keep re-reporting itself on every tick.
+		expect(strandNotices(h)).toHaveLength(1);
+		expect(strandEvents(h)).toHaveLength(1);
+		expect(strandedBoardEntries(h)).toHaveLength(1);
+	});
+});
+
+

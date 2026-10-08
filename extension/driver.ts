@@ -179,6 +179,142 @@ export function stalledWake(state: IdleWakeState, signature: string, now: number
 	return edgeWake(state, signature, now, idleTickSeconds, true);
 }
 
+/**
+ * The alert fingerprint: a cycle detector for the notices and routings the driver already owns.
+ *
+ * THE MEASURED DEFECT IT EXISTS FOR (goal-15 R1/R2). The driver emits nine distinct alert shapes and
+ * NONE of them carries any memory of having been sent. Every other latch in this pool lives in a
+ * caller's field (`auto.ts`'s `#unclaimableKey`, `stranded.ts`'s `alreadyPostedKey`, the driver's own
+ * `#drained`), and every one of those fields is reset by a lifecycle edge — `enable()`, `disable()`,
+ * `dispose()`, a process restart — which regenerates the very same alert from a fresh direction and
+ * posts it again. That is not a theory: the real event log holds `pool.unclaimable` events 2750/2786
+ * /3123 with BYTE-IDENTICAL payloads (`rows: task-221+task-222, missing: reviewer, online: 4`) three
+ * times across 82 minutes, and events 3193/3201 with identical payloads 24 seconds apart. The
+ * operator's "N ready task(s) that no ONLINE agent can claim" batch is the same failure in a louder
+ * voice. Fixing the caller's latch alone cannot fix this class: the memory has to be a function of
+ * (fingerprint, time) that the caller holds, not a boolean that any restart clears.
+ *
+ * WHAT IS EXPORTED. A pure decision function and the identity that feeds it. The identity is WHAT the
+ * alert says (its fingerprint), never who said it or when: two notices that name the same condition
+ * dedupe together, which is the whole point — a repeat of a condition must be recognisable from the
+ * condition, not from the wording. The clock and the window are injected, so the rule is testable
+ * without a pool and without real time.
+ *
+ * WHAT IT DELIBERATELY IS NOT. It is not a permanent suppression: the same fingerprint CAN report
+ * again once the window passes, tagged with how old the condition is (the `repeats` counter), so an
+ * operator who comes back four hours later learns the strand is four hours old rather than being
+ * met by silence. It is also not a gate on the underlying action — the driver still acts every tick;
+ * only the ANNOUNCEMENT is deduplicated.
+ */
+
+/**
+ * How long the same fingerprint stays silent after its last report. Long enough that an offline →
+ * online → offline flapping pool (real: 4 restarts inside 82 minutes) cannot re-report one condition
+ * per cycle, short enough that a condition that survives a restart still re-announces itself with its
+ * age once the operator is plausibly back and reading.
+ */
+export const ALERT_COOLDOWN_MS = 10 * 60_000;
+
+/** What a caller remembers about one alert stream, and the facts the gate needs from it. */
+export interface AlertState {
+	/** The fingerprint the caller last reported, or `undefined` before the first alert. */
+	lastKey: string | undefined;
+	/** When that fingerprint was last reported (ms). `0` means "never". */
+	lastAt: number;
+	/** How many times this exact fingerprint has been reported inside the caller's memory. */
+	repeats: number;
+}
+
+export interface AlertDecision {
+	/** Whether the caller should announce this alert now. */
+	announce: boolean;
+	/** Why the gate answered the way it did — one line, phrased so it can be logged verbatim. */
+	reason: string;
+	/**
+	 * How many times this fingerprint has now been reported, including the one this call announces.
+	 * The caller's receipt, so it can put the age on the notice: "stranded 3 h 47 min" is a different
+	 * sentence from "stranded under a minute", and the operator must be able to tell them apart
+	 * without opening the event log.
+	 */
+	repeats: number;
+	/** The window that was applied, so a test can assert on the exact policy it measured. */
+	cooldownMs: number;
+	/**
+	 * The memory to store: the caller writes this back into its {@link AlertState} slot. Returning it
+	 * rather than mutating the input is what keeps {@link alertGate} pure, and the caller's single
+	 * write is the only thing that makes the stream's memory survive a lifecycle edge.
+	 */
+	next: AlertState;
+}
+
+/**
+ * The gate. The caller passes what it is about to announce and the memory it holds about it; the
+ * answer is whether the announcement still fits the cooldown window, and the caller stores the
+ * returned state.
+ *
+ * Three rules, in the order they decide:
+ *
+ * 1. A NEW fingerprint always announces. The memory two shapes share (`lastKey`) exists to make a
+ *    repeat recognisable, so a different condition is never suppressed by an earlier one — the
+ *    `stranded.ts`/`#unclaimableKey` latches carry this property and it is preserved here.
+ * 2. The same fingerprint inside {@link ALERT_COOLDOWN_MS} of its last report is SILENT. This is the
+ *    rule the operator's repeated batches are missing, and it is the only one with a number in it.
+ * 3. The same fingerprint outside the window re-announces with its age. Silence is the wrong answer
+ *    to a four-hour-old strand: an operator reading a warm console after a restart must still learn
+ *    the pool is stuck, and the one thing they need is how long it has been stuck.
+ *
+ * The state is held per alert stream (one {@link AlertState} per shape; a caller with several shapes
+ * keeps a map). Nothing here owns a session, a clock, or a database, so a caller holding the state in
+ * memory gets exactly the behaviour the field-based latch was supposed to give — without a lifecycle
+ * reset deleting it.
+ */
+export function alertGate(fingerprint: string, now: number, state: AlertState, cooldownMs: number = ALERT_COOLDOWN_MS): AlertDecision {
+	if (state.lastKey === undefined || state.lastKey !== fingerprint) {
+		return {
+			announce: true,
+			reason: state.lastKey === undefined ? "first report of this condition" : `different condition (was ${state.lastKey})`,
+			repeats: 1,
+			cooldownMs,
+			next: { lastKey: fingerprint, lastAt: now, repeats: 1 },
+		};
+	}
+	const silentFor = now - state.lastAt;
+	if (silentFor < cooldownMs) {
+		return {
+			announce: false,
+			reason: `already reported ${Math.max(0, Math.round(silentFor / 1000))}s ago; cooldown is ${Math.round(cooldownMs / 1000)}s`,
+			repeats: state.repeats,
+			cooldownMs,
+			next: state,
+		};
+	}
+	const repeats = state.repeats + 1;
+	return {
+		announce: true,
+		reason: `re-reported after ${Math.round(silentFor / 1000)}s of silence (repeat #${repeats} of this condition)`,
+		repeats,
+		cooldownMs,
+		next: { lastKey: fingerprint, lastAt: now, repeats },
+	};
+}
+
+/**
+ * The identity of an alert stream: a stable fingerprint over WHAT it says.
+ *
+ * Built from the caller's own key (already the fix's identity — the row set, the missing capability,
+ * the goal id) plus the facts that distinguish two alerts of the same shape from the same worker.
+ * Deliberately NOT a hash of a rendered text and NOT a clock: the text carries the ids, the ages and
+ * the timestamps, so hashing it would make every re-render a new fingerprint and dedupe nothing (the
+ * same trap `board.ts`'s `boardClassKey` names). The caller's key is the semantic part; anything the
+ * caller adds must be semantic too, or the gate would be measuring a re-render instead of a repeat.
+ *
+ * The delimiter is escaped in every part, so a message that happens to contain `|` cannot forge a
+ * part boundary: `alertFingerprint(["a", "b"])` and `alertFingerprint(["a|b"])` are different keys.
+ */
+export function alertFingerprint(parts: ReadonlyArray<string | number | boolean | undefined>): string {
+	return parts.map((part) => (part === undefined ? "-" : String(part).replaceAll("|", "\\|"))).join("|");
+}
+
 const TICK_INTERVAL_MS = 3000;
 const PANEL_INTERVAL_MS = 2000;
 /**
@@ -379,6 +515,16 @@ export class SwarmDriver {
 	#countsKey = "";
 	/** Driver start, for the summary's elapsed time. */
 	#startedAt = 0;
+	/**
+	 * Alert memory, one entry per alert stream. Keyed by the stream's name (not per instance), so a
+	 * worker whose turn failed twice and a second worker whose turn failed once share ONE stream and
+	 * are deduplicated together — the stream is the shape of the alert, and the fingerprint inside it
+	 * is the identity of this particular condition. `{@link alertGate}` owns the policy; this map is
+	 * the only place the memory lives, and it is deliberately NOT cleared on a lifecycle edge
+	 * (`startStop`/`stop`): the field-based latches this replaces were, and that reset is exactly
+	 * what let a condition re-report itself every time the pool restarted.
+	 */
+	readonly #alerts = new Map<string, AlertState>();
 	/** Branch per git cwd, re-read at most every `BRANCH_TTL_MS`; the spawn is the expensive part. */
 	readonly #branches = new Map<string, { at: number; value: string | undefined }>();
 	/**
@@ -469,11 +615,18 @@ export class SwarmDriver {
 				this.#started.push(spec.name);
 				void this.#prompt(this.#workers.get(spec.name) as WorkerRuntime, workerBootstrap(spec, this.#deps.config));
 			} catch (error) {
-				this.#deps.notify(
-					`worker ${spec.name} failed to start: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
+				const message = error instanceof Error ? error.message : String(error);
+				this.#alert(
+					"spawn-failed",
+					[spec.name, message],
+					(repeats) =>
+						this.#deps.notify(
+							`worker ${spec.name} failed to start (${repeats === 1 ? "first" : `repeat #${repeats}`}): ${message}`,
+							"error",
+						),
+					(_repeats, reason) => this.#trace(`spawn ${spec.name}: alert held - ${reason}`),
 				);
-				this.#trace(`spawn ${spec.name}: failed ${error instanceof Error ? error.message : String(error)}`);
+				this.#trace(`spawn ${spec.name}: failed ${message}`);
 			}
 		}
 		this.#trace(`spawn: finished, started=${this.#started.join(",") || "(none)"}`);
@@ -525,7 +678,17 @@ export class SwarmDriver {
 			try {
 				await worker.session.dispose();
 			} catch (error) {
-				this.#deps.notify(`dispose of ${name} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				const message = error instanceof Error ? error.message : String(error);
+				this.#alert(
+					"dispose-failed",
+					[name, message],
+					(repeats) =>
+						this.#deps.notify(
+							`dispose of ${name} failed (${repeats === 1 ? "first" : `repeat #${repeats}`}): ${message}`,
+							"warning",
+						),
+					(_repeats, reason) => this.#trace(`dispose ${name}: alert held - ${reason}`),
+				);
 			} finally {
 				this.#selfTearing.delete(name);
 			}
@@ -562,9 +725,19 @@ export class SwarmDriver {
 			if (event.type === "status_changed" && event.ref.status !== "aborted") return;
 			this.#workers.delete(name);
 			this.#deps.store.setAgentStatus(name, "offline");
-			this.#deps.notify(
-				`worker ${name} was released from the Agent Hub; its claim survives until the lease expires`,
-				"warning",
+			// Deduplicated: a hub release fires on BOTH a status change and a removal for the same ref
+			// in some hosts, and the two lines are byte-identical (the text carries no distinguishing
+			// fact), so the second one would read to the operator as a second release.
+			this.#alert(
+				"hub-release",
+				[name],
+				(repeats) =>
+					this.#deps.notify(
+						`worker ${name} was released from the Agent Hub; its claim survives until the lease expires` +
+							(repeats > 1 ? ` (alerted ${repeats}x)` : ""),
+						"warning",
+					),
+				(_repeats, reason) => this.#trace(`host release ${name}: alert held - ${reason}`),
 			);
 			this.#trace(`host release ${name}: session disposed outside the driver`);
 			this.#deps.onPanel();
@@ -668,10 +841,24 @@ export class SwarmDriver {
 	}
 
 	async #prepareWorktree(spec: WorkerSpec): Promise<string> {
-		const { root, exec, notify, store } = this.#deps;
+		const { root, exec, store } = this.#deps;
 		const inside = await exec("git", ["rev-parse", "--is-inside-work-tree"], root).catch(() => undefined);
 		if (!inside || inside.code !== 0 || inside.stdout.trim() !== "true") {
-			notify(`worker ${spec.name}: not a git repository, using the shared checkout with file reservations`, "warning");
+			// Both fallbacks below are PER-WORKER-PER-SPAWN facts that never change for the same
+			// worker, so the stream is the shape and the fingerprint is the worker: a pool that grows
+			// by six workers used to say the same sentence six times, and a growth step used to be
+			// the reason to start a fresh pool and say it all again.
+			this.#alert(
+				"worktree-fallback",
+				[spec.name, "not-a-git-repository"],
+				(repeats) =>
+					this.#deps.notify(
+						`worker ${spec.name}: not a git repository, using the shared checkout with file reservations` +
+							(repeats > 1 ? ` (alerted ${repeats}x)` : ""),
+						"warning",
+					),
+				(_repeats, reason) => this.#trace(`worktree ${spec.name}: alert held - ${reason}`),
+			);
 			return root;
 		}
 		const path = join(store.paths.worktreesDir, spec.name);
@@ -682,7 +869,18 @@ export class SwarmDriver {
 			stderr: String(error),
 		}));
 		if (added.code !== 0) {
-			notify(`worker ${spec.name}: worktree creation failed (${added.stderr.trim() || "unknown"}), using the shared checkout`, "warning");
+			const stderr = added.stderr.trim() || "unknown";
+			this.#alert(
+				"worktree-fallback",
+				[spec.name, stderr],
+				(repeats) =>
+					this.#deps.notify(
+						`worker ${spec.name}: worktree creation failed (${stderr}), using the shared checkout` +
+							(repeats > 1 ? ` (alerted ${repeats}x)` : ""),
+						"warning",
+					),
+				(_repeats, reason) => this.#trace(`worktree ${spec.name}: alert held - ${reason}`),
+			);
 			return root;
 		}
 		return path;
@@ -727,9 +925,22 @@ export class SwarmDriver {
 			closed: (goal, reason) => {
 				// The same shape auto.ts uses for the bound's closures: the FAIL is on the board, and the
 				// operator is told why the round died BEFORE its bound - never silent.
+				// DEDUPLICATED like every other alert this driver sends: the notice carries the goal's
+				// own id and the store already refuses to close an open round twice, so the coincidence
+				// this guards against is a REASON string that moves (a different attempt counter, a
+				// different silent-window length) producing a different text for the same dead round —
+				// which would look to the operator like a second failure they have to act on. The
+				// fingerprint is deliberately the goal id, not the rendered sentence.
 				const notice = `[swarm] the planning round for ${goal.id} was closed without a plan: ${reason}. Post a new goal, or create the tasks directly with swarm_task_create.`;
-				this.#deps.notify(notice, "warning");
-				this.#deps.deliverToMain?.(notice, true);
+				this.#alert(
+					"round-closed",
+					[goal.id],
+					() => {
+						this.#deps.notify(notice, "warning");
+						this.#deps.deliverToMain?.(notice, true);
+					},
+					(_repeats, held) => this.#trace(`round ${goal.id}: closure notice held - ${held}`),
+				);
 			},
 		});
 		for (const worker of this.#workers.values()) {
@@ -878,7 +1089,16 @@ export class SwarmDriver {
 		} catch (error) {
 			worker.lastError = error instanceof Error ? error.message : String(error);
 			this.#trace(`prompt ${worker.spec.name}: failed ${worker.lastError}`);
-			this.#deps.notify(`worker ${worker.spec.name} turn failed: ${worker.lastError}`, "warning");
+			this.#alert(
+				"turn-failed",
+				[worker.spec.name, worker.lastError],
+				(repeats) =>
+					this.#deps.notify(
+						`worker ${worker.spec.name} turn failed (${repeats === 1 ? "first" : `repeat #${repeats}`}): ${worker.lastError}`,
+						"warning",
+					),
+				(_repeats, reason) => this.#trace(`prompt ${worker.spec.name}: alert held - ${reason}`),
+			);
 		}
 	}
 
@@ -898,7 +1118,17 @@ export class SwarmDriver {
 					await worker.session.prompt(text);
 				}
 			} catch (error) {
-				this.#deps.notify(`wake of ${to} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				const message = error instanceof Error ? error.message : String(error);
+				this.#alert(
+					"wake-failed",
+					[to, message],
+					(repeats) =>
+						this.#deps.notify(
+							`wake of ${to} failed (${repeats === 1 ? "first" : `repeat #${repeats}`}): ${message}`,
+							"warning",
+						),
+					(_repeats, reason) => this.#trace(`wake ${to}: alert held - ${reason}`),
+				);
 			}
 		})();
 	}
@@ -959,6 +1189,31 @@ export class SwarmDriver {
 			this.#trace(`usage ${worker.spec.name}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		return worker.usage;
+	}
+
+	/**
+	 * Announce an alert once per fingerprint per {@link ALERT_COOLDOWN_MS}, and say why it was held.
+	 *
+	 * The driver emits nine alert shapes and none of them had any memory of its own, so a condition
+	 * the operator had already been told about was told again on the next tick, the next restart, and
+	 * the next flapping episode — the `pool.unclaimable` events 2750/2786/3123 carry byte-identical
+	 * payloads 82 minutes apart, and events 3193/3201 the same payloads 24 seconds apart. This is the
+	 * single seam all of them now pass through.
+	 *
+	 * `emit` and `repeat` are separate because the two channels have different identities: `emit`
+	 * renders the notice (its text carries the ids and the ages, so it must be rebuilt every time),
+	 * while `repeat` is what the cooldown holds back and carrying the age makes the escalation legible
+	 * — the operator must be able to tell "under a minute" from "three hours" without opening the log.
+	 * A suppression is traced, never silent, and the notice is never dropped for good.
+	 */
+	#alert(stream: string, fingerprintParts: ReadonlyArray<string | number | boolean | undefined>, emit: (repeats: number) => void, repeat: (repeats: number, reason: string) => void, now = this.#deps.now?.() ?? Date.now()): boolean {
+		const fingerprint = alertFingerprint([stream, ...fingerprintParts]);
+		const state = this.#alerts.get(stream) ?? { lastKey: undefined, lastAt: 0, repeats: 0 };
+		const decision = alertGate(fingerprint, now, state);
+		this.#alerts.set(stream, decision.next);
+		if (decision.announce) emit(decision.repeats);
+		else repeat(decision.repeats, decision.reason);
+		return decision.announce;
 	}
 
 	/** The branch of `worktree`, or of the extension's own checkout when that is not a repository. */
@@ -1075,7 +1330,17 @@ export class SwarmDriver {
 			try {
 				await worker.session.dispose();
 			} catch (error) {
-				this.#deps.notify(`dispose of ${worker.spec.name} failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+				const message = error instanceof Error ? error.message : String(error);
+				this.#alert(
+					"dispose-failed",
+					[worker.spec.name, message],
+					(repeats) =>
+						this.#deps.notify(
+							`dispose of ${worker.spec.name} failed (${repeats === 1 ? "first" : `repeat #${repeats}`}): ${message}`,
+							"warning",
+						),
+					(_repeats, reason) => this.#trace(`dispose ${worker.spec.name}: alert held - ${reason}`),
+				);
 			} finally {
 				this.#selfTearing.delete(worker.spec.name);
 			}
