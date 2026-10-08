@@ -317,14 +317,24 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 				store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
 			// Failing your OWN row is not a cluster-level decision; closing someone else's is, and the ticket
 			// must name the row it closes — one pass used to be able to close several other agents' rows.
+			//
+			// `succeeded` is what keeps the ticket honest: `fail()` reports its refusals as a VALUE
+			// (`{ ok: false, reason }`), so without it a passed close-task round spent itself on a close
+			// that never happened — vote-15 and vote-17 both passed 5/6 and neither moved task-286. With
+			// it, a refused close returns the round's own reason and the ticket stays unspent for the
+			// next attempt, so the operator can see "passed but did not execute" instead of "executed".
 			const gated =
 				target !== undefined && target.claimedBy !== identity.id
-					? voteGate("close-task", params.vote_id, { task_id: params.task_id }, close)
-					: { ok: true as const, value: close() };
+					? voteGate("close-task", params.vote_id, { task_id: params.task_id }, close, (closed) => closed.ok)
+					: { ok: true as const, value: close(), consumed: true };
 			if (!gated.ok) return err(gated.reason, { failed: false, gated: true });
 			const result = gated.value;
 			onChange?.();
-			if (!result.ok) return ok(`fail rejected: ${result.reason}`);
+			if (!result.ok) {
+				// A refused close returns the ticket: the round authorised a CLOSE, not an attempt, so a
+				// refusal that took no effect leaves it unspent for the next vote instead of burning it.
+				return ok(`fail rejected: ${result.reason}${gated.consumed ? "" : `; ${params.vote_id} was not consumed, so the pool may act on it again`}`, { failed: false, gated: true });
+			}
 			releaseTaskReservations(params.task_id);
 			return ok(`${params.task_id} -> failed; FAIL posted to the board`, { failed: true });
 		},
@@ -919,8 +929,11 @@ function duplicateWarning(verdict: BoardDuplicateVerdict): string {
 		voteId: string | undefined,
 		payload: Record<string, unknown>,
 		action: () => T,
-	): { ok: true; value: T } | { ok: false; reason: string } {
-		if (!config.voteEnabled || (identity.isMain && voteId === undefined)) return { ok: true, value: action() };
+		succeeded?: (value: T) => boolean,
+	):
+		| { ok: true; value: T; consumed: boolean }
+		| { ok: false; reason: string } {
+		if (!config.voteEnabled || (identity.isMain && voteId === undefined)) return { ok: true, value: action(), consumed: true };
 		if (voteId === undefined) {
 			return {
 				ok: false,
@@ -942,6 +955,7 @@ function duplicateWarning(verdict: BoardDuplicateVerdict): string {
 			consumedBy: identity.id,
 			offlineAfterSeconds: config.offlineAfterSeconds,
 			action: () => action(),
+			succeeded,
 		});
 	}
 

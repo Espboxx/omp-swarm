@@ -2091,7 +2091,17 @@ export class SwarmStore {
 	 * window between the check and the action for a second consumer to slip through.
 	 *
 	 * An action that THROWS rolls the transaction back, ticket included: a failed action must not burn
-	 * the consent it could not use.
+	 * the consent it could not use. The same is true of an action that FAILS WITHOUT THROWING, which is
+	 * the shape goal-18's close-task path actually produced: `fail()` reports a refusal as a
+	 * `{ ok: false, reason }` VALUE, so the transaction committed, the ticket was spent, and the row it
+	 * was supposed to close stayed exactly where it was — twice (vote-15 and vote-17 both passed 5/6
+	 * and neither moved task-286).
+	 *
+	 * `succeeded` is how a caller says what "the action worked" means for its own decision point. When
+	 * the action returns a failed result the consumption is ROLLED BACK, so the round is still unspent
+	 * for the next attempt — but the action's own value is returned as `{ ok: true, value }`, because
+	 * the caller still needs it to report the refusal in its own words (`swarm_fail` says
+	 * "fail rejected: …"). `consumed: false` tells that caller the ticket is still there.
 	 */
 	consumeVote<T>(input: {
 		kind: DecisionKind;
@@ -2100,8 +2110,10 @@ export class SwarmStore {
 		consumedBy: string;
 		offlineAfterSeconds: number;
 		action: (vote: SwarmVote) => T;
+		/** What "the action worked" means here, for an action that reports failure as a value. */
+		succeeded?: (value: T) => boolean;
 		now?: number;
-	}): { ok: true; vote: SwarmVote; value: T } | { ok: false; reason: string } {
+	}): { ok: true; vote: SwarmVote; value: T; consumed: boolean } | { ok: false; reason: string } {
 		const now = input.now ?? Date.now();
 		return this.#db.transaction(() => {
 			const refusal = this.#ticketRefusal(input.kind, input.voteId, input.payload, input.offlineAfterSeconds, now);
@@ -2118,12 +2130,22 @@ export class SwarmStore {
 			const vote = this.#voteRow(input.voteId);
 			if (vote === undefined) return { ok: false as const, reason: `unknown vote ${input.voteId}` };
 			const value = input.action(vote);
+			// The action ran and reported failure as a VALUE rather than throwing. A returned refusal
+			// does NOT undo work by itself: the transaction still commits, so the consumption written a
+			// moment ago would stand and the round would be spent on an action that did nothing — which
+			// is exactly what vote-15 and vote-17 did to task-286. The rollback is therefore EXPLICIT.
+			// The action's value is still returned, so the caller reports the refusal in its own words;
+			// `consumed: false` tells it the round is still unspent for the next attempt.
+			if (input.succeeded !== undefined && !input.succeeded(value)) {
+				this.#db.run("DELETE FROM vote_consumptions WHERE vote_id=?", input.voteId);
+				return { ok: true as const, vote, value, consumed: false };
+			}
 			this.#log("vote.consume", input.consumedBy, undefined, {
 				vote: input.voteId,
 				kind: input.kind,
 				payload: payloadSignature(input.payload),
 			});
-			return { ok: true as const, vote, value };
+			return { ok: true as const, vote, value, consumed: true };
 		});
 	}
 

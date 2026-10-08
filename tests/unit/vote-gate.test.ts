@@ -117,7 +117,7 @@ describe("a passed round is a one-shot ticket for the payload it froze", () => {
 		store.close();
 	});
 
-	test("a refused close still spends the ticket — the ATTEMPT is the action (recorded, not silent)", async () => {
+	test("a REFUSED close does not spend the ticket: the consent authorises a close, not an attempt", async () => {
 		const { store } = makeRoot();
 		roster(store, ["w1", "w2"]);
 		// A row another agent holds: the gate applies, and the close itself is refused by the store.
@@ -128,9 +128,15 @@ describe("a passed round is a one-shot ticket for the payload it froze", () => {
 
 		expect(await w1.call("swarm_fail", { task_id: held.id, reason: "not mine", vote_id: vote })).toContain("fail rejected");
 		expect(store.getTask(held.id)?.status).toBe("claimed");
-		// Deliberate: the ticket is a one-shot authorisation for an attempt, and a "give it back" path would
-		// let a caller un-spend consent it had already used. The refusal is reported, so the pool can re-vote.
-		expect(await w1.call("swarm_fail", { task_id: held.id, reason: "again", vote_id: vote })).toContain("already consumed");
+		// The refusal is the store's, not the pool's: `fail()` declined to close a row its holder
+		// still holds. This assertion used to require the opposite ("the ATTEMPT is the action"),
+		// which is what let vote-15 and vote-17 spend their tickets on closes that never happened
+		// and left task-286 exactly where it was. A round authorises the close it was passed for, so
+		// an action that reports failure does not burn the consent: the reason comes back, and the
+		// ticket stays unspent for the next attempt.
+		const retried = await w1.call("swarm_fail", { task_id: held.id, reason: "again", vote_id: vote });
+		expect(retried).toContain("not consumed");
+		expect(store.getTask(held.id)?.status).toBe("claimed");
 		store.close();
 	});
 
