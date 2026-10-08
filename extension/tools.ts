@@ -301,7 +301,24 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		},
 	};
 
-	const failSchema = z.object({ task_id: z.string(), reason: z.string(), vote_id: z.string().optional() });
+	const failSchema = z.object({
+		task_id: z.string(),
+		reason: z.string(),
+		vote_id: z.string().optional(),
+		/**
+		 * The ruling text a passed `close-task` round actually voted on, for the FOURTH exit of
+		 * `store.fail` (`#ruled`): closing a claimable row that an online agent COULD still take,
+		 * because the pool ruled it carries no work. Without this field the store's fourth exit was
+		 * unreachable from the tool — `failSchema` carried no `decision`, so the tool could only ever
+		 * pass an `UnroutableClose` — and a PASSED close-task round therefore could not move any
+		 * merely-`ready` row. Measured cost: vote-25 passed 5/6 to close task-299 and
+		 * `swarm_fail` still answered "task task-299 is ready (an online agent holds its full
+		 * capability set)"; vote-25's ticket is still unspent. It must equal the `decision` string in
+		 * the round's own payload, because that equality is what makes the ruling an authority rather
+		 * than free text (see the store-level pins in vote-gate.test.ts).
+		 */
+		decision: z.string().optional(),
+	});
 	const failTool: CustomTool<typeof failSchema> = {
 		name: "swarm_fail",
 		label: "Fail Task",
@@ -312,9 +329,23 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		async execute(_id, params) {
 			touch();
 			const target = store.getTask(params.task_id);
-			// The unroutable close needs the window the config owns; the store never reads policy itself.
-			const close = () =>
-				store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
+			// Which of the store's close exits this call can reach. The unroutable exit needs the window
+			// the config owns; the store never reads policy itself. The RULED exit needs the ruling text
+			// and the round that carries it, and it is the only exit that can close a claimable row —
+			// so a caller naming a `decision` gets exactly that, and one that does not gets the
+			// unroutable shape. Mixing them is impossible: the two option objects have disjoint keys.
+			const close = () => {
+				// A ruling is two halves: the TEXT and the ROUND that voted on it. A caller naming a
+				// `decision` without the `vote_id` that carries it has named half an authority, so the
+				// store's `#rulingMatches` would look up "" and refuse — correctly, but with a message
+				// about rulings rather than about the missing argument. Say the actionable thing instead.
+				if (params.decision !== undefined && params.vote_id === undefined) {
+					return { ok: false as const, reason: "a `decision` names a ruling, so it needs the `vote_id` of the close-task round that voted on it" };
+				}
+				return params.decision !== undefined
+					? store.fail(params.task_id, identity.id, params.reason, { decision: params.decision, voteId: params.vote_id ?? "" })
+					: store.fail(params.task_id, identity.id, params.reason, { offlineAfterMs: config.offlineAfterSeconds * 1000 });
+			};
 			// Failing your OWN row is not a cluster-level decision; closing someone else's is, and the ticket
 			// must name the row it closes — one pass used to be able to close several other agents' rows.
 			//
@@ -325,7 +356,13 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 			// next attempt, so the operator can see "passed but did not execute" instead of "executed".
 			const gated =
 				target !== undefined && target.claimedBy !== identity.id
-					? voteGate("close-task", params.vote_id, { task_id: params.task_id }, close, (closed) => closed.ok)
+					? voteGate(
+							"close-task",
+							params.vote_id,
+							params.decision !== undefined ? { task_id: params.task_id, decision: params.decision } : { task_id: params.task_id },
+							close,
+							(closed) => closed.ok,
+						)
 					: { ok: true as const, value: close(), consumed: true };
 			if (!gated.ok) return err(gated.reason, { failed: false, gated: true });
 			const result = gated.value;

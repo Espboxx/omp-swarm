@@ -429,6 +429,14 @@ export interface CapsRepairPolicy {
 export class SwarmStore {
 	readonly #db: Db;
 	readonly #paths: SwarmPaths;
+	/**
+	 * The round {@link SwarmStore.consumeVote} is currently acting under, or `undefined` outside one.
+	 * `consumeVote` spends its ticket BEFORE it runs the action, so the `ruled` close exit sees a
+	 * consumption row for the very round authorising it. This field is what lets `#rulingMatches` tell
+	 * that spend apart from an earlier, different one; see its own doc comment for why it is a field.
+	 * Set and cleared inside the transaction, so a throw can never leave it stale.
+	 */
+	#authorizingVoteId: string | undefined;
 
 	constructor(db: Db, paths: SwarmPaths) {
 		this.#db = db;
@@ -1242,12 +1250,24 @@ export class SwarmStore {
 	 * A ruling the pool never passed is refused, which is the fix for "the record exists but nothing
 	 * checks what it points at": `{ decision: "DECISION #1" }` closes nothing, no matter how plausible
 	 * it reads, because no round ever voted on it.
+	 *
+	 * WHY `#authorizing` EXISTS (and why it is a field, not a parameter). The `ruled` exit is normally
+	 * reached through `consumeVote`, which spends the ticket BEFORE it runs the action — so by the
+	 * time this check runs, the consumption row for THIS round is already there, written by the very
+	 * transaction that is authorising the close. The "already spent" guard cannot tell that row apart
+	 * from a spend made by an EARLIER, different close, so it refused both and the fourth exit was
+	 * unreachable from any tool: vote-25 passed 5/6 and closed nothing. `consumeVote` therefore records
+	 * the round it is currently acting under, and this check tolerates exactly that round — the one
+	 * whose consent this transaction holds — while still refusing every other spend. A caller reaching
+	 * `#ruled` directly (no enclosing `consumeVote`) gets the original strict behaviour, because the
+	 * field is only ever set inside `consumeVote`'s transaction.
 	 */
 	#rulingMatches(decision: string, voteId: string, taskId: string, now: number): boolean {
 		const vote = this.#db.get<VoteRow>("SELECT status, kind, payload FROM votes WHERE id=?", voteId);
 		if (vote === null) return false;
 		if (vote.kind !== "close-task" || vote.status !== "passed") return false;
-		if (this.#consumption(voteId) !== undefined) return false;
+		const spent = this.#consumption(voteId);
+		if (spent !== undefined && this.#authorizingVoteId !== voteId) return false;
 		let payload: { task_id?: unknown; decision?: unknown };
 		try {
 			payload = JSON.parse(vote.payload) as { task_id?: unknown; decision?: unknown };
@@ -2248,7 +2268,16 @@ export class SwarmStore {
 			}
 			const vote = this.#voteRow(input.voteId);
 			if (vote === undefined) return { ok: false as const, reason: `unknown vote ${input.voteId}` };
-			const value = input.action(vote);
+			// The action runs under this round's consent, and a ruled close inside it must be able to
+			// see that this spend is its own rather than an earlier one. Cleared in `finally` so a
+			// throwing action cannot leave the field set for the next caller.
+			this.#authorizingVoteId = input.voteId;
+			let value: T;
+			try {
+				value = input.action(vote);
+			} finally {
+				this.#authorizingVoteId = undefined;
+			}
 			// The action ran and reported failure as a VALUE rather than throwing. A returned refusal
 			// does NOT undo work by itself: the transaction still commits, so the consumption written a
 			// moment ago would stand and the round would be spent on an action that did nothing — which

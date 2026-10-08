@@ -355,3 +355,87 @@ describe("a ruling that closed a row must be one the pool actually passed", () =
 		store.close();
 	});
 });
+
+/**
+ * The TOOL side of the same ruling, which is the half that was missing. The store's fourth exit
+ * (`#ruled`) is the only one that can close a claimable row, and it was unreachable from any tool:
+ * `failSchema` carried no `decision`, so `swarm_fail` could only ever pass an `UnroutableClose`. The
+ * measured cost was a passed round that could not execute — vote-25 passed 5/6 to close task-299 and
+ * `swarm_fail` still answered "task task-299 is ready (an online agent holds its full capability
+ * set)", leaving the ticket unspent and the row claimable. These pins keep the tool's door open.
+ */
+describe("the tool can reach the ruled exit a passed close-task round authorizes", () => {
+	/** A CLAIMABLE row: every dependency satisfied, an online agent holds its capability. */
+	function claimableRow(store: SwarmStore, title: string): string {
+		return store.createTask({ title, createdBy: "boot", requiredCapabilities: ["general"] }).id;
+	}
+
+	test("a passed close-task round closes a merely-ready row through swarm_fail, once", async () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = claimableRow(store, "ruled residue");
+		const decision = "DECISION #2171: close the stale duplicate";
+		const vote = await pass(store, "close-task", { task_id: row, decision });
+		const w1 = toolkit(store, "w1");
+
+		// Before the fix this call was refused by the capability guard, which reads a `ready` row as
+		// "an online agent can still claim it" — true BY DEFINITION for a general-capable row.
+		expect(await w1.call("swarm_fail", { task_id: row, reason: "CLOSED BY DECISION", vote_id: vote, decision })).toContain("-> failed");
+		expect(store.getTask(row)?.status).toBe("failed");
+
+		// The round was spent on the close it authorised, exactly like every other kind.
+		expect(await w1.call("swarm_fail", { task_id: row, reason: "replay", vote_id: vote, decision })).toContain("already consumed");
+		store.close();
+	});
+
+	test("a ruling text that does not match the round's payload is refused and the ticket survives", async () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = claimableRow(store, "wrong ruling");
+		const vote = await pass(store, "close-task", { task_id: row, decision: "the text the pool voted on" });
+		const w1 = toolkit(store, "w1");
+
+		// Free text is not authority. The gate catches the swap FIRST — the payload it froze names a
+		// different `decision`, so consent does not bind — and the store is never reached. That
+		// ordering is the safe one: the ticket cannot be spent on a payload nobody voted on.
+		const swap = await w1.call("swarm_fail", { task_id: row, reason: "swap", vote_id: vote, decision: "DECISION #1" });
+		expect(swap).toContain("consent binds to the decision");
+		expect(store.getTask(row)?.status).toBe("ready");
+		// The row is undamaged and still claimable, and the round is unspent for the correct text.
+		expect(store.claim(row, "generalist", 300, ["general"]).ok).toBe(true);
+		store.close();
+	});
+
+	test("naming a decision without a vote_id never reaches the store: the gate fires first", async () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = claimableRow(store, "no round");
+		const w1 = toolkit(store, "w1");
+
+		// The row is unheld, so the tool asks for a round BEFORE the store ever sees the ruling. That
+		// ordering is what makes the fourth exit safe: free text cannot reach `#ruled` at all, because
+		// the cluster-level gate sits in front of it. The refusal names the payload it would need.
+		const refusal = await w1.call("swarm_fail", { task_id: row, reason: "free text", decision: "DECISION #1" });
+		expect(refusal).toContain("the pool must pass a vote first");
+		expect(refusal).toContain("DECISION #1");
+		expect(store.getTask(row)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a caller that names NO decision still needs a round, and gets the unroutable exit once it has one", async () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = claimableRow(store, "unroutable path");
+		const w1 = toolkit(store, "w1");
+
+		// The pre-existing behaviour is preserved exactly: no `decision` means the unroutable shape,
+		// which refuses a claimable row because an online agent holds its capability. The gate is
+		// still the first thing the caller meets, so the round is required either way.
+		expect(await w1.call("swarm_fail", { task_id: row, reason: "no ruling" })).toContain("the pool must pass a vote first");
+		const vote = await pass(store, "close-task", { task_id: row });
+		expect(await w1.call("swarm_fail", { task_id: row, reason: "no ruling", vote_id: vote })).toContain("fail rejected");
+		expect(await w1.call("swarm_fail", { task_id: row, reason: "no ruling", vote_id: vote })).toContain("fail rejected");
+		expect(store.getTask(row)?.status).toBe("ready");
+		store.close();
+	});
+});
