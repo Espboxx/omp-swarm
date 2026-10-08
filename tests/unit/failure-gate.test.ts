@@ -131,6 +131,47 @@ describe("classifyFailure reads the cause from the reason", () => {
 });
 
 describe("retryGate: the pure rule", () => {
+	/**
+	 * The `other`-family exemption, asserted at the GATE rather than only at the classifier, and
+	 * driven by the worst memory the gate can be handed. This is goal-18 U3's own acceptance
+	 * ("the task-125 exemption is made explicit and tested... asserted in
+	 * tests/unit/failure-gate.test.ts"): the classifier test above proves the text reads `other`,
+	 * and this one proves no amount of same-cause history can stop such a retry.
+	 *
+	 * The memory below is deliberately impossible-for-a-hold: `familyKey: "other"` so the cause
+	 * matches, `count: 99` (33x `RETRY_STOP_AFTER`), and `lastAt` equal to `now` so the sighting is
+	 * also inside the cooldown. A holdable family is refused by both of those; `other` must not be,
+	 * because the exemption is the FIRST return in `retryGate` and `count` is never compared.
+	 */
+	test("an `other`-family row is always retryable, under the worst memory the gate can be handed", () => {
+		const worst: RetryMemory = { familyKey: "other", lastAt: 1_000_000, count: 99 };
+		for (const attempt of [1, 2, 3, 10, 100]) {
+			const decision = decide("planning round for goal-1 hit its bound (600s) with no plan", attempt, 1_000_000, worst);
+			expect(decision.allow).toBe(true);
+			expect(decision.rule).toBe("pass");
+			expect(decision.family).toBe("other");
+			// No remedy: `other` is never held, so a caller must not be handed advice for an action
+			// it is not taking. An empty remedy is part of the contract, not an omission.
+			expect(decision.remedy).toBe("");
+		}
+	});
+
+	/**
+	 * The same exemption against a memory keyed on a HOLDABLE family, which is the case a reader
+	 * would otherwise confuse with the one above: a row whose text reads `other` but whose memory
+	 * carries a `duplicate` count must still be allowed, because the decision is made from the
+	 * row's own reason — not from history belonging to a different cause.
+	 */
+	test("an `other` reason is allowed even when the memory counts a different, holdable cause", () => {
+		const decision = decide("unsupported by the parser", 3, 1_000_000, { familyKey: "duplicate", lastAt: 1_000_000, count: 98 });
+		expect(decision.allow).toBe(true);
+		expect(decision.family).toBe("other");
+		// And the memory moves to THIS cause, so the next same-cause failure starts counting from 1
+		// rather than inheriting the duplicate family's history.
+		expect(decision.next.familyKey).toBe("other");
+		expect(decision.next.count).toBe(1);
+	});
+
 	test("the first same-cause failure is allowed — a stop must never fire on the first attempt", () => {
 		const decision = decide("DUPLICATE — same deliverable as canonical task-150", 1, 1_000, undefined);
 		expect(decision.allow).toBe(true);
