@@ -13,7 +13,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { openDatabase, swarmPaths, type SwarmPaths } from "../../extension/db";
 import { SwarmStore } from "../../extension/store";
-import { buildSwarmTools, type SwarmIdentity } from "../../extension/tools";
+import { buildSwarmTools, SWARM_TOOL_NAMES, type SwarmIdentity } from "../../extension/tools";
 import { DEFAULT_CONFIG, type SwarmConfig } from "../../extension/types";
 
 const CHILD = join(import.meta.dir, "helpers", "vote-race-child.ts");
@@ -437,5 +437,87 @@ describe("the tool can reach the ruled exit a passed close-task round authorizes
 		expect(await w1.call("swarm_fail", { task_id: row, reason: "no ruling", vote_id: vote })).toContain("fail rejected");
 		expect(store.getTask(row)?.status).toBe("ready");
 		store.close();
+	});
+});
+
+/**
+ * The dependency editor at the TOOL level. `task_deps` was insert-only with a single read, so a
+ * planner's bad edge was permanent: correcting one meant closing the dependent and minting a
+ * successor, which is what four instances tonight each paid for (DECISION #2045's 286 -> 287 -> 288,
+ * 308 -> 305, 309 -> 308, task-315's phantom path). The tool-level half matters because the store's
+ * guards are only as good as the path that reaches them — and the `ruled` exit of `store.fail` was
+ * itself unreachable from any tool until `a979eb6` taught `failSchema` a `decision` field. Same
+ * lesson, applied here on purpose rather than by correction.
+ */
+describe("swarm_task_dep_remove reaches the store's guard, not a shortcut around it", () => {
+	test("it removes an edge to a failed dependency and the row becomes claimable", async () => {
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "duplicate survey", createdBy: "boot" }).id;
+		const dependent = store.createTask({ title: "design row", createdBy: "boot", dependencies: [dependency] }).id;
+		// Fail the dependency through the holder exit: `store.fail` refuses an unheld row that is not
+		// closable residue, which is the same gate that makes this pool's status writes honest.
+		store.claim(dependency, "boot", 300, ["general"]);
+		store.fail(dependency, "boot", "CLOSED AS A DUPLICATE");
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+
+		const out = await toolkit(store, "w1").call("swarm_task_dep_remove", {
+			task_id: dependent,
+			depends_on: dependency,
+			reason: "duplicate of task-304, produced nothing",
+		});
+
+		expect(out).toContain("removed");
+		expect(out).toContain("ready");
+		expect(store.getTask(dependent)?.status).toBe("ready");
+		expect(store.recentEvents(40).some((event) => event.type === "task.dep.remove" && event.agentId === "w1")).toBe(true);
+		store.close();
+	});
+
+	test("it refuses an edge to still-pending work, with the store's reason and no shortcut", async () => {
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "real survey", createdBy: "boot" }).id;
+		const dependent = store.createTask({ title: "design row", createdBy: "boot", dependencies: [dependency] }).id;
+
+		const out = await toolkit(store, "w1").call("swarm_task_dep_remove", {
+			task_id: dependent,
+			depends_on: dependency,
+			reason: "I would like to start now",
+		});
+
+		expect(out).toContain("refused");
+		expect(out).toContain("before that work lands");
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+		expect(store.recentEvents(40).some((event) => event.type === "task.dep.remove")).toBe(false);
+		store.close();
+	});
+
+	test("it is not a vote-gated action, because it is a graph correction and not an ownership claim", async () => {
+		// The one design question that had to be answered rather than inherited: a row nobody holds
+		// is corrected the way goal-14's `swarm_repair_caps` corrects a label — through the rule in
+		// the store, not through a cluster-level round. This pins that the call works with no vote
+		// at all, which is the shape the store's own guards are designed to police.
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "failed dep", createdBy: "boot" }).id;
+		const dependent = store.createTask({ title: "row", createdBy: "boot", dependencies: [dependency] }).id;
+		store.claim(dependency, "boot", 300, ["general"]);
+		store.fail(dependency, "boot", "CLOSED AS A DUPLICATE");
+
+		const out = await toolkit(store, "w1").call("swarm_task_dep_remove", {
+			task_id: dependent,
+			depends_on: dependency,
+			reason: "duplicate of task-304, produced nothing",
+		});
+		expect(out).toContain("removed");
+		expect(out).not.toContain("vote");
+		store.close();
+	});
+
+	test("it is registered in SWARM_TOOL_NAMES, so the catalog cannot drift from the surface", () => {
+		// Imported statically at the top of the file: a dynamic import here would work but hides the
+		// dependency, and this assertion exists precisely to keep the catalog visible.
+		expect(SWARM_TOOL_NAMES).toContain("swarm_task_dep_remove");
+		// And it is not a duplicate name: the insert-only assumption was that this tool did not
+		// exist, and a second spell of it would reopen the gap the union of the two paths closed.
+		expect(SWARM_TOOL_NAMES.filter((name) => name.includes("dep_remove")).length).toBe(1);
 	});
 });

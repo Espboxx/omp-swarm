@@ -688,6 +688,42 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 	};
 
 	/**
+	 * Remove one dependency edge. `retryTask` revives a row, `swarm_fail` closes one, and neither
+	 * could ever correct a PLANNER'S EDGE: `task_deps` was insert-only (store.ts:782) with a single
+	 * read (:788), so a bad edge was permanent and the only route around it was to close the
+	 * dependent and mint a successor — which is what four instances of this cost tonight (DECISION
+	 * #2045's dead edge 286 -> 287 -> 288, 308 -> 305, 309 -> 308, and task-315's phantom path).
+	 *
+	 * This is deliberately NOT a cluster-level vote. It is a graph correction on a row no agent
+	 * holds, in the same class as goal-14's `swarm_repair_caps` (whose file:line comment says so
+	 * verbatim): the authority is the rule in `store.removeDependency`, not a round, because the
+	 * store refuses every removal that would unlock still-pending work and records each accepted
+	 * one append-only. A caller may untangle a bad edge; it may not hurry a good one.
+	 */
+	const depRemoveSchema = z.object({
+		task_id: z.string(),
+		depends_on: z.string(),
+		reason: z.string(),
+	});
+	const depRemoveTool: CustomTool<typeof depRemoveSchema> = {
+		name: "swarm_task_dep_remove",
+		label: "Remove Task Dependency",
+		description:
+			"Remove one dependency edge from an unheld `blocked` or `ready` task, so a planner's bad edge is correctable without closing the row and minting a successor. Every guard is a refusal: the task must be unheld (a `claimed` or `review` row belongs to its holder), the edge must exist, the dependency must be `failed`, missing, in a cycle, or already `done` — removing the edge to still-pending work would make the task claimable before that work lands, and the reason must be named. A blocked task whose last dead edge is removed becomes `ready` in the same call. Both sides are logged append-only (`task.dep.remove` and `task.ready`).",
+		parameters: depRemoveSchema,
+		approval: "write",
+		async execute(_id, params) {
+			touch();
+			const result = store.removeDependency(params.task_id, params.depends_on, identity.id, params.reason);
+			onChange?.();
+			if (!result.ok) return err(`dependency removal refused: ${result.reason}`, { removed: false });
+			const task = store.getTask(params.task_id);
+			const remaining = store.unresolvedDependencies(params.task_id);
+			return ok(`removed ${params.task_id} -> ${params.depends_on}; task is ${task?.status ?? "unknown"}${remaining.length > 0 ? `, still waiting on ${remaining.join(", ")}` : ""}`, { removed: true, task });
+		},
+	};
+
+	/**
 	 * goal-14's clause 3: repair a row nobody can claim, through a legitimate operation with an
 	 * audit trail. Without it the only path was a worker editing the database directly — DECISION
 	 * #1076 is the record of that attempt, and what it cost. The repair is deliberately NOT gated by
@@ -1115,6 +1151,7 @@ function duplicateWarning(verdict: BoardDuplicateVerdict): string {
 		voteTool,
 		scaleTool,
 		retryTool,
+		depRemoveTool,
 		repairCapsTool,
 		integrateTool,
 		postTool,
@@ -1145,6 +1182,7 @@ export const SWARM_TOOL_NAMES = [
 	"swarm_vote",
 	"swarm_scale",
 	"swarm_task_retry",
+	"swarm_task_dep_remove",
 	"swarm_repair_caps",
 	"swarm_integrate",
 	"board_post",

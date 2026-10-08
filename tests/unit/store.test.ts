@@ -1111,3 +1111,163 @@ describe("a mint whose capability no configured role can reach is refused, not c
 		store.close();
 	});
 });
+
+/**
+ * The dependency editor: `task_deps` was insert-only (store.ts:782) with a single read (:788), so a
+ * planner's bad edge was permanent. Four instances tonight each paid a close round plus a create
+ * round to route around one (DECISION #2045's 286 -> 287 -> 288, 308 -> 305, 309 -> 308, task-315's
+ * phantom path). These tests pin the one thing that matters more than the delete: an edge to
+ * still-pending work can NEVER be removed, so the editor cannot hurry a good edge.
+ */
+describe("a dependency edge can be corrected, but only a bad or finished one", () => {
+	/** A row blocked on a dependency that is already terminal (failed), so the edge is a dead one. */
+	function blockedOnDead(): { store: SwarmStore; dependent: string } {
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "duplicate survey", createdBy: "main" }).id;
+		const dependent = store.createTask({ title: "design row", createdBy: "main", dependencies: [dependency] }).id;
+		// The holder exit: `store.fail` refuses an unheld row that is not closable residue, which is
+		// the same guard that keeps this pool's status writes honest — so the dependency is claimed
+		// by its own holder first and failed by that holder.
+		store.claim(dependency, "main", 300, ["general"]);
+		store.fail(dependency, "main", "CLOSED AS A DUPLICATE — it produced no artifact");
+		return { store, dependent };
+	}
+
+	test("removing the edge to a failed dependency unblocks the row, and the row becomes claimable", () => {
+		const { store, dependent } = blockedOnDead();
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+		expect(store.deadDependencies(dependent).length).toBe(1);
+
+		const removed = store.removeDependency(dependent, store.deadDependencies(dependent)[0]!, "swift", "the dependency was a duplicate of task-304 that produced no artifact");
+
+		expect(removed.ok).toBe(true);
+		expect(removed.removed).toBe(true);
+		// The whole point: the row is now claimable rather than permanently blocked, which is the
+		// state tonight's four instances each needed a close round to reach.
+		expect(store.getTask(dependent)?.status).toBe("ready");
+		expect(store.deadDependencies(dependent)).toEqual([]);
+		expect(store.unresolvedDependencies(dependent)).toEqual([]);
+		store.close();
+	});
+
+	test("the removal and the promotion are both logged, append-only, with the actor and the reason", () => {
+		const { store, dependent } = blockedOnDead();
+		const dep = store.deadDependencies(dependent)[0]!;
+		store.removeDependency(dependent, dep, "swift", "the dependency was a duplicate of produced no artifact");
+
+		const events = store.recentEvents(80).filter((event) => event.taskId === dependent);
+		const removal = events.find((event) => event.type === "task.dep.remove");
+		expect(removal).toBeDefined();
+		expect(removal?.agentId).toBe("swift");
+		expect(removal?.data).toMatchObject({ dependsOn: dep });
+		expect(String(removal?.data.reason)).toContain("duplicate");
+		// The promotion is a separate event on the same path every other status writer uses, so an
+		// unrecorded status change is not possible (DECISION #2092 / FAIL #2103).
+		expect(events.some((event) => event.type === "task.ready" && event.data.after === "dep.remove")).toBe(true);
+		store.close();
+	});
+
+	test("an edge to still-pending work is refused, because removing it would unlock the work early", () => {
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "real survey", createdBy: "main" }).id;
+		const dependent = store.createTask({ title: "design row", createdBy: "main", dependencies: [dependency] }).id;
+
+		const removed = store.removeDependency(dependent, dependency, "swift", "I want to start now");
+
+		expect(removed.ok).toBe(false);
+		expect(removed.removed).toBe(false);
+		// The reason names the dependency's status AND the consequence, so a caller is not left
+		// guessing which guard refused it (goal-18's U4 lesson: one sentence for five guards is a
+		// sentence that cannot be audited).
+		expect(removed.reason).toContain(dependency);
+		expect(removed.reason).toContain("ready");
+		expect(removed.reason).toContain("before that work lands");
+		// And nothing moved: the edge is intact and the row is still honestly blocked.
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+		expect(store.unresolvedDependencies(dependent)).toEqual([dependency]);
+		store.close();
+	});
+
+	test("a claimed row's edges belong to its holder, so another caller may not remove them", () => {
+		const { store } = makeRoot();
+		// HOW THIS GUARD IS REACHED, measured rather than assumed. A row with a LIVE dependency is
+		// `blocked` and therefore unclaimable (`claim()` refuses it), and a row whose dependency is
+		// `failed` stays `blocked` forever — `fail()` does not promote its dependents and neither
+		// does `sweep()` (both measured). So the only way to reach the ownership guard is a row that
+		// carries an edge to an already-`done` dependency: satisfied, `ready`, and therefore
+		// claimable, and still carrying the edge somebody may want to correct.
+		const live = store.createTask({ title: "live dep", createdBy: "main" }).id;
+		const held = store.createTask({ title: "held row", createdBy: "main", dependencies: [live] }).id;
+		store.claim(live, "main", 300, ["general"]);
+		store.complete(live, "main", { summary: "delivered" });
+		expect(store.getTask(held)?.status).toBe("ready");
+		store.claim(held, "lunar", 300, ["general"]);
+		expect(store.getTask(held)?.claimedBy).toBe("lunar");
+
+		const removed = store.removeDependency(held, live, "swift", "this is not my row to edit");
+
+		// Ownership is checked before the dependency's state, so the answer names the HOLDER, not the
+		// edge: a caller who may not touch this row at all is not told which edges of it are legal.
+		expect(removed.ok).toBe(false);
+		expect(removed.reason).toContain("claimed by lunar");
+		expect(removed.reason).toContain("holder");
+		// And the edge is intact: a refused removal wrote nothing, so the audit trail shows no action.
+		expect(store.unresolvedDependencies(held)).toEqual([]);
+		expect(store.recentEvents(80).some((event) => event.type === "task.dep.remove")).toBe(false);
+		store.close();
+	});
+
+	test("a row blocked on a dead dependency is never promoted, which is the state this editor exists for", () => {
+		// The measured reason the four instances tonight each needed a round: a `failed` dependency
+		// is DEAD rather than pending, so `sweep()` leaves the dependent `blocked` forever and only a
+		// close-plus-re-file could ever get the work moving. This pins that shape so the next reader
+		// understands what the editor unblocks, and so nobody mistakes it for a sweep bug.
+		const { store, dependent } = blockedOnDead();
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+		expect(store.sweep().promoted).toEqual([]);
+		expect(store.getTask(dependent)?.status).toBe("blocked");
+		expect(store.claim(dependent, "swift", 300, ["general"]).ok).toBe(false);
+		store.close();
+	});
+
+	test("an edge nobody wrote is a no-op that is not logged as an action", () => {
+		const { store } = makeRoot();
+		const row = store.createTask({ title: "edgeless row", createdBy: "main" }).id;
+
+		const removed = store.removeDependency(row, "task-9999", "swift", "tidying up");
+
+		expect(removed.ok).toBe(false);
+		expect(removed.reason).toContain("no dependency on");
+		expect(store.recentEvents(80).some((event) => event.type === "task.dep.remove")).toBe(false);
+		store.close();
+	});
+
+	test("a removal must name its reason, so a graph mutation nobody can explain is impossible", () => {
+		const { store, dependent } = blockedOnDead();
+		const dep = store.deadDependencies(dependent)[0]!;
+
+		const removed = store.removeDependency(dependent, dep, "swift", "   ");
+
+		expect(removed.ok).toBe(false);
+		expect(removed.reason).toContain("must name its reason");
+		// The unreflected write did not happen either: the edge is still there.
+		expect(store.deadDependencies(dependent)).toEqual([dep]);
+		store.close();
+	});
+
+	test("the edge to a `done` dependency is also removable, which is the harmless half of the gate", () => {
+		const { store } = makeRoot();
+		const dependency = store.createTask({ title: "finished survey", createdBy: "main" }).id;
+		const dependent = store.createTask({ title: "design row", createdBy: "main", dependencies: [dependency] }).id;
+		// A done dependency never blocks anything, so removing it changes no reachability — the guard
+		// allows it anyway because the caller may know the edge was wrong for a different reason.
+		store.claim(dependency, "main", 300, ["general"]);
+		store.complete(dependency, "main", { summary: "survey delivered" });
+
+		const removed = store.removeDependency(dependent, dependency, "swift", "the edge named work this row never needed");
+
+		expect(removed.ok).toBe(true);
+		expect(store.unresolvedDependencies(dependent)).toEqual([]);
+		store.close();
+	});
+});

@@ -873,6 +873,71 @@ export class SwarmStore {
 	}
 
 	/**
+	 * Remove one `task_id -> depends_on` edge. The graph could always WRITE this edge
+	 * (`#createTaskLocked` inserts at :782) and could only ever read it back (:788), so a planner's
+	 * bad edge was permanent and every correction cost a close round plus a create round. Four
+	 * measured instances forced that this session: 286 -> 287 -> 288 (DECISION #2045, named as "the
+	 * dead edge ... an honest record of the planning round's bad edge"), 308 -> 305 (a duplicate that
+	 * produced no artifact), 309 -> 308 (the same shape one level down after 308 closed), and
+	 * task-315's `files` naming an artifact that does not exist.
+	 *
+	 * The gate is the point, not the delete. The danger is NOT "someone removes an edge" — it is
+	 * "someone removes an edge the dependent still needs, so the dependent becomes claimable before
+	 * the work it is waiting for has landed". Every guard below is a refusal, in the shape
+	 * `retryTask` uses: a caller may correct a BAD edge, not a pending one:
+	 *
+	 *   - the dependent must exist and must be unheld. A `claimed` or `review` row is somebody
+	 *     else's live work and `fail()`'s own `held` exit is the only thing that may close it;
+	 *   - the edge must exist. Removing an edge nobody wrote is a no-op that would otherwise be
+	 *     logged as if it were an action;
+	 *   - the dependency must be UNREACHABLE (`deadDependencies`, so `failed`, missing, or in a
+	 *     cycle) or already `done`. A still-running or still-ready dependency is work in progress:
+	 *     removing its edge is exactly the early-unlock this refuses;
+	 *   - the caller must name a reason. A graph mutation nobody can explain is the same class of
+	 *     unrecorded write DECISION #2092 / FAIL #2103 already cost this pool on a status field.
+	 *
+	 * The removal is logged append-only (`task.dep.remove`) with the actor, both ids and the reason,
+	 * so the audit chain survives even though the edge does not.
+	 */
+	removeDependency(taskId: string, dependsOn: string, agentId: string, reason: string): { ok: boolean; removed: boolean; reason?: string } {
+		if (reason.trim().length === 0) return { ok: false, removed: false, reason: "a dependency removal must name its reason" };
+		return this.#db.transaction(() => {
+			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
+			if (row === null) return { ok: false, removed: false, reason: `unknown task ${taskId}` } as const;
+			if (row.claimed_by !== null) {
+				return { ok: false, removed: false, reason: `task ${taskId} is claimed by ${row.claimed_by}: its edges are its holder's to correct, not another caller's` } as const;
+			}
+			if (row.status !== "blocked" && row.status !== "ready") {
+				return { ok: false, removed: false, reason: `task ${taskId} is ${row.status}, not blocked or ready` } as const;
+			}
+			const edges = this.#deps(taskId);
+			if (!edges.includes(dependsOn)) {
+				return { ok: false, removed: false, reason: `task ${taskId} has no dependency on ${dependsOn}` } as const;
+			}
+			const depRow = this.#db.get<{ status: TaskStatus }>("SELECT status FROM tasks WHERE id=?", dependsOn);
+			const unreachable = depRow === null || depRow.status === "failed" || findCycle(this.#edges(), dependsOn) !== undefined;
+			if (!unreachable && depRow?.status !== "done") {
+				return {
+					ok: false,
+					removed: false,
+					reason: `dependency ${dependsOn} is ${depRow?.status ?? "unknown"}, not failed or done: removing the edge to still-pending work would make ${taskId} claimable before that work lands`,
+				} as const;
+			}
+			const changed = this.#db.run("DELETE FROM task_deps WHERE task_id=? AND depends_on=?", taskId, dependsOn);
+			if (changed.changes !== 1) return { ok: false, removed: false, reason: `edge ${taskId} -> ${dependsOn} vanished before it was deleted` } as const;
+			this.#log("task.dep.remove", agentId, taskId, { dependsOn, reason, depStatus: depRow?.status ?? null, from: row.status });
+			// A blocked row whose last dead edge is gone is now claimable, so it is promoted on the
+			// same path every other status writer uses rather than being edited in place here.
+			const stillBlocked = this.unresolvedDependencies(taskId).length > 0 || this.deadDependencies(taskId).length > 0;
+			if (row.status === "blocked" && !stillBlocked) {
+				this.#db.run("UPDATE tasks SET status='ready', updated_at=? WHERE id=?", Date.now(), taskId);
+				this.#log("task.ready", agentId, taskId, { after: "dep.remove" });
+			}
+			return { ok: true, removed: true } as const;
+		});
+	}
+
+	/**
 	 * Open tasks (ready/claimed/blocked/review) whose `files` list shares a path with the given
 	 * one. Exact path matching only: this exists to expose a possible second writer at publish
 	 * time, not to judge whether two tasks are the same work.
