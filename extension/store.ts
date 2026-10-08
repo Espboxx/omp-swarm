@@ -41,6 +41,9 @@ import type {
 	VoteState,
 } from "./types";
 import { candidatesFromTasks, formatCapsRepair, planCapsRepair, reachableCapabilities, strandedRows, type CapsRepairRecord, type StrandedRow } from "./caps-repair";
+import { retryEscalation, retryGate, type RetryMemory } from "./failure-gate";
+import { goalDuplicateVerdict, goalKind, goalLedger, ledgerInjection, LEDGER_READ_LIMIT, type GoalKind, type GoalLedger } from "./coordinator-ledger";
+import { duplicateRefusal, identityKeyOf, type LiveRow } from "./identity-key";
 import { decide, payloadSignature, type Vote, type VoteOutcome, type VotingConfig } from "./voting";
 
 interface TaskRow {
@@ -317,6 +320,21 @@ export interface CreateTaskInput {
 	 * vote-executed creates, and every takeover replay — keeps its behaviour byte for byte.
 	 */
 	reachable?: Set<string>;
+	/**
+	 * goal-17's L2, at this mint site. When SUPPLIED, a mint whose identity key a LIVE row already
+	 * holds is REFUSED — the same shape `reachable` uses, for the same reason: the guard is on for
+	 * the callers that should have it and byte-for-byte absent for the ones that must not. Absent
+	 * means the mint is exactly what it was before, so the goal's own planning task,
+	 * `swarm_integrate`'s `["integrator"]` label, the operator's `/swarm task`, the vote-executed
+	 * creates and every takeover replay all keep their behaviour.
+	 *
+	 * What the guard may never do is stated by the key itself rather than by a special case: a match
+	 * against a `failed` row is not a refusal (the lookup is live rows only, the same rule
+	 * `planGoal` already applies), a re-file that changes only `caps` to a reachable capability is a
+	 * FRESH key, and a `fix` and a `verify` on one file are two keys because the kind is one of the
+	 * key's four components.
+	 */
+	dedupe?: boolean;
 }
 
 /**
@@ -679,6 +697,35 @@ export class SwarmStore {
 				tags: ["mint-refusal", "goal-14"],
 			});
 			return refusal(reason);
+		}
+		if (input.dedupe === true) {
+			// goal-17's L2 / task-252's G3: a mint whose identity key a LIVE row already holds is
+			// refused, in exactly the capability guard's shape — the same task-shaped object, the
+			// same one-entry trace, the reason naming the prior row and its status. `failed` rows are
+			// never offered to the lookup (the same rule planGoal already applies), so a row the pool
+			// already gave up on can never block its successor.
+			const live: LiveRow[] = this.#db
+				.all<{ id: string; title: string; files: string; required_capabilities: string; status: TaskStatus; created_at: number }>(
+					"SELECT id, title, files, required_capabilities, status, created_at FROM tasks WHERE status!='failed'",
+				)
+				.map((row) => ({
+					id: row.id,
+					title: row.title,
+					files: parseList(row.files),
+					caps: parseList(row.required_capabilities),
+					status: row.status,
+					createdAt: row.created_at,
+				}));
+			const duplicate = duplicateRefusal({ title: input.title, files: input.files ?? [], caps: required }, live, input.now ?? Date.now());
+			if (duplicate !== undefined) {
+				this.postBoard({
+					type: "DECISION",
+					agentId: input.createdBy,
+					content: `${duplicate.reason}\n\nREMEDY: ${duplicate.remedy}\nROUTE: ${duplicate.route} — the key that matched, so a reader can re-derive the match.`,
+					tags: ["duplicate-refusal", "goal-17"],
+				});
+				return refusal(duplicate.reason);
+			}
 		}
 		const now = input.now ?? Date.now();
 		const deps = [...new Set(input.dependencies ?? [])];
@@ -1115,20 +1162,66 @@ export class SwarmStore {
 
 	/**
 	 * Revive a `failed` or `blocked` task: the failed status is cleared and a fresh attempt
-	 * recorded, so a dead end is not permanent — dependents of a failed task are promoted by
-	 * the usual `sweep()` once it completes. A task whose own dependencies are still unresolved
+	 * recorded, so a dead end is not permanent — dependents of a failed task are promoted by the
+	 * usual `sweep()` once it completes. A task whose own dependencies are still unresolved
 	 * stays `blocked`: a `ready` row nobody can claim is worse than an honest `blocked` one —
 	 * it counts as actionable (so it hides the stall notice and grows the roster) while `claim()`
 	 * refuses it forever when the dependency is `failed`. Refuses any other status (a claimed/done
 	 * task is owned by someone, or already finished).
+	 *
+	 * goal-17's L1: a retry now consults {@link retryGate} against the row's own failure reason
+	 * before it revives anything. The measured loop this stops is in `.swarm/swarm.db`: 45 rows in
+	 * `failed`, 41 of them naming one repeatable cause family (`duplicate`/`superseded`), with no
+	 * gate anywhere saying "the same cause has already failed this deliverable N times". The gate's
+	 * memory is the row's own `task.retry` events, so the counter persists across processes the
+	 * way the spec requires, and a held retry leaves one board entry naming the family and the
+	 * remedy — a stop nobody can audit is the prose-sentence failure mode `planGoal`'s `skipped`
+	 * already cost this pool once.
 	 */
 	retryTask(taskId: string, reason?: string, agentId?: string): { ok: boolean; task?: SwarmTask; reason?: string } {
 		const now = Date.now();
-		return this.#db.transaction(() => {
+		const gate = this.#db.transaction(() => {
 			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
-			if (row === null) return { ok: false, reason: `unknown task ${taskId}` };
+			if (row === null) return { ok: false, reason: `unknown task ${taskId}` } as const;
 			if (row.status !== "failed" && row.status !== "blocked") {
-				return { ok: false, reason: `task ${taskId} is ${row.status}, not failed or blocked` };
+				return { ok: false, reason: `task ${taskId} is ${row.status}, not failed or blocked` } as const;
+			}
+			const prior = this.#db.all<{ created_at: number; data: string }>(
+				"SELECT created_at, data FROM events WHERE type='task.retry' AND task_id=? ORDER BY id",
+				taskId,
+			);
+			const memory: RetryMemory = { familyKey: undefined, lastAt: 0, count: 0 };
+			let firstSeenAt: number | undefined;
+			for (const entry of prior) {
+				const data = JSON.parse(entry.data) as { family?: string };
+				if (data.family === undefined) continue;
+				if (firstSeenAt === undefined) firstSeenAt = entry.created_at;
+				memory.familyKey = data.family;
+				memory.lastAt = entry.created_at;
+				memory.count += 1;
+			}
+			const decision = retryGate({
+				deliverable: deliverableKey(row.title),
+				reason: row.result ?? "",
+				attempt: row.attempts + 1,
+				now,
+				memory,
+			});
+			if (!decision.allow) {
+				// The hold is traced twice: the event keeps the audit chain unbroken (a silent
+				// refusal is what the old starvation latch was), and the board entry carries the
+				// remedy. Both are written INSIDE the transaction, so a retry that writes one
+				// cannot lose the other.
+				this.#log("task.retry.held", agentId, taskId, { family: decision.family, rule: decision.rule, reason: decision.reason });
+				const escalation = retryEscalation({ taskId, deliverable: deliverableKey(row.title), decision, firstSeenAt, now });
+				this.postBoard({
+					type: "DECISION",
+					agentId: agentId ?? "unknown",
+					taskId,
+					content: escalation.content,
+					tags: escalation.tags,
+				});
+				return { ok: false, reason: decision.reason } as const;
 			}
 			const claimable = this.unresolvedDependencies(taskId).length === 0;
 			this.#db.run(
@@ -1139,9 +1232,13 @@ export class SwarmStore {
 				now,
 				taskId,
 			);
-			this.#log("task.retry", agentId, taskId, { from: row.status, reason, claimable });
-			return { ok: true, task: this.getTask(taskId) };
+			// The family travels with the retry event, so the NEXT retry of this row can count the
+			// same cause without reading the reason again: the counter is the cause family, not the
+			// row id, which is the same lesson `boardClassKey`'s `task-\d+` exclusion carries.
+			this.#log("task.retry", agentId, taskId, { from: row.status, reason, claimable, family: decision.family });
+			return { ok: true, task: this.getTask(taskId), reason } as const;
 		});
+		return gate;
 	}
 
 	// ----------------------------------------------------------------- goals
@@ -1149,6 +1246,16 @@ export class SwarmStore {
 	/**
 	 * Open a goal's planning round: the goal row plus the ONE planning task whose first claimer
 	 * becomes the scribe. One transaction, so a goal can never exist without its planning task.
+	 *
+	 * goal-17's L3: before the round opens, the board's own conclusions are retrieved and INJECTED
+	 * into the planning task's brief, so the coordinator that opens the round and the scribe that
+	 * merges it start from what earlier rounds already settled instead of re-diagnosing it. The
+	 * operator's measurement is the reason: 200 board entries mention the reviewer-capability knot
+	 * across eight separate goals, and the knot was re-derived more than once. Injection, not
+	 * refusal — measured on the 17 live goals, a goal-level duplicate refusal would refuse nothing
+	 * (0 fingerprint collisions), so the honest shipped shape is the one the goal's own text names
+	 * ("只做注入不做拒绝"). The verdict is still computed and reported, so a future surface with real
+	 * collisions is one flag away from refusing.
 	 */
 	createGoal(input: { goal: string; agents: number; createdBy: string; deadlineMs?: number; now?: number }): {
 		goal: SwarmGoal;
@@ -1156,16 +1263,26 @@ export class SwarmStore {
 	} {
 		const createdAt = input.now ?? Date.now();
 		const deadlineMs = input.deadlineMs ?? GOAL_DEADLINE_MS;
+		// The ledger is read BEFORE the transaction (it only reads the board), so the brief the
+		// planning task carries is complete at insert time and no second write is needed.
+		const ledger = this.coordinatorLedger();
+		const verdict = goalDuplicateVerdict(ledger, input.goal);
+		const injection = ledgerInjection(ledger, input.goal, verdict);
 		return this.#db.transaction(() => {
 			const next = this.#db.get<{ n: number }>("SELECT COALESCE(MAX(CAST(substr(id, 6) AS INTEGER)), 0) + 1 AS n FROM goals");
 			const id = `goal-${next?.n ?? 1}`;
+			// The injection is appended at THIS call site rather than added to `planningTaskBrief`'s
+			// signature: `planning.ts` is another row's write domain this round, and a caller-side
+			// append keeps the brief's own signature (and its tests) untouched. The empty case appends
+			// nothing, so a fresh pool's brief is byte-identical to what it was.
+			const brief = planningTaskBrief({ id, goal: input.goal, agents: input.agents, createdBy: input.createdBy }, deadlineMs);
 			// The planning task is created first so the goal row can carry its id; the brief is built
 			// from the same values the row will hold. No `reachable` set: the planning task requires
 			// `["general"]`, which every roster carries, and this caller must never refuse a goal's
 			// own round over a capability the operator has not configured.
 			const planningTask = this.#createTaskLocked({
 				title: `Plan ${id}: merge the split proposals into the task graph`,
-				description: planningTaskBrief({ id, goal: input.goal, agents: input.agents, createdBy: input.createdBy }, deadlineMs),
+				description: injection === "" ? brief : `${brief}\n\n${injection}`,
 				priority: 10,
 				createdBy: input.createdBy,
 				requiredCapabilities: ["general"],
@@ -1182,9 +1299,44 @@ export class SwarmStore {
 				createdAt + deadlineMs,
 				planningTask.id,
 			);
-			this.#log("goal.open", input.createdBy, planningTask.id, { goal: id, agents: input.agents, deadlineMs });
+			this.#log("goal.open", input.createdBy, planningTask.id, {
+				goal: id,
+				agents: input.agents,
+				deadlineMs,
+				// goal-17's L3: the counts travel with the event, so the audit trail shows what the
+				// round was handed without re-reading the board.
+				ledgerRows: ledger.readRows,
+				ledgerClasses: ledger.classes.length,
+				ledgerAnswered: ledger.answeredCount,
+				ledgerDuplicate: verdict.duplicate,
+			});
 			return { goal: this.getGoal(id) as SwarmGoal, planningTask };
 		});
+	}
+
+	/**
+	 * The conclusions a new goal must be handed (goal-17's L3): the board's FAIL/DECISION classes,
+	 * which are already answered and which are still open, with the kind of work each class's own
+	 * goals asked for so a new goal's kind can be compared against it.
+	 *
+	 * Read-only and cheap on the sizes this pool actually has (361 conclusion rows at the time this
+	 * was written); the caller's board is capped by {@link LEDGER_READ_LIMIT}, and the whole read is
+	 * outside any write transaction so it can never hold a lock.
+	 */
+	coordinatorLedger(limit = LEDGER_READ_LIMIT): GoalLedger {
+		const rows = this.#db
+			.all<{ id: number; type: BoardType; agent_id: string; tags: string }>(
+				"SELECT id, type, agent_id, tags FROM board WHERE type IN ('FAIL','DECISION') ORDER BY id DESC LIMIT ?",
+				limit,
+			)
+			.map((row) => ({ id: row.id, type: row.type, agentId: row.agent_id, tags: parseList(row.tags) }));
+		// The kind each goal asked for: the ledger needs it to compare a new goal's kind against the
+		// kind that produced an existing class. Goals are few, so one pass is enough.
+		const kindsByGoal = new Map<string, GoalKind>();
+		for (const row of this.#db.all<{ id: string; goal: string }>("SELECT id, goal FROM goals")) {
+			kindsByGoal.set(row.id, goalKind(row.goal));
+		}
+		return goalLedger(rows, kindsByGoal, limit);
 	}
 
 	getGoal(id: string): SwarmGoal | undefined {
@@ -1238,7 +1390,7 @@ export class SwarmStore {
 	planGoal(goalId: string, agentId: string, options: { ceiling?: number; config?: SwarmConfig } = {}): PlanResult {
 		const now = Date.now();
 		const created: string[] = [];
-		const skipped: { title: string; id: string }[] = [];
+		const skipped: { title: string; id: string; route?: "exact" | "spelling" }[] = [];
 		// Merge key -> the task row that carries it, created or already in the pool: the DECISION's
 		// fold mapping needs it after the transaction has committed.
 		const idByKey = new Map<string, string>();
@@ -1284,10 +1436,16 @@ export class SwarmStore {
 			// A `failed` row is not a deliverable the pool holds: only live/finished work dedupes.
 			const keys = new Map<string, string>();
 			const heldShapes: { shape: DeliverableShape; id: string }[] = [];
+			// goal-17's L2: the identity key's view of the same live rows, so the merge loop can ask
+			// the exact route beside the spelling route it already consults. `failed` rows are
+			// excluded here too, by the same rule, so a row the pool gave up on never blocks its
+			// successor (task-252's A5).
+			const liveRowsForDedupe: LiveRow[] = [];
 			for (const task of this.listTasks({ limit: 1000 })) {
 				if (task.status === "failed") continue;
 				keys.set(deliverableKey(task.title), task.id);
 				heldShapes.push({ shape: describeDeliverable(task.title, task.files), id: task.id });
+				liveRowsForDedupe.push({ id: task.id, title: task.title, files: task.files, caps: task.requiredCapabilities, status: task.status, createdAt: task.createdAt });
 			}
 			for (const merged of orderForCreation(merge.tasks).ordered) {
 				// The pool dedupes by the same deliverable rule the round does, so a re-takeover after a
@@ -1301,8 +1459,23 @@ export class SwarmStore {
 					heldShapes
 						.map((held) => ({ held, skip: poolSkipReason(held.shape, shape) }))
 						.find((candidate) => candidate.skip !== undefined)?.held.id;
+				// goal-17's L2 / task-252's G3b: the identity key is asked HERE, before the mint, not
+				// discovered from it. A refusal inside this loop throws `MintRefused` and rolls the
+				// WHOLE round back, so a round carrying one duplicate row beside nine fresh ones would
+				// lose all ten; the pre-check skips instead and records which ROUTE matched, so the
+				// plan DECISION's existing skipped line says why. The existing `skipped` mechanism is
+				// reused rather than replaced — a second skip vocabulary is the "second key" failure.
+				const mergedKey = identityKeyOf(merged.title, merged.files, merged.capabilities).key;
+				const duplicateRow = liveRowsForDedupe.find((row) => identityKeyOf(row.title, row.files, row.caps).key === mergedKey);
+				// The contract's order is exact → spelling → class, and the route that fired is what
+				// the reason names: an exact hit has the key to show, a spelling hit has the wording.
+				if (duplicateRow !== undefined) {
+					skipped.push({ title: merged.title, id: duplicateRow.id, route: "exact" });
+					idByKey.set(merged.key, duplicateRow.id);
+					continue;
+				}
 				if (existing !== undefined) {
-					skipped.push({ title: merged.title, id: existing });
+					skipped.push({ title: merged.title, id: existing, route: "spelling" });
 					idByKey.set(merged.key, existing);
 					continue;
 				}
@@ -1379,7 +1552,7 @@ export class SwarmStore {
 				// nothing, which is exactly how goal-5's four spellings of one report stayed invisible.
 				for (const fold of folds) lines.push(`  "${fold.title}" -> ${idByKey.get(fold.into) ?? fold.into} (${fold.reason})`);
 			}
-			if (skipped.length > 0) lines.push(`skipped (a live task already carries them): ${skipped.map((s) => `${s.title} -> ${s.id}`).join(", ")}`);
+			if (skipped.length > 0) lines.push(`skipped (a live task already carries them): ${skipped.map((s) => `${s.title} -> ${s.id} [${s.route ?? "spelling"}]`).join(", ")}`);
 			if (unresolved.length > 0) lines.push(`dropped unresolvable dependency reference(s): ${unresolved.map((d) => `${d.task} <- ${d.dep}`).join(", ")}`);
 			this.postBoard({
 				type: "DECISION",

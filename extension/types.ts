@@ -150,7 +150,7 @@ export interface PlanResult {
 	/** Ids of the tasks the merge created, in creation order. */
 	created: string[];
 	/** Deliverables the merge left alone because the pool already holds that deliverable. */
-	skipped: { title: string; id: string }[];
+	skipped: { title: string; id: string; /** Which route matched: the shape/spelling route or goal-17 L2's exact identity key. */ route?: "exact" | "spelling" }[];
 	/** Number of proposals the round carried. */
 	proposals: number;
 	/** Deliverable keys more than one proposal named. */

@@ -367,7 +367,11 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 					// naming the reachable alternative and the operator's path. The set comes from
 					// `config` the way `repairCaps`'s does, so the store never holds a second copy of
 					// the roster derivation.
-					store.createTask({ ...fields, createdBy: identity.id, reachable: reachableCapabilities(config) }),
+					// goal-17's L2 / task-252's G3a: this is the ONE mint site a worker reaches, so it
+					// is also where the identity-key refusal belongs — a mint whose key a LIVE row
+					// already holds is refused, naming that row, instead of minting a `failed`
+					// SUPERSEDED/DUPLICATE row weeks later.
+					store.createTask({ ...fields, createdBy: identity.id, reachable: reachableCapabilities(config), dedupe: true }),
 				);
 				if (!gated.ok) return err(gated.reason, { created: false, gated: true });
 				task = gated.value;
@@ -615,7 +619,7 @@ export function buildSwarmTools(deps: SwarmToolDeps): CustomTool[] {
 		name: "swarm_task_retry",
 		label: "Retry Task",
 		description:
-			"Revive a `failed` or `blocked` task (fresh attempt, claim cleared) so its dependents can be promoted once it completes. A task whose own dependencies are unresolved stays `blocked` — it is never left in `ready` where `claim()` would refuse it forever. Refuses a task that is claimed, in review, or done.",
+			"Revive a `failed` or `blocked` task (fresh attempt, claim cleared) so its dependents can be promoted once it completes. A task whose own dependencies are unresolved stays `blocked` — it is never left in `ready` where `claim()` would refuse it forever. Refuses a task that is claimed, in review, or done. goal-17 L1: a retry is HELD when the row's own failure reason names a repeatable cause family (`duplicate`/`superseded`/`blocked`) that has already failed this deliverable N times, or the same cause failed inside the retry cooldown — the refusal names the family and the remedy, and a DECISION board entry records the stop. A retry that changes the cause (the files, the capability, the deliverable's scope) is always a fresh attempt.",
 		parameters: retrySchema,
 		approval: "write",
 		async execute(_id, params) {

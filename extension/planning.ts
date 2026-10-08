@@ -1035,10 +1035,11 @@ export function peakParallelism(tasks: MergedTask[]): number {
 }
 
 /** The brief the goal's single planning task carries: what the round is, who does what, the bound. */
-export function planningTaskBrief(goal: { id: string; goal: string; agents: number; createdBy: string }, deadlineMs = GOAL_DEADLINE_MS): string {
+export function planningTaskBrief(goal: { id: string; goal: string; agents: number; createdBy: string }, deadlineMs = GOAL_DEADLINE_MS, injection = ""): string {
 	return [
 		`GOAL ${goal.id} (${goal.agents} agent(s), opened by ${goal.createdBy}): ${goal.goal}`,
 		"",
+		...(injection === "" ? [] : [injection, ""]),
 		"This is the goal's ONLY planning task, and the first agent to claim it is the SCRIBE.",
 		"Round:",
 		`1. Every worker posts its OWN split of the goal with swarm_propose (a board entry tagged "${PROPOSAL_TAG}" + "${goalTag(goal.id)}" that points at this task).`,

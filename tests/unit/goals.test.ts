@@ -176,7 +176,7 @@ describe("the scribe merges exactly once", () => {
 		const result = store.planGoal(opened.goal.id, "B");
 		expect(result.ok).toBe(true);
 		expect(result.created).toEqual([]);
-		expect(result.skipped).toEqual([{ title: "the DELIVERABLE.", id: existing.id }]);
+		expect(result.skipped).toEqual([{ title: "the DELIVERABLE.", id: existing.id, route: "spelling" }]);
 		expect(store.listTasks({ limit: 20 }).filter((task) => deliverableKey(task.title) === deliverableKey("The deliverable")).length).toBe(1);
 		store.close();
 	});
