@@ -253,3 +253,105 @@ describe("the pool's SIZE is voted on, whoever asks (goal-9 high 2)", () => {
 		check.close();
 	});
 });
+
+describe("a ruling that closed a row must be one the pool actually passed", () => {
+	/** A passed `close-task` round frozen on `rowId`, carrying the ruling's own text in its payload. */
+	function ruledRound(store: SwarmStore, rowId: string): string {
+		const vote = store.openVote({
+			kind: "close-task",
+			question: "close the residue",
+			payload: { task_id: rowId, decision: "DECISION #1753 + vote-15 + vote-17" },
+			openedBy: "w1",
+			policy: { threshold: 0.75, minBase: 2, timeoutMs: 90_000 },
+		});
+		store.castBallot(vote.id, "w1", true);
+		store.castBallot(vote.id, "w2", true);
+		const settled = store.settleVote(vote.id, DEFAULT_CONFIG.offlineAfterSeconds);
+		if (settled?.vote.status !== "passed") throw new Error("the ruling round did not pass");
+		return vote.id;
+	}
+
+	test("a fabricated ruling closes nothing: the text alone is not authority", () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		// An ordinary queued row: unheld, deps satisfied, a capable agent online. Everything about it is
+		// claimable, so only a REAL ruling could ever close it — which is the point of the fourth exit.
+		const row = store.createTask({ title: "queued", createdBy: "boot", requiredCapabilities: ["general"] });
+		const closed = store.fail(row.id, "generalist", "let me close it", { decision: "DECISION #1", voteId: "vote-1" });
+		expect(closed.ok).toBe(false);
+		expect(store.getTask(row.id)?.status).toBe("ready");
+		// Still waiting its turn, exactly as it was: the row is claimable, not damaged.
+		expect(store.claim(row.id, "generalist", 300, ["general"]).ok).toBe(true);
+		store.close();
+	});
+
+	test("a ruled exit closes the row and the event names the round that licensed it", () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = store.createTask({ title: "residue", createdBy: "boot", requiredCapabilities: ["general"] });
+		const vote = ruledRound(store, row.id);
+
+		const closed = store.fail(row.id, "generalist", "CLOSED BY DECISION", {
+			decision: "DECISION #1753 + vote-15 + vote-17",
+			voteId: vote,
+		});
+		expect(closed.ok).toBe(true);
+		expect(store.getTask(row.id)?.status).toBe("failed");
+		store.close();
+	});
+
+	test("a ruling whose text does not match the round's own payload is refused", () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = store.createTask({ title: "residue", createdBy: "boot", requiredCapabilities: ["general"] });
+		const vote = ruledRound(store, row.id);
+
+		// The round exists and passed, but it did not vote on THIS text: naming a ruling means naming
+		// what the pool actually decided, so a mismatch is the same refusal as no ruling at all.
+		const closed = store.fail(row.id, "generalist", "close it", { decision: "DECISION #1", voteId: vote });
+		expect(closed.ok).toBe(false);
+		expect(closed.reason).toContain("no ruling named");
+		expect(store.getTask(row.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a ruled exit is not a second close: an already-consumed round cannot close a second row", () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const first = store.createTask({ title: "first", createdBy: "boot", requiredCapabilities: ["general"] });
+		const second = store.createTask({ title: "second", createdBy: "boot", requiredCapabilities: ["general"] });
+		// The round is frozen on `first`, so a ruling naming `second` is a payload the pool never voted
+		// on — the same refusal the ticket gate already gives a payload swap.
+		const vote = ruledRound(store, first.id);
+		const closed = store.fail(second.id, "generalist", "swap", {
+			decision: "DECISION #1753 + vote-15 + vote-17",
+			voteId: vote,
+		});
+		expect(closed.ok).toBe(false);
+		expect(store.getTask(second.id)?.status).toBe("ready");
+		store.close();
+	});
+
+	test("a ruling whose round was ALREADY SPENT closes nothing, even at the row it ruled on", () => {
+		const { store } = makeRoot();
+		roster(store, ["w1", "w2"]);
+		const row = store.createTask({ title: "already ruled", createdBy: "boot", requiredCapabilities: ["general"] });
+		const ruling = { decision: "DECISION #1753 + vote-15 + vote-17", voteId: ruledRound(store, row.id) };
+
+		// One close by this ruling — which spends the round it rode in on.
+		expect(store.fail(row.id, "generalist", "CLOSED BY DECISION", ruling).ok).toBe(true);
+		expect(store.getTask(row.id)?.status).toBe("failed");
+
+		// Now the row is reopened for a fresh attempt and the SAME ruling is named again, for the SAME
+		// row and the SAME text. The `task_id` and text guards both pass, so the only thing left that
+		// can refuse is the spent check — which is exactly the guard under test. Without it, one passed
+		// round is a standing permission to close that row forever, which is the replay hole goal-9
+		// closed for every other kind (VERDICT §3).
+		store.retryTask(row.id, "reopen", "generalist");
+		expect(store.getTask(row.id)?.status).not.toBe("failed");
+		const replay = store.fail(row.id, "generalist", "CLOSED BY DECISION", ruling);
+		expect(replay.ok).toBe(false);
+		expect(replay.reason).toContain("no ruling named");
+		store.close();
+	});
+});

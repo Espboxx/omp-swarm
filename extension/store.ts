@@ -391,6 +391,24 @@ export interface UnroutableClose {
 }
 
 /**
+ * The RULED an unheld, fully-satisfied row may be closed by — a caller-supplied ruling that a
+ * `close-task` round actually passed. It is the only way `fail()` can close a row every online
+ * agent could still take, so the ruling is not free text: it is checked against the round that
+ * authorised it ({@link SwarmStore.rulingAuthority} holds what a decision must match).
+ *
+ * `decision` carries the ruling's own text (the board DECISION id and the round that passed), and
+ * `voteId` names the round it came from. Naming a ruling that no round ever passed is refused: the
+ * text alone used to be enough, and "`{ decision: "DECISION #1" }`" could then close an ordinary
+ * queued row, which is the authority `#ruled` refuses to assume.
+ */
+export interface RuledClose {
+	/** The ruling's own text, recorded verbatim on the audit payload next to the row it closed. */
+	decision: string;
+	/** The `close-task` round that passed this ruling, which the store verifies really exists. */
+	voteId: string;
+}
+
+/**
  * Caller-supplied policy for `repairCaps`, for the same reason as `UnroutableClose`: the roster the
  * capability label must be judged against belongs to the config the caller already holds. A store
  * that read a config of its own would judge a row against a DIFFERENT fact than the one the claim
@@ -1094,8 +1112,17 @@ export class SwarmStore {
 	/**
 	 * Fail a task. With no `unroutable` option this behaves exactly as it always has: the holder, or
 	 * unheld residue whose dependencies can never reach `done`.
+	 *
+	 * The fourth exit is the one that can close a row every online agent could still take, and it is
+	 * the only exit that MUST be told why: the caller names a ruling, and the ruling is verified
+	 * against the `close-task` round that passed it rather than trusted as free text.
 	 */
-	fail(taskId: string, agentId: string, reason: string, unroutable?: UnroutableClose): { ok: boolean; task?: SwarmTask; reason?: string } {
+	fail(
+		taskId: string,
+		agentId: string,
+		reason: string,
+		unroutable?: UnroutableClose | RuledClose,
+	): { ok: boolean; task?: SwarmTask; reason?: string } {
 		const now = Date.now();
 		const result = this.#db.transaction(() => {
 			const row = this.#db.get<TaskRow>("SELECT * FROM tasks WHERE id=?", taskId);
@@ -1112,8 +1139,20 @@ export class SwarmStore {
 			// every dependency is satisfied, and no agent ONLINE could claim it even if it tried. Only the
 			// caller can ask for this (it names the offline window), and the guards below are what keep it
 			// from ever closing work a capable agent could still take.
-			const stranded = !closable && unroutable !== undefined && this.#stranded(row, taskId, unroutable, now);
-			if (!held && !closable && !stranded) {
+			const stranded =
+				!closable && unroutable !== undefined && "offlineAfterMs" in unroutable && this.#stranded(row, taskId, unroutable, now);
+			// The FOURTH way, which the other two cannot reach either: the row is unheld, every dependency
+			// is satisfied, nothing is unroutable, and a `close-task` round has ruled it to carry no work.
+			// Its closed-by-decision status is not a property of the graph, so no exit that reads only the
+			// graph can see it; the caller names it instead — and the store verifies the ruling is real
+			// before it acts on it, because this exit is the only one that can close claimable work.
+			const ruled =
+				!closable &&
+				!stranded &&
+				unroutable !== undefined &&
+				"decision" in unroutable &&
+				this.#ruled(row, taskId, unroutable, now);
+			if (!held && !closable && !stranded && !ruled) {
 				return { ok: false, reason: `task ${taskId} is ${row.status}${row.claimed_by ? ` by ${row.claimed_by}` : ""}${this.#failHint(row, taskId, unroutable, now)}` };
 			}
 			this.#db.run(
@@ -1125,7 +1164,15 @@ export class SwarmStore {
 			// Only the holder goes idle: closing someone else's dead residue must not clear the
 			// caller's own current_task.
 			if (held) this.#settleAgent(agentId, now);
-			this.#log("task.fail", agentId, taskId, { reason, closed: !held, deadDependencies: dead, stranded });
+			this.#log("task.fail", agentId, taskId, {
+				reason,
+				closed: !held,
+				deadDependencies: dead,
+				stranded,
+				// Present only on the fourth exit, and the ruling that licensed it verbatim, so the
+				// one exit that can close claimable work is never authorless in the audit trail.
+				ruled: ruled ? { decision: (unroutable as RuledClose).decision, vote: (unroutable as RuledClose).voteId } : undefined,
+			});
 			return { ok: true, task: this.getTask(taskId) };
 		});
 		if (result.ok) this.postBoard({ type: "FAIL", agentId, taskId, content: reason, tags: ["failure"] });
@@ -1154,6 +1201,72 @@ export class SwarmStore {
 	}
 
 	/**
+	 * Whether an unheld, fully-satisfied row may be closed because it was RULED to carry no work —
+	 * the only exit that can close a row an online agent could still claim, which is why every guard
+	 * here is a refusal and the ruling is VERIFIED rather than assumed.
+	 *
+	 * What it deliberately does NOT check is age. An age guard would make the authority "nobody came
+	 * for it in ten minutes", which is a different authority from "somebody ruled on it", and it is
+	 * the shape goal-15 already learned to refuse: a row nobody picked up within a window is a row
+	 * that is still waiting its turn, and the unroutable exit's comment says so verbatim.
+	 *
+	 * Guards, all refusals:
+	 *   the row must be unheld and still actionable (a claimed or done task never leaves its holder
+	 *     through here — the holder's exit is `complete`, not `fail`);
+	 *   every dependency must be satisfied, and not DEAD (a dead dependency already has `closable`,
+	 *     and an unfinished one still has work to wait for);
+	 *   the ruling must name a non-empty decision, AND that decision must match a `close-task` round
+	 *     that actually passed. The match is the whole point: a ruling that exists only in the
+	 *     caller's argument is free text, and free text is exactly what could close an ordinary
+	 *     queued row, so the store refuses it rather than trusting it.
+	 *
+	 * A ruling that does license a close SPENDS its round, the same way `consumeVote` spends the
+	 * ticket it acts on. Without that, one passed round would be a standing permission to close
+	 * every row it could be aimed at — which is the replay hole goal-9 closed for every other kind.
+	 */
+	#ruled(row: TaskRow, taskId: string, options: RuledClose, now: number): boolean {
+		if (row.claimed_by !== null || (row.status !== "blocked" && row.status !== "ready")) return false;
+		if (this.unresolvedDependencies(taskId).length > 0) return false;
+		const decision = options.decision?.trim();
+		if (decision === undefined || decision.length === 0) return false;
+		// The ruling is matched and its round SPENT in one step, so the check and the use cannot
+		// drift apart: a round that authorises exactly one close cannot authorise a second one.
+		return this.#rulingMatches(decision, options.voteId, taskId, now);
+	}
+
+	/**
+	 * Whether a named ruling is backed by a `close-task` round that really passed. The ruling is the
+	 * TEXT the caller supplies and it must equal the voted payload's own decision text, and the round
+	 * must be a passed `close-task` that is not already spent.
+	 *
+	 * A ruling the pool never passed is refused, which is the fix for "the record exists but nothing
+	 * checks what it points at": `{ decision: "DECISION #1" }` closes nothing, no matter how plausible
+	 * it reads, because no round ever voted on it.
+	 */
+	#rulingMatches(decision: string, voteId: string, taskId: string, now: number): boolean {
+		const vote = this.#db.get<VoteRow>("SELECT status, kind, payload FROM votes WHERE id=?", voteId);
+		if (vote === null) return false;
+		if (vote.kind !== "close-task" || vote.status !== "passed") return false;
+		if (this.#consumption(voteId) !== undefined) return false;
+		let payload: { task_id?: unknown; decision?: unknown };
+		try {
+			payload = JSON.parse(vote.payload) as { task_id?: unknown; decision?: unknown };
+		} catch {
+			return false;
+		}
+		// The ruling is bound to the row the pool ruled on, the same way the ticket is bound to the
+		// payload it froze: a ruling about task-1 says nothing about task-2, so naming it to close a
+		// second row is the payload swap the gate already refuses.
+		if (payload.task_id !== taskId) return false;
+		if (typeof payload.decision !== "string" || payload.decision !== decision) return false;
+		// Every guard passed, so this ruling licenses exactly this close — and the round that carried
+		// it is spent on it. One pass, one close: the same PRIMARY KEY backstop `consumeVote` uses,
+		// so two rows cannot be closed by one ruling even in two processes.
+		this.#recordConsumptionLocked(voteId, "close-task", payload as Record<string, unknown>, "ruled-exit", now);
+		return true;
+	}
+
+	/**
 	 * Which guard refused an unheld actionable row, so a caller is not left guessing.
 	 *
 	 * goal-18's U4: this used to be ONE sentence for five different guards, and the sentence it
@@ -1163,9 +1276,15 @@ export class SwarmStore {
 	 * guards are now named in the order `#stranded` evaluates them, so the reason is auditable
 	 * instead of plausible.
 	 */
-	#failHint(row: TaskRow, taskId: string, unroutable?: UnroutableClose, now = Date.now()): string {
+	#failHint(row: TaskRow, taskId: string, unroutable?: UnroutableClose | RuledClose, now = Date.now()): string {
 		if (row.claimed_by !== null || (row.status !== "ready" && row.status !== "blocked")) return "";
 		if (unroutable === undefined) return " (nothing here can close it: no dependency of it is dead)";
+		// The ruled exit is checked before any field of the unroutable window is read, because
+		// `RuledClose` has no window to read: reaching here with a ruling that did not license the
+		// close means the ruling itself was empty, or the round it names never passed.
+		if ("decision" in unroutable) {
+			return " (no ruling named, or the ruling it names was never passed as a close-task round: only a ruling the pool actually voted can close a row that is merely waiting its turn)";
+		}
 		if (now - row.updated_at < (unroutable.graceMs ?? UNROUTABLE_GRACE_MS)) {
 			return ` (it has not been stranded for the grace window: ${Math.max(0, Math.round((now - row.updated_at) / 1000))}s of ${Math.round((unroutable.graceMs ?? UNROUTABLE_GRACE_MS) / 1000)}s)`;
 		}
