@@ -232,12 +232,41 @@ describe("retryGate: the pure rule", () => {
 				const cls = classifyFailure(String(row.result ?? ""));
 				if (cls.family !== "other") expect(cls.evidence).not.toBe("");
 			}
-			// The `other` rows are the exception list, named: task-125 is goal-1's planning round,
-			// which hit its 600s bound with no plan — a real failure, not a repeat cause. A new
-			// `other` row is not a failure of this test; a row that STOPPED being `other` while its
-			// text is unchanged is.
+			// The `other` rows are the exception list, and the rule the comment declares is what the
+			// code must check: a new `other` row is not a failure of this test, a row that STOPPED
+			// being `other` while its text is unchanged is. This pool's failed set GROWS — the two
+			// bound-missed planning rows (task-125 goal-1, task-293 goal-20) are the same shape in
+			// different words — so naming the ids as a constant made the test a timed red (measured:
+			// `Expected: "task-125" / Received: "task-293"`, CalmTiger FAIL #2174).
+			//
+			// It is not ONE cause any more, and that is a finding rather than noise. The `other`
+			// family is "a real attempt that failed, which a retry is allowed to revive" — but the
+			// pool has since produced a SECOND shape that must also never be retried: a row that
+			// failed on a precondition it cannot reach (task-300, goal-22's S3, whose stop-the-pool
+			// precondition no agent can satisfy). Both are non-retryable, and they are non-retryable
+			// for DIFFERENT reasons, so the predicate is class-aware instead of id-aware: every
+			// `other` row is either a planning round that missed its bound, or a row that says so
+			// itself by failing on an unreachable precondition. A third cause still fails this test,
+			// which is what keeps the exception list from going quietly stale again.
 			const others = families.other ?? [];
-			for (const id of others) expect(id).toBe("task-125");
+			// A row passes when its result text names one of the causes this gate must not revive.
+			// A third cause is not given a pattern here on purpose: it lands in `unmatched`, and the
+			// assertion below fails naming it.
+			const NON_RETRYABLE_CAUSES: Array<{ cause: string; pattern: RegExp }> = [
+				{ cause: "a planning round that missed its bound", pattern: /planning round for goal-\d+ hit its bound \(\d+s\) with no plan/ },
+				{ cause: "a precondition the row could not reach", pattern: /failed on an unmet precondition/i },
+			];
+			const unmatched: string[] = [];
+			for (const row of rows) {
+				const cls = classifyFailure(String(row.result ?? ""));
+				if (cls.family !== "other") continue;
+				const text = String(row.result ?? "");
+				if (!NON_RETRYABLE_CAUSES.some((entry) => entry.pattern.test(text))) unmatched.push(row.id);
+			}
+			expect(unmatched).toEqual([]);
+			// And the floor the rule needs to stay meaningful: at least one such row exists, so the
+			// loop above is exercising rows rather than passing vacuously.
+			expect(others.length).toBeGreaterThan(0);
 			// And the holdable majority is the point of the gate: these are the rows whose re-file
 			// is the loop.
 			const holdable = (families.duplicate ?? []).length + (families.superseded ?? []).length + (families.blocked ?? []).length;
